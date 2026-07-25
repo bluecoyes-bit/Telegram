@@ -10,10 +10,11 @@ import time
 import asyncio
 import random
 import logging
-import gc
-from typing import List, Dict, Optional, Any, Tuple, Set
+import gc  # 🔥 NEW: Garbage collection control
+from typing import List, Dict, Optional, Any, Tuple, Set, TYPE_CHECKING
 from weakref import WeakSet
 from proxy_manager import RobustProxyManager, ProxyEntry
+
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -26,19 +27,15 @@ from telethon.errors import (
 logger = logging.getLogger("VideoChatEngineFallback")
 
 # =====================================================================
-# 🔥 GRACEFUL PYTGCALLS IMPORT (OPTIONAL)
+# 🔥 FIXED: TRUE UNIVERSAL PYTGCALLS ADAPTER (V3 & LEGACY SUPPORT)
 # =====================================================================
-PYTGCALLS_AVAILABLE = False
-
 try:
     from pytgcalls import PyTgCalls
     from pytgcalls.types import MediaStream
-    PYTGCALLS_AVAILABLE = True
     logger.info("✅ PyTgCalls V3 Engine Loaded Successfully.")
-except ImportError:
+except (ModuleNotFoundError, ImportError):
     try:
         from pytgcalls import GroupCallFactory
-        PYTGCALLS_AVAILABLE = True
         logger.info("✅ PyTgCalls Legacy Engine Loaded Successfully.")
         
         class MediaStream:
@@ -58,6 +55,7 @@ except ImportError:
                     factory = GroupCallFactory(self.client, GroupCallFactory.MTPROTO_CLIENT_TYPE.TELETHON)
                 except AttributeError:
                     factory = GroupCallFactory(self.client)
+                    
                 self._group_call = factory.get_file_group_call(stream.media_path)
                 await self._group_call.start(chat_id)
 
@@ -69,16 +67,9 @@ except ImportError:
                 if self._group_call:
                     try: await self._group_call.stop()
                     except: pass
-    except ImportError:
-        PYTGCALLS_AVAILABLE = False
-        logger.warning("⚠️ pytgcalls not installed. Voice chat features will be disabled.")
-        # Dummy classes that raise when used
-        class PyTgCalls:
-            def __init__(self, client):
-                raise NotImplementedError("pytgcalls is not installed")
-        class MediaStream:
-            def __init__(self, media_path, *args, **kwargs):
-                raise NotImplementedError("pytgcalls is not installed")
+    except Exception as crash_reason:
+        logger.critical(f"🚨 FATAL: pytgcalls library is completely missing or broken! Fix your environment. ({crash_reason})")
+        raise crash_reason
 
 
 from config import CONFIG, DEVICE_PROFILES
@@ -106,7 +97,6 @@ class CloudVoiceChatEngine:
         self.db = db
         self.proxy_manager = proxy_manager
         self.scraper_helper = MemberScraper(db)
-        self._pytgcalls_available = PYTGCALLS_AVAILABLE
         self.is_running = False
         # 🔥 FIX 1: WeakSet instead of List for task tracking - avoids memory leaks
         self._active_tasks: set = set()
