@@ -129,7 +129,7 @@ CONFIG: Dict[str, Any] = {
     # ── Core API Credentials ──
     "API_ID": _env_int("API_ID", 38223087, min_val=1),
     "API_HASH": _env_str("API_HASH", "f3448783d23ace67fecdef3f392d2e47"),
-    "BOT_TOKEN": _env_str("BOT_TOKEN", "8966015094:AAEldB60lvhFwjsTsL1jlfxFPi32Fx73PO8"),
+    "BOT_TOKEN": _env_str("BOT_TOKEN", "8966015094:AAHsAICrx1J8mEx3hhOC4aiUJBJDLdQ_dj4"),
 
     # ── Admin ──
     "ADMIN_ID": _env_str("ADMIN_ID", "5599766250"),
