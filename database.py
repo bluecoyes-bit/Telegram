@@ -622,7 +622,7 @@ class SuiteDatabase:
             "phone": clean_phone,
             "session_string": str(session_str),
             "session": str(session_str),
-            "status": str(status),
+            "status": status.value if hasattr(status, 'value') else status,
             "device_model": device.get("device_model", "PC 64bit"),
             "system_version": device.get("system_version", "Windows 11"),
             "app_version": device.get("app_version", "4.8.4"),

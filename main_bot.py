@@ -1075,8 +1075,8 @@ async def centralized_ui_router(event) -> None:
     elif route == "action_halt_voice":
         await event.edit("🛑 **Initiating Voice Chat Emergency Shutdown...**\nClearing processes and releasing cluster locks...", buttons=None)
         try:
-            # 🔥 BUG FIXED: Removed 'await' because terminate_voice_cluster is not an async function
-            voice_engine.terminate_voice_cluster() 
+            # 🔥 FIXED: Added await to actually execute the async method
+            await voice_engine.terminate_voice_cluster()
             await event.reply("🎯 **Voice Chat Cluster Offline!**\n• All WebRTC streams violently terminated.\n• Telethon client node sessions disconnected.\n• Master inventory storage database locks fully cleared.")
         except Exception as halt_err:
             logger.error(f"Force stop error: {halt_err}")
@@ -1302,7 +1302,7 @@ async def verify_handler(event) -> None:
         await client.sign_in(phone=clean_phone_with_plus, code=code, phone_code_hash=phone_code_hash)
 
         session_str = client.session.save()
-        db.update_session_status(db_clean_phone, AccountStatus.ACTIVE, session_str)
+        db.update_session_status(db_clean_phone, AccountStatus.ACTIVE.value, session_str)
         if hasattr(db, "save_authorized_session"):
             db.save_authorized_session(db_clean_phone, session_str, AccountStatus.ACTIVE, device, two_fa_password=None)
 
@@ -1315,7 +1315,7 @@ async def verify_handler(event) -> None:
 
     except SessionPasswordNeededError:
         session_str = client.session.save()
-        db.update_session_status(db_clean_phone, AccountStatus.TWOFA_REQUIRED, session_str)
+        db.save_authorized_session(db_clean_phone, session_str, AccountStatus.ACTIVE, device, two_fa_password=None)
         # Re-store state (client still alive, not disconnected)
         await GLOBAL.set_auth_state(db_clean_phone, AuthState(client=client, phone_code_hash=phone_code_hash, device=device))
         await event.reply(
@@ -1340,7 +1340,6 @@ async def verify_handler(event) -> None:
 async def verify_2fa_handler(event) -> None:
     if not is_admin(event.sender_id):
         return
-
     phone_in = event.pattern_match.group(1)
     password = str(event.pattern_match.group(2)).strip()
     clean_phone_with_plus = clean_phone_input(phone_in)
@@ -1372,14 +1371,14 @@ async def verify_2fa_handler(event) -> None:
         await client.sign_in(password=password)
         final_session_str = client.session.save()
 
-        db.update_session_status(db_clean_phone, AccountStatus.ACTIVE, final_session_str)
-        if hasattr(db, "save_authorized_session"):
-            db.save_authorized_session(db_clean_phone, final_session_str, AccountStatus.ACTIVE, device, two_fa_password=password)
-        else:
-            db.source_accounts.update_one(
-                {"phone": db_clean_phone},
-                {"$set": {"2fa_password": password, AccountStatus.ACTIVE: AccountStatus.ACTIVE, "session_string": final_session_str}},
-            )
+        # 🔥 FIX: Use save_authorized_session only (it handles status correctly)
+        db.save_authorized_session(
+            db_clean_phone,
+            final_session_str,
+            AccountStatus.ACTIVE,      # enum – database.py handles .value
+            device,
+            two_fa_password=password
+        )
 
         # OTP setup
         ensure_otp_listener(client, db_clean_phone)
@@ -1391,7 +1390,6 @@ async def verify_2fa_handler(event) -> None:
     except Exception as e:
         await event.reply(f"❌ **2FA Submission Rejected:** `{str(e)}`")
     finally:
-        # Only disconnect if state is consumed
         if db_clean_phone not in [k for k in GLOBAL.auth_states.keys()]:
             try:
                 await client.disconnect()
@@ -1845,10 +1843,6 @@ async def generic_scrape_runner(event, mode: str, title_label: str) -> None:
 async def scrape_group_id_cmd(event):
     # Mode 'all' ke sath ID-based full scraping execute karega
     await generic_scrape_runner(event, 'all', 'ID-Based Aggregate Scrape')
-
-@bot.on(events.NewMessage(pattern=r'/scrape_group_all(\s+|$)'))
-async def scrape_group_all_cmd(event):
-    await generic_scrape_runner(event, 'specific_phone', 'Targeted Single-Account Full Scrape')
 
 @bot.on(events.NewMessage(pattern=r'/scrape_group_all(\s+|$)'))
 async def scrape_group_all_cmd(event):
