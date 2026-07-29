@@ -4,7 +4,7 @@ Ultimate Enterprise Telegram Suite — Master Controller v2.0
 Enterprise-Grade Architecture | 100% Feature Parity | Zero Memory Leaks
 """
 
-import os, sys, asyncio, logging, random, time, pathlib, ssl, re, gc
+import os, sys, asyncio, logging, random, time, pathlib, ssl, re, gc, socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable, Set
@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
-from proxy_manager import RobustProxyManager
+from proxy_manager import ProxyManager
 from scraper import MemberScraper
 from videochat import CloudVoiceChatEngine
 from adder import EnterpriseMemberAdder
@@ -35,6 +35,10 @@ from web_console import console_router, init_console_db, setup_console_routes
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MasterSuiteBot")
 logging.getLogger("telethon").setLevel(logging.WARNING)
+
+# 🔥 FIX: Silence Telethon's repetitive internal network warnings when testing proxies
+logging.getLogger("telethon.network.mtprotosender").setLevel(logging.ERROR)
+logging.getLogger("telethon.network.connection.connection").setLevel(logging.ERROR)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -270,7 +274,11 @@ class GlobalState:
 
     async def pool_remove(self, phone: str) -> Optional[ClientPoolEntry]:
         async with self._pool_lock:
-            return self.client_pool.pop(phone, None)
+            entry = self.client_pool.pop(phone, None)
+            if entry:
+                try: await entry.client.disconnect()
+                except Exception: pass
+            return entry
 
     async def pool_cleanup_stale(self, max_idle: float = 3600) -> int:
         """Remove clients idle for more than max_idle seconds."""
@@ -324,17 +332,34 @@ GLOBAL.initialize()
 # DATABASE & SERVICE INSTANCES
 # ──────────────────────────────────────────────
 db = SuiteDatabase()
-proxy_manager = RobustProxyManager()
+proxy_manager = ProxyManager()
 scraper_engine = MemberScraper(db)
-voice_engine = CloudVoiceChatEngine(db, proxy_manager)
+voice_engine = CloudVoiceChatEngine(db)
 adder_engine = EnterpriseMemberAdder(db, proxy_manager)
 
-bot = TelegramClient('master_control_suite', CONFIG["API_ID"], CONFIG["API_HASH"])
+bot = TelegramClient(StringSession(), CONFIG["API_ID"], CONFIG["API_HASH"])
 dm_engine = setup_dmsender_handlers(bot, db, proxy_manager)
 
 # ──────────────────────────────────────────────
 # HELPER FUNCTIONS
 # ──────────────────────────────────────────────
+
+from telethon.errors import QueryIdInvalidError
+
+async def safe_answer(event, text=None, alert=False):
+    """Safely answers callback queries, ignoring expired ID errors."""
+    try:
+        await event.answer(text, alert=alert)
+    except QueryIdInvalidError:
+        pass  # Query already expired, ignore silently
+    except Exception:
+        pass
+
+def get_proxy_count() -> int:
+    try:
+        return proxy_manager.working_count
+    except AttributeError:
+        return len(proxy_manager.working_proxies) if hasattr(proxy_manager, 'working_proxies') else 0
 
 def clean_phone_input(phone_str: str) -> str:
     """Sanitize and normalize phone number to international format."""
@@ -356,9 +381,10 @@ def normalize_phone(phone: str) -> str:
 
 def is_admin(sender_id) -> bool:
     admin_id = CONFIG.get("ADMIN_ID")
-    if admin_id:
-        return str(sender_id) == str(admin_id).strip()
-    return True
+    if not admin_id:
+        logger.error("🚨 ADMIN_ID is not set! Rejecting all commands for security.")
+        return False
+    return str(sender_id) == str(admin_id).strip()
 
 
 def safe_session_str(record: dict) -> Optional[str]:
@@ -430,19 +456,24 @@ async def create_authenticated_client(record: dict) -> Optional[TelegramClient]:
     return client
 
 
-async def connect_client(client: TelegramClient, retries: int = 2) -> bool:
-    """Connect a client with retries."""
+async def connect_client(client: TelegramClient, retries: int = 1) -> bool:
+    """Connect a client with retries. BLAZING FAST FAIL."""
     for attempt in range(retries):
         try:
             if not client.is_connected():
-                await asyncio.wait_for(client.connect(), timeout=15.0)
+                await asyncio.wait_for(client.connect(), timeout=10.0)
             return True
-        except (asyncio.TimeoutError, OSError, ConnectionError, ssl.SSLError) as e:
+        except Exception as e:
+            # Catching broad Exception ensures Telethon-specific connection errors 
+            # are caught, allowing proper cleanup to prevent "Future exception" warnings.
+            try: 
+                await client.disconnect()
+            except Exception:
+                pass
             if attempt == retries - 1:
                 logger.warning(f"Failed to connect client after {retries} attempts: {e}")
                 return False
-            await asyncio.sleep(1 * (attempt + 1))
-    return False
+            await asyncio.sleep(0.5)
 
 
 @asynccontextmanager
@@ -487,7 +518,8 @@ async def managed_client(record: dict, use_pool: bool = True):
         device_model=device["device_model"],
         system_version=device["system_version"],
         app_version=device["app_version"],
-        timeout=10,
+        timeout=5.0,
+        connection_retries=1,
         proxy=proxy_dict,
     )
 
@@ -567,7 +599,26 @@ async def shared_login_process(phone: str) -> dict:
     )
 
     string_session = StringSession()
-    proxy_node = proxy_manager.get_secured_proxy() if getattr(proxy_manager, 'working_count', 0) > 0 else None
+    
+    proxy_node = None
+    raw_proxy = None
+    
+    # 1. Try to get a validated working proxy
+    if getattr(proxy_manager, 'working_count', 0) > 0:
+        raw_proxy = proxy_manager.get_proxy()
+    # 2. Fallback: If no validated proxies yet, try to parse the first raw proxy from the list
+    elif hasattr(proxy_manager, 'raw_proxies') and proxy_manager.raw_proxies:
+        raw_proxy = proxy_manager.parse_proxy_string(proxy_manager.raw_proxies[0])
+        
+    if raw_proxy:
+        proxy_node = {
+            "proxy_type": raw_proxy.get("proxy_type", "socks5"),
+            "addr": raw_proxy.get("addr"),
+            "port": int(raw_proxy.get("port", 0)),
+            "username": raw_proxy.get("username") or None,  # 🔥 FIX: None, not ""
+            "password": raw_proxy.get("password") or None,  # 🔥 FIX: None, not ""
+            "rdns": True
+        }
 
     client = TelegramClient(
         string_session,
@@ -576,6 +627,8 @@ async def shared_login_process(phone: str) -> dict:
         device_model=device.get("device_model", "PC 64bit"),
         system_version=device.get("system_version", "Windows 11"),
         app_version=device.get("app_version", "4.8.4"),
+        timeout=5.0,
+        connection_retries=1,
         proxy=proxy_node,
     )
 
@@ -610,7 +663,7 @@ async def shared_login_process(phone: str) -> dict:
 async def master_help_panel(event) -> None:
     if not is_admin(event.sender_id):
         return
-    all_sessions = db.get_all_suite_sessions()
+    all_sessions = await db.get_all_suite_sessions()
     status_bar = await build_premium_status_bar(all_sessions)
 
     text = (
@@ -637,7 +690,7 @@ async def master_help_panel(event) -> None:
 async def master_start_panel(event) -> None:
     if not is_admin(event.sender_id):
         return
-    all_sessions = db.get_all_suite_sessions()
+    all_sessions = await db.get_all_suite_sessions()
     status_bar = await build_premium_status_bar(all_sessions)
 
     text = (
@@ -667,7 +720,7 @@ async def centralized_ui_router(event) -> None:
         return
 
     route = event.data.decode('utf-8')
-    all_sessions = db.get_all_suite_sessions()
+    all_sessions = await db.get_all_suite_sessions()
     status_bar = await build_premium_status_bar(all_sessions)
     back_to_lvl1 = [[Button.inline("Back", data="nav_lvl1_main")]]
 
@@ -686,7 +739,7 @@ async def centralized_ui_router(event) -> None:
             [Button.inline("Search", data="nav_lvl1_search"),
              Button.inline("Analytics", data="nav_lvl1_stats")],
         ]
-        await event.edit(text, buttons=buttons)
+        await safe_edit(event, text, buttons)
 
     # ── LEVEL 1: ACCOUNTS ──
     elif route == "nav_lvl1_accounts":
@@ -794,9 +847,9 @@ async def centralized_ui_router(event) -> None:
             f"Voice Engine: " + ("🟢 Running" if voice_engine.is_running else "⚪ Inactive") + "\n"
             f"Member Adder: " + ("🟢 Running" if adder_engine.is_running else "⚪ Inactive") + "\n\n"
             f"**Infrastructure**\n"
-            f"Healthy Proxies: `{proxy_manager.working_count}`"
+            f"Healthy Proxies: `get_proxy_count()`"
         )
-        await event.edit(text, buttons=back_to_lvl1)
+        await safe_edit(event, text, buttons=back_to_lvl1)
 
     # ── LEVEL 1: DIAGNOSTICS ──
     elif route == "nav_lvl1_diag":
@@ -1025,7 +1078,7 @@ async def centralized_ui_router(event) -> None:
     elif route == "action_health_scan":
         await event.edit("⚕️ **Global Health Scan & Auto-Recovery Initiated!**\n\nScanning `failed` and `restricted` accounts...", buttons=None)
 
-        all_accounts = db.get_all_accounts_raw()
+        all_accounts = await db.get_all_accounts_raw()
         failed_accounts = [acc for acc in all_accounts if acc.get("status") in (
             AccountStatus.FAILED, AccountStatus.BANNED, AccountStatus.RESTRICTED)]
 
@@ -1097,7 +1150,7 @@ async def centralized_ui_router(event) -> None:
     elif route == "action_halt_adder":
         if adder_engine.is_running:
             adder_engine.halt_engine()
-            await event.answer("🛑 Member Adder halted safely.", alert=True)
+            await safe_answer(event, "🛑 Member Adder halted safely.", alert=True)
             await event.edit("🛑 **Member Adder Campaign Halted.** Active processes terminated and locks released.",
                              buttons=[[Button.inline("⬅️ Back", data="nav_lvl1_campaigns")]])
         else:
@@ -1125,10 +1178,17 @@ async def centralized_ui_router(event) -> None:
 
     elif route == "diag_proxy_health":
         await event.answer("Scanning proxy health...", alert=True)
-        task = asyncio.create_task(proxy_manager.run_pipeline_scan())
-        GLOBAL.register_task(task)
+        
+        # Start background testing thread
+        proxy_manager.start_background_testing()
+        
+        working = proxy_manager.working_count
+        total = proxy_manager.count
+        
         await event.edit(
-            f"**Proxy Scan Initiated**\nCurrently tracking `{proxy_manager.working_count}` healthy proxies.",
+            f"**✅ Proxy Scan Initiated**\n"
+            f"Currently tracking `{working}` healthy proxies out of `{total}` total.\n"
+            f"Background refresh active every 20 min.",
             buttons=back_to_lvl1,
         )
 
@@ -1186,7 +1246,7 @@ async def catch_global_search_inputs(event) -> None:
         raw_query = event.text.strip().replace("+", "").replace("@", "")
         await GLOBAL.set_search_query(None)
 
-        all_sessions = db.get_all_suite_sessions()
+        all_sessions = await db.get_all_suite_sessions()
         matched_doc = None
         for doc in all_sessions:
             phone = str(doc.get("phone", ""))
@@ -1208,6 +1268,14 @@ async def catch_global_search_inputs(event) -> None:
             )
         else:
             await event.reply("No account found matching your search criteria.")
+
+async def safe_edit(event, text, buttons=None):
+    """Edit a message, silently ignoring 'not modified' and 'query expired' errors."""
+    try:
+        await event.edit(text, buttons=buttons)
+    except (MessageNotModifiedError, QueryIdInvalidError) as e:
+        # Log at debug level to avoid clutter
+        logger.debug(f"Edit skipped: {e}")            
 
 
 # ──────────────────────────────────────────────
@@ -1436,7 +1504,7 @@ async def details_handler(event) -> None:
 async def list_handler(event) -> None:
     if not is_admin(event.sender_id):
         return
-    all_sessions = db.get_all_suite_sessions()
+    all_sessions = await db.get_all_suite_sessions()
     if not all_sessions:
         await event.reply("📂 **DB 1 Layer is empty.** Active or pending node lines zero.")
         return
@@ -1540,7 +1608,7 @@ async def terminate_manual_login(event) -> None:
     phone = args[1].strip().replace(" ", "")
     status_msg = await event.reply(f"⚡ **Initiating termination pipeline context for `{phone}`...**")
 
-    target_sessions = db.get_active_target_sessions()
+    target_sessions = await db.get_active_target_sessions()
     matched_acc = next((acc for acc in target_sessions if str(acc.get("phone")) == phone), None)
     if not matched_acc:
         await status_msg.edit(f"⚠️ **Query Exception:** `{phone}` Target DB clusters me nahi mila.")
@@ -1684,7 +1752,7 @@ async def global_health_scan_router(event) -> None:
         "Agar unka temporary Telegram Spam Mute expire ho gaya hoga, toh unhe auto-recover karke wapas `ACTIVE` pool mein add kiya jayega. Please wait..."
     )
 
-    all_accounts = db.get_all_accounts_raw()
+    all_accounts = await db.get_all_accounts_raw()
     failed_accounts = [acc for acc in all_accounts if acc.get("status") in (
         AccountStatus.FAILED, AccountStatus.BANNED, AccountStatus.RESTRICTED)]
 
@@ -1729,7 +1797,7 @@ async def global_health_scan_router(event) -> None:
     tasks = [asyncio.create_task(scan_and_recover(acc)) for acc in failed_accounts]
     await asyncio.gather(*tasks)
 
-    updated_all = db.get_all_accounts_raw()
+    updated_all = await db.get_all_accounts_raw()
     total_active = sum(1 for x in updated_all if x.get("status") == AccountStatus.ACTIVE)
 
     report = (
@@ -1800,41 +1868,40 @@ async def generic_scrape_runner(event, mode: str, title_label: str) -> None:
         selected_worker["session"] = safe_session_str(record)
         selected_worker["session_string"] = selected_worker["session"]
     else:
-        active_sessions = db.get_active_target_sessions()
+        active_sessions = await db.get_active_target_sessions()
         if not active_sessions:
             await event.reply("❌ **Operation Dropped:** Verified processing modules are empty. Run `/reload_accounts` first.")
             return
         selected_worker = random.choice(active_sessions)
-
+    #
     status_msg = await event.reply(
         f"📡 **Launching {title_label} Scan Engine...**\n"
         f"⚡ Connecting via targeted node endpoint `+{selected_worker['phone']}`..."
     )
 
-    async with managed_client(selected_worker, use_pool=True) as client:
-        try:
-            if mode == 'hidden':
-                count = await scraper_engine.scrape_hidden_matrix(selected_worker, target_link)
-            elif mode == 'voicechat':
-                count = await scraper_engine.scrape_voicechat_matrix(selected_worker, target_link)
-            else:
-                scrape_mode = 'all' if mode == 'specific_phone' else mode
-                count = await scraper_engine.scrape_standard_pool(selected_worker, target_link, scrape_mode)
+    try:
+        if mode == 'hidden':
+            count = await scraper_engine.scrape_hidden_matrix(selected_worker, target_link)
+        elif mode == 'voicechat':
+            count = await scraper_engine.scrape_voicechat_matrix(selected_worker, target_link)
+        else:
+            scrape_mode = 'all' if mode == 'specific_phone' else mode
+            count = await scraper_engine.scrape_standard_pool(selected_worker, target_link, scrape_mode)
 
-            report = (
-                f"🏆 **[{title_label}] Sequence Complete!**\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 **Metrics Summary Output:**\n"
-                f"• Scraper Account: `+{selected_worker['phone']}`\n"
-                f"• Destination Registry: `scraped_data` repository\n"
-                f"• Total Extracted Rows: `{count}` unique profiles saved\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✨ *Dataset is fully synced and ready for target multi-account campaigns.*"
-            )
-            await status_msg.edit(report)
-        except Exception as e:
-            logger.error(f"Scrape error: {e}")
-            await status_msg.edit(f"❌ **Scraper Infrastructure Exception:** `{str(e)[:150]}`")
+        report = (
+            f"🏆 **[{title_label}] Sequence Complete!**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 **Metrics Summary Output:**\n"
+            f"• Scraper Account: `+{selected_worker['phone']}`\n"
+            f"• Destination Registry: `scraped_data` repository\n"
+            f"• Total Extracted Rows: `{count}` unique profiles saved\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✨ *Dataset is fully synced and ready for target multi-account campaigns.*"
+        )
+        await status_msg.edit(report)
+    except Exception as e:
+        logger.error(f"Scrape error: {e}")
+        await status_msg.edit(f"❌ **Scraper Infrastructure Exception:** `{str(e)[:150]}`")
 
 
 # ── Scrape command registrations ──
@@ -1982,7 +2049,7 @@ async def run_member_adder_matrix(event) -> None:
     target = args[1].strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
 
     # Lock all active accounts
-    active_accounts = db.get_active_target_sessions()
+    active_accounts = await db.get_active_target_sessions()
     for acc in active_accounts:
         phone = acc.get("phone")
         if phone:
@@ -2025,7 +2092,7 @@ async def run_global_dmsender_matrix(event) -> None:
         await event.reply("⚠️ **Engine Occupied:** Campaign pehle se background me active hai.")
         return
 
-    all_scraped_data = list(db.scraped_members.find({}))
+    all_scraped_data = await asyncio.to_thread(list, db.scraped_members.find({}))
     if not all_scraped_data:
         await event.reply("❌ **Database Empty:** Scraped database me koi users nahi hain. Pehle `/scrape` commands run karein.")
         return
@@ -2071,7 +2138,7 @@ async def start_voice_engine_cmd(event) -> None:
     input_segments = raw_input.strip().split()
     target = input_segments[0].replace("<", "").replace(">", "").replace('"', '').replace("'", "")
 
-    active_pool = db.get_active_target_sessions()
+    active_pool = await db.get_active_target_sessions()
     total_available = len(active_pool)
     if total_available == 0:
         await event.reply("❌ **Operation Aborted:** Mapped source range limits are empty. No active sessions online.")
@@ -2104,7 +2171,7 @@ async def start_voice_engine_cmd(event) -> None:
 
 @bot.on(events.NewMessage(pattern='/status'))
 async def system_diagnostics_snapshot(event) -> None:
-    active_pool = len(db.get_active_target_sessions())
+    active_pool = len(await db.get_active_target_sessions())
     scraped_rows = db.count_scraped_data()
 
     adder_state = "`🟢 RUNNING`" if adder_engine.is_running else "`🔴 RESTING`"
@@ -2125,7 +2192,7 @@ async def system_diagnostics_snapshot(event) -> None:
         f"🚀 Member Adder Engine: {adder_state}\n"
         f"📨 Direct Message Engine: {dm_state}\n"
         f"🎙️ VoiceChat Stream Loop: {voice_state}\n\n"
-        f"🛡️ Validated Proxies Pool: `{proxy_manager.working_count}` functional"
+        f"🛡️ Validated Proxies Pool: `get_proxy_count()` functional"
     )
     await event.reply(text)
 
@@ -2154,11 +2221,12 @@ async def continuous_session_auditor() -> None:
 
     while True:
         try:
-            if not await GLOBAL.is_health_check_active():
+            # 🔥 AUTO-PAUSE: Automatically skip auditor cycles if heavy campaigns are running
+            if not await GLOBAL.is_health_check_active() or adder_engine.is_running or dm_engine.is_running or voice_engine.is_running:
                 await asyncio.sleep(30)
                 continue
 
-            active_accounts = db.get_active_target_sessions()
+            active_accounts = await db.get_active_target_sessions()
             if not active_accounts:
                 await asyncio.sleep(random.randint(600, 1200))
                 continue
@@ -2180,15 +2248,19 @@ async def continuous_session_auditor() -> None:
 
             accounts_checked = 0
             accounts_failed = 0
-
-            # ── 🔥 PARALLEL BATCH PROCESSING ──
+            
+            # ── 🔥 SEQUENTIAL PROCESSING TO PREVENT EVENT LOOP FREEZE ──
             for i in range(0, len(active_accounts), BATCH_SIZE):
                 if not await GLOBAL.is_health_check_active():
                     break
 
                 batch = active_accounts[i:i+BATCH_SIZE]
-                tasks = [_audit_single_account(acc) for acc in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                results = []
+                for acc in batch:
+                    # 🔥 Give control back to the event loop so DM/Adder workers can run
+                    await asyncio.sleep(0.1) 
+                    res = await _audit_single_account(acc)
+                    results.append(res)
 
                 for r in results:
                     if isinstance(r, Exception):
@@ -2307,12 +2379,13 @@ async def auto_health_recovery_loop() -> None:
     audit_logger.info("🏥 Auto-Recovery Background Engine Started.")
 
     while True:
-        if not await GLOBAL.is_health_check_active():
+        # 🔥 AUTO-PAUSE: Automatically skip recovery cycles if heavy campaigns are running
+        if not await GLOBAL.is_health_check_active() or adder_engine.is_running or dm_engine.is_running or voice_engine.is_running:
             await asyncio.sleep(60)
             continue
 
         try:
-            all_accounts = db.get_all_accounts_raw()
+            all_accounts = await db.get_all_accounts_raw()
             failed_accounts = [acc for acc in all_accounts if acc.get("status") in (
                 AccountStatus.FAILED, AccountStatus.BANNED, AccountStatus.RESTRICTED)]
 
@@ -2716,9 +2789,8 @@ async def main_lifecycle_bootstrap() -> None:
     else:
         logger.warning("🚨 'web_view' directory not found.")
 
-    # Start background proxy scan (keep reference)
-    task = asyncio.create_task(proxy_manager.run_pipeline_scan())
-    GLOBAL.register_task(task)
+    # Start background proxy scan
+    proxy_manager.start_background_testing()
 
     # Start bot
     await bot.start(bot_token=CONFIG["BOT_TOKEN"])

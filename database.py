@@ -15,6 +15,7 @@ import logging
 import asyncio
 import hashlib
 import functools
+from functools import partial
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Generator, Union
 from collections import OrderedDict
@@ -177,6 +178,10 @@ class SuiteDatabase:
         })
         
         try:
+            if hasattr(self, 'client') and self.client:
+                try: self.client.close()
+                except Exception: pass
+                
             self.client = MongoClient(
                 MONGODB_SETTINGS["MONGO_URI"],
                 **mongo_kwargs
@@ -300,12 +305,20 @@ class SuiteDatabase:
         """Create index only if it doesn't exist (avoids redundant createIndex calls)."""
         name = kwargs.get("name")
         if name:
-            existing = collection.index_information()
-            if name in existing:
-                return
+            try:
+                existing = collection.index_information()
+                if name in existing:
+                    return
+            except Exception:
+                pass
         try:
             collection.create_index(keys, **kwargs)
             logger.debug(f"📌 Created index {kwargs.get('name', keys)} on {collection.name}")
+        except OperationFailure as e:
+            if e.code == 85:  # IndexOptionsConflict
+                logger.debug(f"📌 Index already exists with different options on {collection.name}, safely skipped.")
+            else:
+                logger.warning(f"⚠️ Index creation skipped ({kwargs.get('name', keys)}): {e}")
         except Exception as e:
             logger.warning(f"⚠️ Index creation skipped ({kwargs.get('name', keys)}): {e}")
     
@@ -420,65 +433,61 @@ class SuiteDatabase:
         except Exception:
             return None
     
-    def get_all_suite_sessions(self) -> List[Dict[str, Any]]:
-        """Return ALL documents from source_accounts (projected)."""
+    
+    async def get_all_suite_sessions(self) -> List[Dict[str, Any]]:
+        """Return ALL documents from source_accounts (async thread-safe)."""
         self._ensure_connection()
+        
+        def fetch():
+            return list(self.src_accounts.find({}, {k: 1 for k in MAX_PROJECTION_FIELDS}))
+            
         try:
-            return list(self.src_accounts.find(
-                {},
-                {k: 1 for k in MAX_PROJECTION_FIELDS}
-            ))
+            return await self._run_sync(fetch)
         except Exception:
             return []
     
-    def get_all_accounts_raw(self) -> list:
+    async def get_all_accounts_raw(self) -> list:
         """Alias for fetch_source_accounts. Returns all raw docs."""
-        return self.fetch_source_accounts()
+        return await self._run_sync(self.fetch_source_accounts)
     
     # ────────────────────────────────────────────────────────────
     # 5. ACTIVE SESSION LISTING (HEAVILY OPTIMIZED)
     # ────────────────────────────────────────────────────────────
     
-    def get_active_target_sessions(self) -> list:
+    async def _run_sync(self, func, *args, **kwargs):
+        """Run a synchronous MongoDB method in a thread executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+    
+    async def get_active_target_sessions(self) -> list:
         """
-        FAST PATH: Returns active sessions with valid session strings.
-        Uses index-only scan where possible.
-        Performance: < 50ms for 10,000 accounts with 2,000 active.
+        FAST PATH: Uses run_in_executor to prevent blocking the async loop.
         """
         self._ensure_connection()
         active_pool = []
         
-        try:
-            # Use cursor with batch_size instead of loading all
+        def fetch_docs():
             cursor = self.src_accounts.find(
                 {"status": "active"},
-                {
-                    "phone": 1, "session": 1, "session_string": 1,
-                    "device_model": 1, "system_version": 1, "app_version": 1,
-                    "api_id": 1, "api_hash": 1, "device_metadata": 1,
-                    "first_name": 1, "account_sequence_index": 1,
-                    "last_updated": 1, "timestamp": 1, "authenticated_at": 1,
-                    "proxy": 1, "proxy_updated_at": 1,
-                }
+                {k: 1 for k in MAX_PROJECTION_FIELDS}
             ).batch_size(CURSOR_BATCH_SIZE)
+            return list(cursor)
+
+        try:
+            # Offload heavy I/O to thread pool
+            docs = await self._run_sync(fetch_docs)
             
-            for doc in cursor:
+            for doc in docs:
                 phone = doc.get("phone")
-                if not phone:
-                    continue
+                if not phone: continue
                 
                 phone_clean = str(phone).strip().replace(" ", "").replace("+", "")
-                
-                # Validate session string
                 session_token = doc.get("session") or doc.get("session_string")
-                if not session_token or str(session_token).strip() in ("", "None"):
-                    continue
                 
+                if not session_token or str(session_token).strip() in ("", "None"): continue
                 session_token = str(session_token).strip()
-                if len(session_token) <= 10:
-                    continue  # Invalid session
+                if len(session_token) <= 10: continue
                 
-                # Build normalized document
                 clean_doc = {
                     "phone": phone_clean,
                     "session": session_token,
@@ -499,7 +508,6 @@ class SuiteDatabase:
             
             logger.debug(f"📊 Active sessions: {len(active_pool)} from cursor scan.")
             return active_pool
-            
         except Exception as e:
             logger.error(f"❌ get_active_target_sessions error: {e}")
             return []
@@ -654,29 +662,19 @@ class SuiteDatabase:
             logger.error(f"❌ save_authorized_session failed for +{clean_phone}: {e}")
             raise
     
-    def update_session_status(
-        self, phone: str, status: str, session_str: Optional[str] = None
-    ) -> None:
-        """Update account status. Optionally update session string too."""
+    def update_session_status(self, phone: str, status: str, session_str: Optional[str] = None):
         clean_phone = self._normalize(phone)
-        if not clean_phone:
-            return
-        
+        if not clean_phone: return
         self.backup_original_session(clean_phone)
-        
         update_data = {
-            "status": status,
+            "status": status.value if hasattr(status, 'value') else status, # 🔥 FIX: Parse Enum
             "last_updated": datetime.utcnow(),
         }
         if session_str:
             update_data["session"] = session_str
             update_data["session_string"] = session_str
-        
         try:
-            self.src_accounts.update_one(
-                {"phone": clean_phone},
-                {"$set": update_data}
-            )
+            self.src_accounts.update_one({"phone": clean_phone}, {"$set": update_data})
             self._session_cache.invalidate(f"session:{clean_phone}")
             self._stats_cache.invalidate("status_bar")
         except Exception as e:
@@ -817,8 +815,8 @@ class SuiteDatabase:
     # 9. SCRAPED MEMBERS MANAGEMENT (bulk operations)
     # ────────────────────────────────────────────────────────────
     
-    def save_scraped_members(self, member_list: list, source_group: str) -> int:
-        """Bulk upsert scraped members. Returns count of new/modified docs."""
+    async def save_scraped_members(self, member_list: list, source_group: str) -> int:
+        """Bulk upsert scraped members (async thread-safe)."""
         if not member_list:
             return 0
         
@@ -828,103 +826,59 @@ class SuiteDatabase:
             m["scraped_at"] = datetime.utcnow()
             enriched.append(m)
         
-        # Process in batches of BULK_BATCH_SIZE
-        total_affected = 0
-        for i in range(0, len(enriched), BULK_BATCH_SIZE):
-            batch = enriched[i:i + BULK_BATCH_SIZE]
-            operations = [
-                UpdateOne(
-                    {"user_id": str(m.get("user_id", m.get("id", "")))},
-                    {"$set": m},
-                    upsert=True
-                )
-                for m in batch
-            ]
-            try:
-                result = self.scraped_members.bulk_write(operations, ordered=False)
-                total_affected += result.upserted_count + result.modified_count
-            except BulkWriteError as bwe:
-                # Count successful ops even with partial failures
-                details = bwe.details
-                total_affected += details.get("nUpserted", 0) + details.get("nModified", 0)
-                logger.warning(f"⚠️ Bulk write partial failure: {len(bwe.details.get('writeErrors', []))} errors")
-            except Exception as e:
-                logger.error(f"❌ bulk_write error: {e}")
-        
-        return total_affected
-    
-    def count_scraped_data(self) -> int:
-        """Get total scraped member count (cached)."""
-        cache_key = "scraped_count"
-        cached = self._stats_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        
+        def run_bulk():
+            total_affected = 0
+            for i in range(0, len(enriched), BULK_BATCH_SIZE):
+                batch = enriched[i:i + BULK_BATCH_SIZE]
+                operations = [
+                    UpdateOne(
+                        {"user_id": str(m.get("user_id", m.get("id", "")))},
+                        {"$set": m},
+                        upsert=True
+                    ) for m in batch
+                ]
+                try:
+                    result = self.scraped_members.bulk_write(operations, ordered=False)
+                    total_affected += result.upserted_count + result.modified_count
+                except BulkWriteError as bwe:
+                    total_affected += bwe.details.get("nUpserted", 0) + bwe.details.get("nModified", 0)
+            return total_affected
+
         try:
-            count = self.scraped_members.estimated_document_count()
-            self._stats_cache.set(cache_key, count)
-            return count
-        except Exception:
+            return await self._run_sync(run_bulk)
+        except Exception as e:
+            logger.error(f"❌ bulk_write error: {e}")
             return 0
     
-    def clear_scraped_data(self) -> int:
-        """Purge all scraped data. Returns count deleted."""
-        try:
-            result = self.scraped_members.delete_many({})
-            self._stats_cache.invalidate("scraped_count")
-            return result.deleted_count
-        except Exception:
-            return 0
+    async def count_scraped_data(self) -> int:
+        def run_count(): return self.scraped_members.estimated_document_count()
+        return await self._run_sync(run_count)
+        
     
-    def get_group_stats(self) -> list:
-        """Aggregate scraped data by source_group (fast aggregation pipeline)."""
-        try:
+    async def clear_scraped_data(self) -> int:
+        def run_del(): return self.scraped_members.delete_many({}).deleted_count
+        return await self._run_sync(run_del)
+    
+    async def get_group_stats(self) -> list:
+        def run_agg():
+            return list(self.scraped_members.aggregate([{"$group": {"_id": "$source_group", "count": {"$sum": 1}}}], allowDiskUse=True))
+        return await self._run_sync(run_agg)
+    
+    async def get_targets_by_group(self, group_name: str) -> list:
+        def run_find():
+            return list(self.scraped_members.find({"source_group": group_name}))
+        return await self._run_sync(run_find)
+    
+    async def fetch_unprocessed_scraped_pool(self) -> list:
+        def run_agg():
             pipeline = [
-                {"$group": {"_id": "$source_group", "count": {"$sum": 1}}},
-                {"$sort": {"count": -1}},
+                {"$lookup": {"from": MONGODB_SETTINGS["PROCESSED_MEMBERS_COLLECTION"], "localField": "user_id", "foreignField": "user_identifier", "as": "processed_match"}},
+                {"$match": {"processed_match": {"$size": 0}}},
+                {"$project": {"processed_match": 0}}
             ]
             return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))
-        except Exception:
-            return []
-    
-    def get_targets_by_group(self, group_name: str) -> list:
-        """Get scraped members for a specific source_group."""
         try:
-            return list(self.scraped_members.find(
-                {"source_group": group_name},
-                {"user_id": 1, "access_hash": 1, "username": 1, "phone": 1, "first_name": 1, "last_name": 1}
-            ))
-        except Exception:
-            return []
-    
-    def fetch_unprocessed_scraped_pool(self) -> list:
-        """
-        Get scraped members NOT yet processed (for DM/Adder pipelines).
-        Uses MongoDB $lookup to offload the diff computation to the server.
-        Prevents OOM crashes with large datasets.
-        """
-        try:
-            pipeline = [
-                {
-                    "$lookup": {
-                        "from": MONGODB_SETTINGS["PROCESSED_MEMBERS_COLLECTION"],
-                        "localField": "user_id",
-                        "foreignField": "user_identifier",
-                        "as": "processed_match"
-                    }
-                },
-                {
-                    "$match": {
-                        "processed_match": {"$size": 0}
-                    }
-                },
-                {
-                    "$project": {
-                        "processed_match": 0  # Exclude join temp field
-                    }
-                }
-            ]
-            return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))
+            return await self._run_sync(run_agg)
         except Exception as e:
             logger.error(f"fetch_unprocessed_scraped_pool aggregation failed: {e}")
             return []

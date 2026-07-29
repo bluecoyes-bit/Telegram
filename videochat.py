@@ -12,8 +12,7 @@ import random
 import logging
 import gc  # 🔥 NEW: Garbage collection control
 from typing import List, Dict, Optional, Any, Tuple, Set, TYPE_CHECKING
-from weakref import WeakSet
-from proxy_manager import RobustProxyManager, ProxyEntry
+from weakref import WeakSet  # 🔥 NEW: Weak references for task tracking
 
 
 from telethon import TelegramClient, events
@@ -93,13 +92,12 @@ def get_channel_peer_id(entity) -> int:
 class CloudVoiceChatEngine:
     """Manages secure WebRTC streaming loops, session cross-logins, and official service OTP wipes."""
     
-    def __init__(self, db: SuiteDatabase, proxy_manager: Optional[RobustProxyManager] = None):  
+    def __init__(self, db: SuiteDatabase):
         self.db = db
-        self.proxy_manager = proxy_manager
         self.scraper_helper = MemberScraper(db)
         self.is_running = False
         # 🔥 FIX 1: WeakSet instead of List for task tracking - avoids memory leaks
-        self._active_tasks: set = set()
+        self._active_tasks: WeakSet = WeakSet()
         self._running_calls: List[PyTgCalls] = []
         self._running_clients: List[TelegramClient] = []
         self._last_status: Dict[str, str] = {}
@@ -124,7 +122,7 @@ class CloudVoiceChatEngine:
 
         print("📡 Starting Deep Raw Account Validity and Strict 'session_backups' Sync...")
         
-        all_accounts = self.db.get_all_accounts_raw()
+        all_accounts = await self.db.get_all_accounts_raw()
         if not all_accounts:
             return {"processed": 0, "active": 0, "failed": 0, "skipped": 0, "errors": []}
 
@@ -463,8 +461,7 @@ class CloudVoiceChatEngine:
         acc_doc: Dict[str, Any],
         group_link: str,
         audio_path: str,
-        replacement_queue: asyncio.Queue,
-        proxy_manager: Optional[RobustProxyManager] = None,
+        replacement_queue: asyncio.Queue
     ):
         """Asynchronously spawns separate instances for independent audio delivery loops with Native PyTgCalls Takeover Guard."""
         phone = str(acc_doc.get("phone"))
@@ -481,41 +478,29 @@ class CloudVoiceChatEngine:
             return
 
         device = acc_doc.get("device_metadata") or acc_doc.get("device_fingerprint") or random.choice(DEVICE_PROFILES)
-
-        proxy_entry = None
-        proxy_dict = None
-        if proxy_manager:
-            # Try to get proxy from the same country as stored in acc_doc
-            stored_proxy = acc_doc.get("proxy")
-            preferred_country = stored_proxy.get("country") if stored_proxy else None
-            if preferred_country:
-                proxy_entry = proxy_manager.get_proxy_by_preference(preferred_country)
-            if not proxy_entry:
-                proxy_entry = proxy_manager.get_proxy("socks5") or proxy_manager.get_proxy("any")
-            if proxy_entry:
-                proxy_dict = proxy_entry.dict
-                self._voice_log(phone, f"Using proxy {proxy_entry.host}:{proxy_entry.port} (country={proxy_entry.country})")
-            else:
-                self._voice_log(phone, "No proxy available, using direct connection", "warning")
         
-        client = None
+        # 🔥 CRITICAL OPTIMIZATION: entity_cache_limit + receive_updates=False
+        client = TelegramClient(
+            StringSession(acc_doc.get("session_string")), 
+            int(acc_doc.get("api_id", CONFIG["API_ID"])), 
+            str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
+            device_model=device.get("device_model", "PC 64bit"),
+            system_version=device.get("system_version", "Windows 11"),
+            app_version=device.get("app_version", "4.8.4"),
+            # 🔥 KEY: Limit entity cache to prevent Telethon from caching thousands of users
+            entity_cache_limit=30,
+            # 🔥 KEY: Disable sequential updates for performance
+            sequential_updates=False,
+        )
+        
+        # 🔥 NEW: Disable entity saving - we don't need persistent entity cache
+        client.session.save_entities = False
+        
+        self._running_clients.append(client)
         target_entity = None
         app = None
         
         try:
-            client = TelegramClient(
-                StringSession(acc_doc.get("session_string")),
-                int(acc_doc.get("api_id", CONFIG["API_ID"])),
-                str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-                device_model=device.get("device_model", "PC 64bit"),
-                system_version=device.get("system_version", "Windows 11"),
-                app_version=device.get("app_version", "4.8.4"),
-                entity_cache_limit=30,
-                sequential_updates=False,
-                proxy=proxy_dict,
-            )
-            client.session.save_entities = False
-            self._running_clients.append(client)
             self._voice_log(phone, "Connecting Telegram client interface session...")
             await client.connect()
             
@@ -659,25 +644,23 @@ class CloudVoiceChatEngine:
                     await asyncio.sleep(5)
 
         except Exception as e:
-            if proxy_entry:
-                proxy_entry.record_failure()
             err_str = str(e).lower()
             self._voice_log(phone, f"💥 WebRTC Stream Dropout Exception caught: {e}", "error")
             if any(k in err_str for k in ["banned", "deactivated", "unregistered", "revoked", "disabled"]):
                 self.db.mark_account_failed(phone, f"Banned or Dropped during WebRTC call session: {err_str[:60]}")
+            
+            await self._trigger_replacement_spawn(replacement_queue, group_link, audio_path)
+
+        finally:
             try:
                 if app and app in self._running_calls: self._running_calls.remove(app)
                 if app: await app.stop()
             except: pass
             try:
                 if client in self._running_clients: self._running_clients.remove(client)
-                if client:
-                    await client.disconnect()
+                await client.disconnect()
             except: pass
             
-            await self._trigger_replacement_spawn(replacement_queue, group_link, audio_path)
-
-        finally:
             self.db.release_lock(phone)
             # 🔥 NEW: Force garbage collection after each stream ends
             if gc.isenabled():
@@ -709,9 +692,7 @@ class CloudVoiceChatEngine:
             next_backup_doc = replacement_queue.get_nowait()
             phone = next_backup_doc.get("phone")
             print(f"🔄 [REPLACEMENT ENGINE] Deploying backup session +{phone} into active voice cluster loop...", flush=True)
-            task = asyncio.create_task(self._execute_single_stream(
-                next_backup_doc, group_link, audio_path, replacement_queue, self.proxy_manager
-            ))
+            task = asyncio.create_task(self._execute_single_stream(next_backup_doc, group_link, audio_path, replacement_queue))
             # 🔥 FIX: Strong reference to prevent GC
             self._active_tasks.add(task)
             task.add_done_callback(self._active_tasks.discard)
@@ -727,7 +708,7 @@ class CloudVoiceChatEngine:
         self._last_status.clear()
         
         # 🔍 Database core pool extraction grid
-        active_pool = self.db.get_active_target_sessions()
+        active_pool = await self.db.get_active_target_sessions()
 
         if not active_pool:
             self.is_running = False
@@ -757,7 +738,7 @@ class CloudVoiceChatEngine:
         for acc in initial_deploy_batch:
             if not self.is_running:
                 break
-            task = asyncio.create_task(self._execute_single_stream(acc, group_link, audio_file, replacement_queue, self.proxy_manager))
+            task = asyncio.create_task(self._execute_single_stream(acc, group_link, audio_file, replacement_queue))
             self._active_tasks.add(task)
             task.add_done_callback(self._active_tasks.discard)
             launch_tasks.append(task)
@@ -767,38 +748,62 @@ class CloudVoiceChatEngine:
         return f"🚀 **Voice Chat Cluster Active Matrix Initiated:** Target set to `{actual_target}` (Total Available: `{total_fetched}`). Active connections are streaming. Backups loaded in queue: `{replacement_queue.qsize()}` accounts."
 
     async def terminate_voice_cluster(self):
-        if not self.is_running: return
-        print("🛑 [VOICECHAT MASTER] Shutdown Core Triggered.", flush=True)
+        """
+        🛑 GRACEFUL EMERGENCY SHUTDOWN
+        🔥 OPTIMIZED: Cleaner shutdown with resource deallocation
+        """
+        if not self.is_running:
+            return
+            
+        print("🛑 [VOICECHAT MASTER] Shutdown Core Triggered. Initiating graceful teardown...", flush=True)
         self.is_running = False
-        
+
+        # 1. Cancel pending deployment tasks immediately
         for task in list(self._active_tasks):
             try: task.cancel()
             except: pass
         self._active_tasks.clear()
 
-        # Step A: Hang up all PyTgCalls streams
-        for app in list(self._running_calls):
-            try: await app.stop()
-            except: pass
-        self._running_calls.clear()
+        async def _graceful_teardown():
+            # Step A: Hang up all PyTgCalls streams
+            print("⏳ [VOICECHAT] Sending LeaveCall requests to Telegram servers...", flush=True)
+            for app in list(self._running_calls):
+                try:
+                    await app.stop()
+                except Exception:
+                    pass
+            self._running_calls.clear()
+            
+            # Step B: Reduced cooldown from 2.0s to 1.0s
+            await asyncio.sleep(1.0)
+            
+            # Step C: Disconnect all Telethon clients
+            print("🔌 [VOICECHAT] Disconnecting Telegram Client Sockets...", flush=True)
+            for client in list(self._running_clients):
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            self._running_clients.clear()
+            
+            # 🔥 NEW: Clear client cache
+            for client in list(self._client_cache.values()):
+                try:
+                    await client.disconnect()
+                except: pass
+            self._client_cache.clear()
+            
+            # Step D: Release database locks
+            try:
+                self.db.release_all_locks()
+            except Exception: pass
+            
+            self._last_status.clear()
+            
+            # 🔥 NEW: Force garbage collection after shutdown
+            if gc.isenabled():
+                gc.collect()
+            
+            print("✅ [VOICECHAT MASTER] All accounts cleanly disconnected. Cluster is offline.", flush=True)
 
-        await asyncio.sleep(1.0)
-
-        # Step B: Disconnect all Telethon clients
-        for client in list(self._running_clients):
-            try: await client.disconnect()
-            except: pass
-        self._running_clients.clear()
-
-        # Step C: Clear client cache
-        for client in list(self._client_cache.values()):
-            try: await client.disconnect()
-            except: pass
-        self._client_cache.clear()
-
-        # Step D: Release database locks
-        try: self.db.release_all_locks()
-        except: pass
-        
-        if gc.isenabled(): gc.collect()
-        print("✅ [VOICECHAT MASTER] All accounts cleanly disconnected.", flush=True)
+        asyncio.create_task(_graceful_teardown())

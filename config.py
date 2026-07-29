@@ -89,8 +89,8 @@ class AuditorConfig:
     """Background session auditor tuning."""
     batch_size: int = field(default_factory=lambda: _env_int("AUDITOR_BATCH_SIZE", 10, 1, 100))
     batch_stagger: int = field(default_factory=lambda: _env_int("AUDITOR_BATCH_STAGGER", 15, 5, 120))
-    cooldown_min: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MIN", 1800, 300, 14400))
-    cooldown_max: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MAX", 3600, 600, 28800))
+    cooldown_min: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MIN", 43200, 300, 86400))
+    cooldown_max: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MAX", 86400, 600, 172800))
     enabled: bool = field(default_factory=lambda: _env_bool("AUDITOR_ENABLED", True))
 
 @dataclass
@@ -129,7 +129,7 @@ CONFIG: Dict[str, Any] = {
     # ── Core API Credentials ──
     "API_ID": _env_int("API_ID", 38223087, min_val=1),
     "API_HASH": _env_str("API_HASH", "f3448783d23ace67fecdef3f392d2e47"),
-    "BOT_TOKEN": _env_str("BOT_TOKEN", "8966015094:AAHsAICrx1J8mEx3hhOC4aiUJBJDLdQ_dj4"),
+    "BOT_TOKEN": _env_str("BOT_TOKEN", "8966015094:AAEKmjOFJ36CNH7dMZdt5raAFcgPgB9DtSU"),
 
     # ── Admin ──
     "ADMIN_ID": _env_str("ADMIN_ID", "5599766250"),
@@ -150,7 +150,7 @@ CONFIG: Dict[str, Any] = {
     "HUMAN_ADD_INTERVAL": (25, 45),
     "BURST_ADD_LIMIT": _env_int("BURST_ADD_LIMIT", 5, 1, 20),
     "BURST_COOLDOWN_TIME": (60, 120),
-    "LOOP_KEEP_ALIVE": (20, 35),
+    "LOOP_KEEP_ALIVE": (30, 45),
 
     # ── Pool / Caching (10k-scale) ──
     "MAX_POOL_SIZE": _env_int("MAX_POOL_SIZE", 50, 10, 500),
@@ -163,8 +163,8 @@ CONFIG: Dict[str, Any] = {
     # ── Auditor ──
     "AUDITOR_BATCH_SIZE": _env_int("AUDITOR_BATCH_SIZE", 10, 1, 100),
     "AUDITOR_BATCH_STAGGER": _env_int("AUDITOR_BATCH_STAGGER", 15, 5, 120),
-    "AUDITOR_COOLDOWN_MIN": _env_int("AUDITOR_COOLDOWN_MIN", 1800, 300, 14400),
-    "AUDITOR_COOLDOWN_MAX": _env_int("AUDITOR_COOLDOWN_MAX", 3600, 600, 28800),
+    "AUDITOR_COOLDOWN_MIN": _env_int("AUDITOR_COOLDOWN_MIN", 43200, 300, 86400),
+    "AUDITOR_COOLDOWN_MAX": _env_int("AUDITOR_COOLDOWN_MAX", 86400, 600, 172800),
     "AUDITOR_ENABLED": _env_bool("AUDITOR_ENABLED", True),
 
     # ── Adder ──

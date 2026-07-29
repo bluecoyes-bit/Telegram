@@ -181,7 +181,7 @@ def parse_chat_id(chat_id_str: str):
 async def api_console_accounts():
     global _db
     if not _db: return []
-    accounts = _db.get_all_suite_sessions()
+    accounts = await _db.get_all_suite_sessions()
     catalog = []
     for acc in accounts:
         catalog.append({
@@ -283,7 +283,7 @@ async def async_mass_join_worker(accounts, target_channel):
 async def trigger_mass_operation(req: MassActionRequest):
     global _db
     if not _db: return {"status": "error", "reason": "DB reference dropped."}
-    accounts = _db.get_all_suite_sessions()
+    accounts = await _db.get_all_suite_sessions()
     if not accounts:
         return {"status": "error", "reason": "No active identity sessions found inside the database pool container."}
     asyncio.create_task(async_mass_join_worker(accounts, req.target_channel))
@@ -664,7 +664,8 @@ async def api_console_chat_info(phone: str, chat_id: str):
         members_list = []
         if not is_user:
             try:
-                async for p in client.iter_participants(entity):
+                # 🔥 FIX: Forced limit to prevent 502 Proxy Timeout
+                async for p in client.iter_participants(entity, limit=100):
                     role = "member"
                     if isinstance(p.participant, ChannelParticipantCreator): role = "owner"
                     elif isinstance(p.participant, ChannelParticipantAdmin): role = "admin"
@@ -747,8 +748,12 @@ async def api_console_analytics(phone: str):
     profile = await api_console_get_profile(phone)
     health = await api_console_health_metrics(phone)
     global _db
-    total_sessions = len(_db.get_all_suite_sessions()) if _db else 0
-    active_sessions = len([a for a in (_db.get_all_suite_sessions() if _db else []) if a.get("status") == "active"])
+    
+    # Fetch all sessions (await the async method)
+    all_sessions = await _db.get_all_suite_sessions() if _db else []
+    total_sessions = len(all_sessions)
+    active_sessions = len([a for a in all_sessions if a.get("status") == "active"])
+    
     return {
         "status": "success",
         "total_sessions": total_sessions,
