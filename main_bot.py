@@ -22,13 +22,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+import gc
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
 from proxy_manager import ProxyManager
 from scraper import MemberScraper
 from videochat import CloudVoiceChatEngine
-from adder import EnterpriseMemberAdder
+from adder import EnterpriseMemberAdder, AdderState, status_updater_loop
 from dmsender import setup_dmsender_handlers
 from web_console import console_router, init_console_db, setup_console_routes
 
@@ -419,10 +420,16 @@ def get_account_label(acc: dict) -> str:
     first_name = str(acc.get("first_name") or "").strip()
     name_lbl = f"👤 {first_name} | " if first_name and first_name != "None" else ""
 
-    login_time_raw = acc.get("authenticated_at") or acc.get("last_updated") or acc.get("timestamp")
+    login_time_raw = acc.get("authenticated_at") or acc.get("timestamp") or acc.get("last_updated")
     if isinstance(login_time_raw, (int, float)):
         login_time_raw = datetime.utcfromtimestamp(login_time_raw)
-    date_str = login_time_raw.strftime("%d-%m-%Y | %H:%M") if isinstance(login_time_raw, datetime) else "N/A Date"
+    
+    # 🔥 FIX: Convert DB UTC time to IST for Explorer display UI
+    if isinstance(login_time_raw, datetime):
+        ist_time = login_time_raw + timedelta(hours=5, minutes=30)
+        date_str = ist_time.strftime("%d-%m-%Y | %H:%M")
+    else:
+        date_str = "N/A Date"
 
     return f"{status_icon} {name_lbl}+{phone_num} • 🗓️ {date_str}"
 
@@ -452,6 +459,9 @@ async def create_authenticated_client(record: dict) -> Optional[TelegramClient]:
         system_version=device["system_version"],
         app_version=device["app_version"],
         timeout=10,
+        entity_cache_limit=100,
+        sequential_updates=False,
+        receive_updates=False,
     )
     return client
 
@@ -521,6 +531,9 @@ async def managed_client(record: dict, use_pool: bool = True):
         timeout=5.0,
         connection_retries=1,
         proxy=proxy_dict,
+        entity_cache_limit=100,          # limit entity cache to reduce RAM
+        sequential_updates=False,        # avoid processing updates sequentially
+        receive_updates=False,           # we don't need live updates in most operations
     )
 
     try:
@@ -552,14 +565,13 @@ async def managed_client(record: dict, use_pool: bool = True):
 # ──────────────────────────────────────────────
 # OTP HANDLER REGISTRY (avoid duplicate listeners)
 # ──────────────────────────────────────────────
-_otp_handlers_registered: Set[str] = set()
 
 
 def ensure_otp_listener(client: TelegramClient, phone_key: str) -> None:
     """Register OTP listener only once per phone key."""
-    if phone_key in _otp_handlers_registered:
+    if getattr(client, "_otp_registered", False):
         return
-    _otp_handlers_registered.add(phone_key)
+    client._otp_registered = True
 
     @client.on(events.NewMessage(from_users=777000))
     async def telegram_service_handler(event) -> None:
@@ -583,13 +595,14 @@ async def fetch_past_otps(client: TelegramClient, phone_key: str) -> None:
 
 
 # ──────────────────────────────────────────────
-# SHARED LOGIN PROCESS
+# SHARED LOGIN PROCESS (STRICT PROXY ROTATION)
 # ──────────────────────────────────────────────
 
 async def shared_login_process(phone: str) -> dict:
     """
-    Send login code request. Returns dict with client, device, code_hash.
-    Raises on failure.
+    Send login code request strictly through proxy.
+    Rotates through multiple healthy proxies if one fails.
+    No direct internet fallback to protect IP.
     """
     clean_phone = normalize_phone(phone)
     existing = db.get_session_by_phone(clean_phone)
@@ -600,60 +613,80 @@ async def shared_login_process(phone: str) -> dict:
 
     string_session = StringSession()
     
-    proxy_node = None
-    raw_proxy = None
-    
-    # 1. Try to get a validated working proxy
-    if getattr(proxy_manager, 'working_count', 0) > 0:
-        raw_proxy = proxy_manager.get_proxy()
-    # 2. Fallback: If no validated proxies yet, try to parse the first raw proxy from the list
-    elif hasattr(proxy_manager, 'raw_proxies') and proxy_manager.raw_proxies:
-        raw_proxy = proxy_manager.parse_proxy_string(proxy_manager.raw_proxies[0])
+    max_attempts = 4  # 🔥 System 4 alag-alag proxies try karega
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        proxy_node = None
+        raw_proxy = None
         
-    if raw_proxy:
-        proxy_node = {
-            "proxy_type": raw_proxy.get("proxy_type", "socks5"),
-            "addr": raw_proxy.get("addr"),
-            "port": int(raw_proxy.get("port", 0)),
-            "username": raw_proxy.get("username") or None,  # 🔥 FIX: None, not ""
-            "password": raw_proxy.get("password") or None,  # 🔥 FIX: None, not ""
-            "rdns": True
-        }
+        # 1. Naye ProxyManager se properly proxy fetch karein
+        raw_proxy = proxy_manager.get_proxy()
+                
+        # 2. Fallback: Agar working proxy na ho toh list se random proxy uthayein
+        if not raw_proxy and proxy_manager.proxies:
+            raw_proxy = random.choice(proxy_manager.proxies)
+            
+        if raw_proxy:
+            proxy_node = {
+                "proxy_type": raw_proxy.get("type", "socks5"),
+                "addr": raw_proxy.get("host"),
+                "port": raw_proxy.get("port"),
+                "username": raw_proxy.get("username") or None,
+                "password": raw_proxy.get("password") or None,
+                "rdns": True
+            }
 
-    client = TelegramClient(
-        string_session,
-        api_id=CONFIG["API_ID"],
-        api_hash=CONFIG["API_HASH"],
-        device_model=device.get("device_model", "PC 64bit"),
-        system_version=device.get("system_version", "Windows 11"),
-        app_version=device.get("app_version", "4.8.4"),
-        timeout=5.0,
-        connection_retries=1,
-        proxy=proxy_node,
-    )
+        client = TelegramClient(
+            string_session,
+            api_id=CONFIG["API_ID"],
+            api_hash=CONFIG["API_HASH"],
+            device_model=device.get("device_model", "PC 64bit"),
+            system_version=device.get("system_version", "Windows 11"),
+            app_version=device.get("app_version", "4.8.4"),
+            timeout=10.0,           
+            connection_retries=1,   
+            request_retries=1,      
+            proxy=proxy_node,
+        )
 
-    try:
-        await asyncio.wait_for(client.connect(), timeout=20.0)
-        send_code_result = await client.send_code_request(phone)
-        code_hash = send_code_result.phone_code_hash
-
-        db.save_pending_session(clean_phone, string_session.save(), AccountStatus.PENDING, code_hash, device)
-
-        return {
-            "status": "code_sent",
-            "phone": phone,
-            "db_clean_phone": clean_phone,
-            "code_hash": code_hash,
-            "device": device,
-            "client": client,
-        }
-    except Exception:
         try:
-            await client.disconnect()
-        except Exception:
-            pass
-        raise
+            async def _proxy_req():
+                await client.connect()
+                return await client.send_code_request(phone)
+                
+            send_code_result = await asyncio.wait_for(_proxy_req(), timeout=20.0)
+            code_hash = send_code_result.phone_code_hash
 
+            db.save_pending_session(clean_phone, string_session.save(), AccountStatus.PENDING, code_hash, device)
+            
+            proxy_label = f"{raw_proxy.get('host') or raw_proxy.get('addr')}:{raw_proxy.get('port')}" if raw_proxy else "Direct / None"
+            
+            return {
+                "status": "code_sent",
+                "phone": phone,
+                "db_clean_phone": clean_phone,
+                "code_hash": code_hash,
+                "device": device,
+                "client": client,
+                "proxy_used": proxy_label,
+            }
+        except Exception as e:
+            last_error = e
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            
+            # 🔥 PUNISH DEAD PROXY: Naye architecture ke method ko call karein
+            if raw_proxy:
+                proxy_manager.mark_failed(raw_proxy)
+                
+            logger.warning(f"Proxy attempt {attempt}/{max_attempts} failed ({proxy_node.get('addr') if proxy_node else 'None'}). Rotating to next proxy...")
+            continue  
+
+    logger.error(f"Strict Proxy Policy: Exhausted all {max_attempts} attempts. Last error: {str(last_error)}")
+    raise Exception(f"Proxy Connection Failed! 🛑 System ne {max_attempts} alag-alag proxies try kiye par sabne connection drop kar diya. Real IP secure rakha gaya hai.")
 
 # ──────────────────────────────────────────────
 # 1. HELP PANEL
@@ -771,7 +804,7 @@ async def centralized_ui_router(event) -> None:
 
     # ── LEVEL 1: DATA EXTRACTION ──
     elif route == "nav_lvl1_data":
-        scraped_rows = db.count_scraped_data()
+        scraped_rows = await db.count_scraped_data()
         text = (
             "🛰️ **CORE DATA EXTRACTION CONTROL ROOM**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -837,7 +870,7 @@ async def centralized_ui_router(event) -> None:
 
     # ── LEVEL 1: STATS ──
     elif route == "nav_lvl1_stats":
-        scraped_rows = db.count_scraped_data()
+        scraped_rows = await db.count_scraped_data()
         text = (
             "**Analytics & System Health**\n\n"
             f"**Storage**\n"
@@ -906,9 +939,10 @@ async def centralized_ui_router(event) -> None:
             "revoked": lambda x: x.get("status") == AccountStatus.REVOKED,
             "pending": lambda x: x.get("status") in (AccountStatus.PENDING, AccountStatus.TWOFA_REQUIRED),
             "today": lambda x: (
-                (last_up := x.get("last_updated") or x.get("timestamp")) is not None and
-                (isinstance(last_up, datetime) and last_up >= today_start or
-                 isinstance(last_up, (int, float)) and datetime.utcfromtimestamp(last_up) >= today_start)
+            # 🔥 FIX: Strictly check original login/creation time, ignore health checks
+            (last_up := x.get("authenticated_at") or x.get("timestamp") or x.get("last_updated")) is not None and
+            (isinstance(last_up, datetime) and last_up >= today_start or
+             isinstance(last_up, (int, float)) and datetime.utcfromtimestamp(last_up) >= today_start)
             ),
         }
         pred = filter_map.get(current_filter, lambda x: True)
@@ -969,7 +1003,7 @@ async def centralized_ui_router(event) -> None:
             Button.inline("⬅️ Return to Accounts Admin", data="nav_lvl1_accounts"),
         ])
 
-        await event.edit(explorer_text, buttons=explorer_buttons)
+        await safe_edit(event, explorer_text, explorer_buttons)
 
     # ── LEVEL 3: ACCOUNT PROFILE ──
     elif route.startswith("view_prof_"):
@@ -1159,8 +1193,8 @@ async def centralized_ui_router(event) -> None:
     # ── ACTION: CLEAR SCRAPED ──
     elif route == "action_clear_scraped":
         try:
-            total = db.count_scraped_data()
-            db.clear_scraped_data()
+            total = await db.count_scraped_data()
+            await db.clear_scraped_data()
             await event.edit(f"🗑️ **Cloud Database Purged Clean!**\nPurged `{total}` profile rows from repository collections.",
                              buttons=back_to_lvl1)
         except Exception as e:
@@ -1299,6 +1333,7 @@ async def login_handler(event) -> None:
         client = login_result["client"]
         device = login_result["device"]
         code_hash = login_result["code_hash"]
+        proxy_used = login_result.get("proxy_used", "Direct / None")  # 🔥 Extract proxy info
 
         # Store auth state with TTL
         await GLOBAL.set_auth_state(db_clean_phone, AuthState(
@@ -1310,10 +1345,12 @@ async def login_handler(event) -> None:
         await event.reply(
             f"📥 **OTP Code Sent Successfully!**\n"
             f"👤 **Phone:** `{phone}`\n"
-            f"📱 **Device Profile:** `{device.get('device_model', 'Unknown')}`\n\n"
+            f"📱 **Device Profile:** `{device.get('device_model', 'Unknown')}`\n"
+            f"🛡️ **Proxy Used:** `{proxy_used}`\n\n"  # 🔥 Display proxy details
             f"🔑 Ab input verify karein use karke:\n`/verify {db_clean_phone} CODE`"
         )
         logger.info(f"✅ OTP sent for {phone}")
+
 
     except asyncio.TimeoutError:
         logger.error(f"Timeout for {phone}")
@@ -1948,11 +1985,11 @@ async def scrape_hidden_cmd(event):
 @bot.on(events.NewMessage(pattern='/delete_scraped_files'))
 async def delete_scraped_files_cmd(event) -> None:
     try:
-        total = db.count_scraped_data()
+        total = await db.count_scraped_data()
         if total == 0:
             await event.reply("📂 **Database Notice:** Your cloud memory `scraped_members` collection layer is already completely empty.")
             return
-        db.clear_scraped_data()
+        await db.clear_scraped_data()
         await event.reply(f"🗑️ **Cloud Database Purged Clean!**\n\nSuccessfully dropped and cleared `{total}` user rows from your live MongoDB database server.")
     except Exception as e:
         logger.error(f"Delete scraped error: {e}")
@@ -2033,46 +2070,57 @@ async def direct_contact_csv_scraper(event) -> None:
 # 22. MEMBER ADDER
 # ──────────────────────────────────────────────
 
-@bot.on(events.NewMessage(pattern='/addmembers'))
+@bot.on(events.NewMessage(pattern=r"^/addmembers (.+)"))
 async def run_member_adder_matrix(event) -> None:
     if not is_admin(event.sender_id):
         return
+
     if adder_engine.is_running:
         await event.reply("⚠️ Member Adding background engine processing pool is occupied right now.")
         return
 
-    args = event.text.split()
-    if len(args) < 2:
-        await event.reply("❌ **Syntax Error:** Use: `/addmembers <group_link>`")
-        return
+    chat_id = event.chat_id
+    target_group_link = event.pattern_match.group(1).strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
 
-    target = args[1].strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
-
-    # Lock all active accounts
+    # Lock all active accounts safely before campaign
     active_accounts = await db.get_active_target_sessions()
     for acc in active_accounts:
         phone = acc.get("phone")
         if phone:
             db.acquire_lock(normalize_phone(str(phone)))
 
-    status_msg = await event.reply(
-        "🚀 **Triggering Multi-Account Rotating Member Adder Engine...**\n*Session tracking layers locked safely.*"
-    )
-    logger.info(f"⚡ Launching adder to target: {target}")
-
-    async def inline_ui_callback(text_update):
-        try:
-            await status_msg.edit(f"⚙️ **Adder Status:**\n{text_update}")
-        except Exception:
-            pass
+    logger.info(f"⚡ Launching enterprise adder to target: {target_group_link}")
 
     try:
-        final_output = await adder_engine.execute_adding_pipeline(target, inline_ui_callback)
-        await event.reply(final_output)
+        # 1. Initialize State Tracker
+        adder_state = AdderState(total_target=0, max_workers=10)
+
+        # 2. Send initial status message to get message_id
+        status_msg_obj = await bot.send_message(chat_id, "🚀 Initializing Enterprise System...")
+
+        # 3. Fire & Forget background updater task
+        asyncio.create_task(
+            status_updater_loop(bot, chat_id, status_msg_obj.id, adder_state)
+        )
+
+        async def dummy_callback(text):
+            pass
+
+        # 4. Start Worker Queue with state tracker
+        result_text = await adder_engine.execute_adding_pipeline(
+            target_group_link=target_group_link,
+            update_callback=dummy_callback,
+            adder_state=adder_state
+        )
+
+        # 5. Send final summary report
+        await bot.send_message(chat_id, result_text)
+
     except Exception as e:
         logger.error(f"Adder error: {e}")
         await event.reply(f"❌ **Adder System Exception:** `{str(e)[:200]}`")
     finally:
+        # Release account locks after completion/failure
         for acc in active_accounts:
             phone = acc.get("phone")
             if phone:
@@ -2172,7 +2220,7 @@ async def start_voice_engine_cmd(event) -> None:
 @bot.on(events.NewMessage(pattern='/status'))
 async def system_diagnostics_snapshot(event) -> None:
     active_pool = len(await db.get_active_target_sessions())
-    scraped_rows = db.count_scraped_data()
+    scraped_rows = await db.count_scraped_data()
 
     adder_state = "`🟢 RUNNING`" if adder_engine.is_running else "`🔴 RESTING`"
     dm_state = "`🟢 RUNNING`" if dm_engine.is_running else "`🔴 RESTING`"
@@ -2258,7 +2306,7 @@ async def continuous_session_auditor() -> None:
                 results = []
                 for acc in batch:
                     # 🔥 Give control back to the event loop so DM/Adder workers can run
-                    await asyncio.sleep(0.1) 
+                    await asyncio.sleep(3.0) 
                     res = await _audit_single_account(acc)
                     results.append(res)
 
@@ -2271,9 +2319,12 @@ async def continuous_session_auditor() -> None:
 
                 # Stagger between batches (much shorter than per-account)
                 await asyncio.sleep(BATCH_STAGGER)
+                # Trigger GC more often to free objects
+                if random.random() < 0.5:
+                    gc.collect()
 
             # ── Pool cleanup ──
-            evicted = await GLOBAL.pool_cleanup_stale(max_idle=7200)
+            evicted = await GLOBAL.pool_cleanup_stale(max_idle=1800)
             if evicted:
                 audit_logger.info(f"🧹 Cleaned {evicted} stale pooled connections.")
 
@@ -2319,7 +2370,7 @@ async def _audit_single_account(account_doc: dict) -> bool:
     is_duplicate = False
 
     try:
-        async with managed_client(account_doc, use_pool=True) as client:
+        async with managed_client(account_doc, use_pool=False) as client:
             me = await asyncio.wait_for(client.get_me(), timeout=10.0)
             if not me:
                 return True  # Not a failure, just empty response
@@ -2349,7 +2400,8 @@ async def _audit_single_account(account_doc: dict) -> bool:
         db.mark_account_revoked(clean_phone, reason_failed)
         await GLOBAL.pool_remove(clean_phone)
 
-        now_str = datetime.now().strftime("%d-%m-%Y | %H:%M:%S")
+        ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        now_str = ist_time.strftime("%d-%m-%Y | %H:%M:%S")
         icon = "⚠️" if is_duplicate else "❌"
         alert = (
             f"{icon} **Session Status login removed!**\n\n"
@@ -2556,7 +2608,7 @@ async def api_login(req: LoginReq):
             phone_code_hash=code_hash,
         )
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/verify")
@@ -2582,9 +2634,12 @@ async def api_verify(req: VerifyReq):
         me = await client.get_me()
         return {"status": "ok", "phone": req.phone, "name": f"{me.first_name or ''} {me.last_name or ''}".strip(), "id": me.id}
     except SessionPasswordNeededError:
+        # 🔥 FIX: Save partially authenticated session string and update status to TWOFA_REQUIRED
+        session_str = client.session.save()
+        auth_bot.db.save_authorized_session(phone_normalized, session_str, "2fa_required", device, two_fa_password=None)
         return {"status": "2fa_required", "phone": req.phone}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/verify_2fa")
@@ -2611,7 +2666,7 @@ async def api_verify_2fa(req: Verify2FAReq):
         me = await client.get_me()
         return {"status": "ok", "phone": req.phone, "name": f"{me.first_name or ''} {me.last_name or ''}".strip(), "id": me.id}
     except Exception as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/sessions")
@@ -2697,28 +2752,30 @@ async def api_logout(phone: str):
 @app.post("/bulk_login")
 async def api_bulk_login(req: BulkLoginReq):
     if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
+        raise HTTPException(status_code=503, detail="Bot not initialized")
     results = {"sent": [], "already": [], "failed": {}}
-    for phone in req.phones:
+    for raw_phone in req.phones:
+        phone = normalize_phone(raw_phone)
         try:
             async with auth_bot._lock:
-                if phone in auth_bot.sessions:
-                    results["already"].append(phone)
+                if phone in auth_bot.sessions or phone in auth_bot.pending_codes:
+                    results["already"].append(raw_phone)
                     continue
-            client = auth_bot.create_user_client(phone)
-            await client.connect()
-            if await client.is_user_authorized():
-                async with auth_bot._lock:
-                    auth_bot.sessions[phone] = client
-                results["already"].append(phone)
-                continue
-            sent = await client.send_code_request(phone)
+            
+            # 🔥 FIX: Use shared_login_process to properly store the session to the DB and acquire device profiles
+            login_result = await shared_login_process(raw_phone)
+            
             async with auth_bot._lock:
-                auth_bot.pending_codes[phone] = {"client": client, "phone_code_hash": sent.phone_code_hash, "timeout": sent.timeout}
-            results["sent"].append(phone)
+                auth_bot.pending_codes[phone] = {
+                    "client": login_result["client"], 
+                    "phone_code_hash": login_result["code_hash"], 
+                    "timeout": 120,
+                    "device": login_result["device"]
+                }
+            results["sent"].append(raw_phone)
             await asyncio.sleep(3)
         except Exception as e:
-            results["failed"][phone] = str(e)
+            results["failed"][raw_phone] = str(e)
     return results
 
 

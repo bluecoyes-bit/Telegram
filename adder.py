@@ -11,6 +11,7 @@ import asyncio
 import random
 import logging
 from typing import List, Dict, Optional, Any, Tuple
+from datetime import datetime, timedelta
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -19,12 +20,12 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import InputPeerChannel, InputPeerUser
 from telethon.errors import (
     UserPrivacyRestrictedError, UserAlreadyParticipantError,
-    FloodWaitError, PeerFloodError, UserIdInvalidError
+    FloodWaitError, PeerFloodError, UserIdInvalidError, MessageNotModifiedError
 )
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
-from proxy_manager import RobustProxyManager
+from proxy_manager import ProxyManager
 from scraper import MemberScraper
 
 logger = logging.getLogger("SuiteAdder")
@@ -32,26 +33,171 @@ logger = logging.getLogger("SuiteAdder")
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+
+# ==========================================
+# 🛠️ PATCH 1: The Tracker & Variables
+# ==========================================
+class AdderState:
+    def __init__(self, total_target, max_workers):
+        self.start_time = time.time()
+        self.is_running = True
+        
+        # Queue metrics
+        self.completed = 0
+        self.skipped = 0
+        self.total_target = total_target
+        
+        # Infra metrics
+        self.active_workers = 0
+        self.max_workers = max_workers
+        self.failures = 0
+        
+        # Performance metrics
+        self.total_delay_sum = 0.0 # Track total delay to calculate average
+        self.status_msg = "Running" # Can change to "Completed", "Paused", etc.
+        
+    def stop(self):
+        self.is_running = False
+        self.status_msg = "Completed"
+
+
+# ==========================================
+# 🛠️ PATCH 2: The UI Message Generator Function
+# ==========================================
+def generate_status_ui(state: AdderState) -> str:
+    # 1. Calculate Runtime
+    elapsed_seconds = max(1, int(time.time() - state.start_time))
+    runtime_str = str(timedelta(seconds=elapsed_seconds))
+    
+    # 2. Queue Math
+    remaining = max(0, state.total_target - state.completed - state.skipped)
+    completion_pct = 0.0
+    if state.total_target > 0:
+         completion_pct = (state.completed + state.skipped) / state.total_target * 100
+
+    # 3. Health Math
+    health = "Excellent"
+    if state.failures > (state.max_workers * 2):
+        health = "Warning ⚠️"
+    if state.failures > (state.max_workers * 5):
+        health = "Critical ❌"
+
+    worker_health_pct = max(0, 100 - (state.failures * 2)) 
+
+    # 4. Performance Math (Throughput & Delay)
+    elapsed_minutes = elapsed_seconds / 60
+    throughput = round(state.completed / elapsed_minutes, 1) if elapsed_minutes > 0 else 0
+    
+    avg_delay = round(state.total_delay_sum / state.completed, 1) if state.completed > 0 else 0.0
+
+    # 5. ETA Math
+    eta_str = "Calculating..."
+    if throughput > 0:
+        eta_minutes = remaining / throughput
+        eta_td = timedelta(minutes=eta_minutes)
+        hours, remainder = divmod(eta_td.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        eta_str = f"{hours:02}h {minutes:02}m"
+        if eta_td.days > 0:
+            eta_str = f"{eta_td.days}d " + eta_str
+
+    # 6. Formatting the Exact UI Structure
+    ui = f"""⚙️ Adder Status:
+📊 Live Tracking: {state.completed} members added.
+
+🚀 **ENTERPRISE MEMBER ADDER**
+
+────────────────────────────────
+⚡ **SYSTEM STATUS**
+
+⏱️ **Runtime**            {runtime_str}
+🟢 **Status**            {state.status_msg}
+🛡️ **Health**           {health}
+────────────────────────────────
+
+🎯 **QUEUE MANAGEMENT**
+
+✅ **Completed**           {state.completed}
+⏭️ **Skipped**              {state.skipped}
+⏳ **Remaining**            {remaining}
+
+📈 **Completion**           {completion_pct:.1f}%
+────────────────────────────────
+
+🏗️ **INFRASTRUCTURE**
+
+👥 **Worker Pool**          {state.active_workers} / {state.max_workers}
+🟢 **Worker Health**        {worker_health_pct}%
+⚠️ **Failures**             {state.failures}
+────────────────────────────────
+
+🚀 **PERFORMANCE**
+
+⚡ **Throughput**           {throughput} members/min
+⏱️ **Average Delay**        {avg_delay} sec
+🕒 **Est. Finish**     {eta_str}
+────────────────────────────────
+🔄 *Updated just now*"""
+
+    return ui
+
+
+# ==========================================
+# 🛠️ PATCH 3: The Background Monitor Task
+# ==========================================
+async def status_updater_loop(client, chat_id, message_id, state: AdderState):
+    """
+    Yeh independent background task hai.
+    Main script freeze ho ya block ho, yeh UI refresh karta rahega.
+    """
+    while state.is_running:
+        try:
+            new_text = generate_status_ui(state)
+            
+            # Send the edit request (Update interval: 10 seconds to avoid flood waits)
+            await client.edit_message(chat_id, message_id, new_text)
+            
+        except MessageNotModifiedError:
+            # Telegram throws this if the message hasn't changed. Ignore it safely.
+            pass
+        except Exception as e:
+            # Agar network issue hai toh yahan catch hoga, par loop break nahi hoga.
+            pass
+            
+        await asyncio.sleep(10) # ⏳ Wait 10 seconds before next refresh
+
+    # Final UI update immediately after the adder loop finishes
+    try:
+        final_text = generate_status_ui(state)
+        # Update 'Updated just now' to exact completion time
+        final_text = final_text.replace("Updated just now", f"Completed at {datetime.now().strftime('%H:%M:%S')}")
+        await client.edit_message(chat_id, message_id, final_text)
+    except Exception:
+        pass
+
+
 class EnterpriseMemberAdder:
     """Manages multi-account smart rotation loops, safe bursts padding, and anti-ban tracking matrix."""
     
-    def __init__(self, db: SuiteDatabase, proxy_manager: Optional[RobustProxyManager] = None):
+    def __init__(self, db: SuiteDatabase, proxy_manager: Optional[ProxyManager] = None):
         self.db = db
         self.proxy_manager = proxy_manager
         self.scraper_helper = MemberScraper(db)
         self.is_running = False
+        self.adder_state: Optional[AdderState] = None # Added for state tracking
         
         # Telemetry metrics trace trackers
         self.total_added = 0
         self.accounts_down = 0
         self.privacy_skips = 0
 
-    async def execute_adding_pipeline(self, target_group_link: str, update_callback) -> str:
+    async def execute_adding_pipeline(self, target_group_link: str, update_callback, adder_state: Optional[AdderState] = None) -> str:
         """
         Executes structural lookups from Scraped DB pool, starts multiple account workers,
         and updates progress states back to the live central Telegram Bot UI dashboard.
         """
         self.is_running = True
+        self.adder_state = adder_state
         self.total_added = 0
         self.accounts_down = 0
         self.privacy_skips = 0
@@ -78,8 +224,23 @@ class EnterpriseMemberAdder:
         PROGRESS_UPDATE_INTERVAL = int(CONFIG.get("ADDER_PROGRESS_UPDATE_INTERVAL", 10))
 
         members_queue = asyncio.Queue()
-        for member in scraped_pool:
-            await members_queue.put(member)
+        PAGE_SIZE = 500
+        offset = 0
+        while True:
+            page = await self.db.fetch_unprocessed_scraped_pool_paginated(offset, PAGE_SIZE)
+            if not page:
+                break
+            for member in page:
+                await members_queue.put(member)
+            offset += PAGE_SIZE
+            if len(page) < PAGE_SIZE:
+                break
+
+        # Dynamically set target for the UI state tracker
+        if self.adder_state:
+            self.adder_state.total_target = members_queue.qsize()
+            self.adder_state.max_workers = MAX_WORKER_SESSIONS
+            self.adder_state.active_workers = 0
 
         accounts_queue = asyncio.Queue()
         for acc_doc in active_accounts:
@@ -90,26 +251,71 @@ class EnterpriseMemberAdder:
             self.db.acquire_lock(phone) # 🔒 Lock account instantly so auditor ignores it
             
             session_str = acc_doc.get("session_string") or acc_doc.get("session")
-            # Use permanent device metadata if available
             device = acc_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
             
-            # Proxy allocation check integration
-            proxy_node = None
-            if self.proxy_manager and self.proxy_manager.working_count > 0:
-                proxy_node = self.proxy_manager.get_secured_proxy()
+            # 🚀 PATCH: 5 Attempts with Strict Proxy Rotation (No Direct Connection)
+            max_attempts = 5
+            client = None
+            is_connected = False
+            
+            for attempt in range(1, max_attempts + 1):
+                proxy_node = None
+                # Fetch fresh proxy on EVERY attempt
+                if self.proxy_manager and self.proxy_manager.working_count > 0:
+                    raw_proxy = self.proxy_manager.get_proxy()
+                    if raw_proxy:
+                        proxy_node = {
+                            "proxy_type": raw_proxy.get("type", "socks5"),
+                            "addr": raw_proxy.get("host"),
+                            "port": raw_proxy.get("port"),
+                            "username": raw_proxy.get("username"),
+                            "password": raw_proxy.get("password"),
+                            "rdns": True
+                        }
+                
+                # Strict check: Agar proxy nahi mili, toh wait and retry. Direct connection NAHI karni.
+                if not proxy_node:
+                    logger.warning(f"⚠️ No active proxies available for {phone} (Attempt {attempt}). Waiting...")
+                    await asyncio.sleep(random.uniform(2.0, 4.0))
+                    continue
 
-            client = TelegramClient(
-                StringSession(session_str),
-                int(acc_doc.get("api_id", CONFIG["API_ID"])),
-                str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-                device_model=device.get("device_model", "PC 64bit"),
-                system_version=device.get("system_version", "Windows 11"),
-                app_version=device.get("app_version", "4.8.4"),
-                proxy=proxy_node
-            )
+                # Initialize client inside loop to apply new proxy dynamically
+                client = TelegramClient(
+                    StringSession(session_str),
+                    int(acc_doc.get("api_id", CONFIG["API_ID"])),
+                    str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
+                    device_model=device.get("device_model", "PC 64bit"),
+                    system_version=device.get("system_version", "Windows 11"),
+                    app_version=device.get("app_version", "4.8.4"),
+                    proxy=proxy_node # 🔥 Strict proxy integration
+                )
+
+                try:
+                    await client.connect()
+                    # Double check if session is still alive after connecting
+                    if await client.is_user_authorized():
+                        is_connected = True
+                        break # ✅ Success! Break the retry loop
+                    else:
+                        raise ValueError("Session Unauthorized/Dead")
+                        
+                except Exception as e:
+                    logger.debug(f"🔄 Proxy/Connect attempt {attempt} failed for {phone}: {e}")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    
+                    # Background delay before trying the next proxy
+                    if attempt < max_attempts:
+                        await asyncio.sleep(random.uniform(1.5, 3.5)) 
+            
+            # Agar 5 attempts ke baad bhi fail ho gaya, toh account ko safe mark karke drop karo
+            if not is_connected or not client:
+                self.db.release_lock(phone) # 🔓 Unlock safely
+                return None
 
             try:
-                await client.connect()
                 target_entity = None
                 
                 try:
@@ -142,7 +348,7 @@ class EnterpriseMemberAdder:
                     await client.disconnect()
                 except Exception:
                     pass
-                self.db.release_lock(phone) # 🔓 Unlock immediately if initialization fails
+                self.db.release_lock(phone) # 🔓 Unlock immediately if entity resolution fails
                 return None
 
         async def worker_loop():
@@ -157,7 +363,12 @@ class EnterpriseMemberAdder:
                         worker_account = await initialize_account(account_doc)
                         if worker_account is None:
                             self.accounts_down += 1
+                            if self.adder_state:
+                                self.adder_state.failures += 1
                             continue
+                        
+                        if self.adder_state:
+                            self.adder_state.active_workers += 1
 
                     try:
                         member = members_queue.get_nowait()
@@ -175,34 +386,59 @@ class EnterpriseMemberAdder:
                         elif uid and access_hash and access_hash != "0":
                             target_user = InputPeerUser(int(uid), int(access_hash))
                         else:
+                            if self.adder_state: self.adder_state.skipped += 1
                             self.db.log_addition_state(uid, uname, "invalid_identity")
                             continue
 
+                        api_start_time = time.time()
                         await worker_account["client"](InviteToChannelRequest(worker_account["target_peer"], [target_user]))
+                        api_delay = time.time() - api_start_time
+
                         self.total_added += 1
                         worker_account["burst_count"] += 1
                         self.db.log_addition_state(uid, uname, "success_added")
+                        
+                        if self.adder_state:
+                            self.adder_state.completed += 1
+                            self.adder_state.total_delay_sum += api_delay
 
                         if self.total_added % PROGRESS_UPDATE_INTERVAL == 0:
-                            await update_callback(f"📊 **Live Tracking:** `{self.total_added}` members added.")
+                            # Default callback only triggers if enterprise monitor is not initialized
+                            if not self.adder_state:
+                                await update_callback(f"📊 **Live Tracking:** `{self.total_added}` members added.")
 
                         if worker_account["burst_count"] >= BURST_ADD_LIMIT:
-                            await asyncio.sleep(random.uniform(*BURST_COOLDOWN_TIME))
+                            sleep_time = random.uniform(*BURST_COOLDOWN_TIME)
+                            if self.adder_state: self.adder_state.total_delay_sum += sleep_time
+                            await asyncio.sleep(sleep_time)
                             worker_account["burst_count"] = 0
                         else:
-                            await asyncio.sleep(random.uniform(*HUMAN_ADD_INTERVAL))
+                            sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
+                            if self.adder_state: self.adder_state.total_delay_sum += sleep_time
+                            await asyncio.sleep(sleep_time)
 
                     except UserPrivacyRestrictedError:
                         self.privacy_skips += 1
+                        if self.adder_state: self.adder_state.skipped += 1
                         self.db.log_addition_state(uid, uname, "privacy_restricted")
-                        await asyncio.sleep(random.uniform(3, 6))
+                        
+                        sleep_time = random.uniform(3, 6)
+                        if self.adder_state: self.adder_state.total_delay_sum += sleep_time
+                        await asyncio.sleep(sleep_time)
 
                     except UserAlreadyParticipantError:
+                        if self.adder_state: self.adder_state.skipped += 1
                         self.db.log_addition_state(uid, uname, "already_member")
-                        await asyncio.sleep(random.uniform(1.5, 3.5))
+                        
+                        sleep_time = random.uniform(1.5, 3.5)
+                        if self.adder_state: self.adder_state.total_delay_sum += sleep_time
+                        await asyncio.sleep(sleep_time)
 
                     except (PeerFloodError, FloodWaitError):
                         self.accounts_down += 1
+                        if self.adder_state:
+                            self.adder_state.failures += 1
+                            self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
                         await members_queue.put(member) # 🔥 Repopulate queue on drop
                         try:
                             await worker_account["client"].disconnect()
@@ -213,6 +449,7 @@ class EnterpriseMemberAdder:
                         continue
 
                     except (UserIdInvalidError, ValueError):
+                        if self.adder_state: self.adder_state.skipped += 1
                         self.db.log_addition_state(uid, uname, "invalid_identity")
                         continue
 
@@ -220,6 +457,10 @@ class EnterpriseMemberAdder:
                         err_msg = str(crash).lower()
                         if any(k in err_msg for k in ["banned", "deactivated", "revoked", "disabled"]):
                             self.accounts_down += 1
+                            if self.adder_state:
+                                self.adder_state.failures += 1
+                                self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
+                                
                             if hasattr(self.db, "mark_account_failed"):
                                 self.db.mark_account_failed(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
                             else:
@@ -231,10 +472,16 @@ class EnterpriseMemberAdder:
                             self.db.release_lock(worker_account["phone"]) # 🔓 Unlock banned account
                             worker_account = None
                             continue
-                        await asyncio.sleep(random.uniform(8, 12))
+                            
+                        sleep_time = random.uniform(8, 12)
+                        if self.adder_state: self.adder_state.total_delay_sum += sleep_time
+                        await asyncio.sleep(sleep_time)
+                        
             finally:
                 # Loop khatam hone ke baad final cleanup
                 if worker_account is not None:
+                    if self.adder_state:
+                        self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
                     try:
                         await worker_account["client"].disconnect()
                     except Exception:
@@ -248,6 +495,10 @@ class EnterpriseMemberAdder:
         except asyncio.CancelledError:
             pass
 
+        # Stop tracker gracefully after gathering workers
+        if self.adder_state:
+            self.adder_state.stop()
+
         if self.accounts_down >= len(active_accounts) and not members_queue.empty():
             return (
                 f"⚠️ **All Active Workers Stopped!** Limit reached or sessions blocked. Try again later.\n\n📊 **Final Metrics Summary:**\n- Total Added: `{self.total_added}`\n- Banned/Down Nodes: `{self.accounts_down}`"
@@ -260,6 +511,8 @@ class EnterpriseMemberAdder:
     def halt_engine(self):
         """Kills active loop variables instantly safely."""
         self.is_running = False
+        if hasattr(self, 'adder_state') and self.adder_state:
+            self.adder_state.stop()
         if hasattr(self, 'active_workers'):
             for worker in self.active_workers:
                 worker.cancel()

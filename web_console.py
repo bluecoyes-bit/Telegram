@@ -12,7 +12,7 @@ import logging
 import asyncio
 from typing import Optional
 import datetime
-
+from collections import OrderedDict
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from telethon import TelegramClient
@@ -94,20 +94,21 @@ def setup_console_routes(db_instance):
 # =====================================================================
 # 🔐 PERSISTENT CONNECTION POOL (Collision-Safe)
 # =====================================================================
-ACTIVE_CLIENT_POOL = {}
+ACTIVE_CLIENT_POOL = OrderedDict()
+MAX_WEB_POOL_SIZE = 50          # maximum clients to keep in memory
+WEB_CLIENT_IDLE_TIMEOUT = 300    # seconds before eviction (currently not enforced, but we'll use LRU)
 CLIENT_LOCKS = {}
 
 async def get_buffered_active_client(phone: str, record: dict) -> TelegramClient:
     """
     Fetches or creates a long-lived TelegramClient session.
     Uses asyncio.Lock() per phone node to prevent concurrent request overlap.
-    Automatically cleans up dead/revoked clients and expired locks.
+    Implements LRU eviction to limit the pool size.
     """
     clean_phone = phone.replace("+", "").replace(" ", "")
     
     # Enforce CLIENT_LOCKS size limit to prevent memory leaks
     if len(CLIENT_LOCKS) > 500:
-        # Prune locks not in active pool
         active_phones = set(ACTIVE_CLIENT_POOL.keys())
         stale_locks = [p for p in CLIENT_LOCKS.keys() if p not in active_phones]
         for p in stale_locks:
@@ -117,19 +118,20 @@ async def get_buffered_active_client(phone: str, record: dict) -> TelegramClient
         CLIENT_LOCKS[clean_phone] = asyncio.Lock()
         
     async with CLIENT_LOCKS[clean_phone]:
+        # Check if client exists and is healthy
         if clean_phone in ACTIVE_CLIENT_POOL:
             client = ACTIVE_CLIENT_POOL[clean_phone]
             try:
                 if client.is_connected():
                     if await client.is_user_authorized():
+                        # Mark as recently used
+                        ACTIVE_CLIENT_POOL.move_to_end(clean_phone)
                         return client
                     else:
-                        # Unauthorized: disconnect and remove from pool
-                        logger.warning(f"Client for +{clean_phone} is disconnected or unauthorized. Reinitializing.")
+                        logger.warning(f"Client for +{clean_phone} is unauthorized. Reinitializing.")
                         await client.disconnect()
                         ACTIVE_CLIENT_POOL.pop(clean_phone, None)
                 else:
-                    # Not connected: clean up
                     ACTIVE_CLIENT_POOL.pop(clean_phone, None)
             except Exception as e:
                 logger.debug(f"Client health check failed for +{clean_phone}: {e}")
@@ -148,7 +150,6 @@ async def get_buffered_active_client(phone: str, record: dict) -> TelegramClient
             "app_version": record.get("app_version", "4.8.4")
         }
         
-        # Get proxy configuration
         proxy_dict = record.get("proxy")
         
         logger.info(f"🔌 Spawning collision-safe persistent MTProto node link for +{clean_phone}")
@@ -159,7 +160,10 @@ async def get_buffered_active_client(phone: str, record: dict) -> TelegramClient
             device_model=device["device_model"],
             system_version=device["system_version"],
             app_version=device["app_version"],
-            proxy=proxy_dict if (proxy_dict and isinstance(proxy_dict, dict)) else None
+            proxy=proxy_dict if (proxy_dict and isinstance(proxy_dict, dict)) else None,
+            entity_cache_limit=50,           # Limit entity cache size
+            sequential_updates=False,        # Disable sequential updates
+            receive_updates=False,           # No need for live updates
         )
         await client.connect()
         
@@ -167,7 +171,20 @@ async def get_buffered_active_client(phone: str, record: dict) -> TelegramClient
             await client.disconnect()
             raise PermissionError("Session authentication trace expired or revoked.")
             
+        # Add to pool and mark as recent
         ACTIVE_CLIENT_POOL[clean_phone] = client
+        ACTIVE_CLIENT_POOL.move_to_end(clean_phone)
+        
+        # Enforce pool size limit by evicting oldest (LRU)
+        while len(ACTIVE_CLIENT_POOL) > MAX_WEB_POOL_SIZE:
+            oldest_phone, oldest_client = ACTIVE_CLIENT_POOL.popitem(last=False)
+            try:
+                await oldest_client.disconnect()
+            except:
+                pass
+            CLIENT_LOCKS.pop(oldest_phone, None)
+            logger.info(f"Evicted idle client for +{oldest_phone} from web pool")
+        
         return client
 
 # Helper to safely parse chat IDs (handles negative IDs for groups/channels)
@@ -235,10 +252,10 @@ async def api_console_send_message(req: SendMessageRequest):
         if not content:
             return {"status": "error", "reason": "Message text is empty."}
         # 🔥 FIX: Handle edit message and safe reply_to casting
-        if req.edit_id:
+        if req.edit_id and str(req.edit_id).strip():
             await client.edit_message(target_id, int(req.edit_id), content)
         else:
-            reply_to_id = int(req.reply_to) if req.reply_to else None
+            reply_to_id = int(req.reply_to) if req.reply_to and str(req.reply_to).strip() else None
             await client.send_message(target_id, content, reply_to=reply_to_id)
         return {"status": "success"}
     except Exception as e:
@@ -248,13 +265,14 @@ async def api_console_send_message(req: SendMessageRequest):
 # =====================================================================
 # 🤖 MASS AUTOMATION & LIVE BACKGROUND TELEMETRY HUB
 # =====================================================================
-automation_logs_stream = []
+from collections import deque
+automation_logs_stream = deque(maxlen=100)
 
 def append_system_log(message: str):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 🔥 FIX: Convert Backend Automation Logs to IST Time
+    ist_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
+    timestamp = ist_time.strftime("%Y-%m-%d %H:%M:%S")
     automation_logs_stream.append(f"[{timestamp}] ⚙️ {message}")
-    if len(automation_logs_stream) > 100:
-        automation_logs_stream.pop(0)
 
 @console_router.get("/api/console/automation-logs")
 async def get_live_automation_logs():
@@ -373,7 +391,9 @@ async def api_console_messages(phone: str, chat_id: str):
             if not msg.message and not msg.media:
                 continue
             text = str(msg.message or "").strip()
-            time_node = msg.date.strftime("%H:%M")
+            # 🔥 FIX: Convert Telethon UTC msg.date to IST
+            ist_date = msg.date + datetime.timedelta(hours=5, minutes=30)
+            time_node = ist_date.strftime("%H:%M")
             media_type = "text"
             media_data = None  # 🔥 Will hold rich media object
 
@@ -820,9 +840,10 @@ async def api_console_chat_media(phone: str, chat_id: str, media_type: str):
             elif media_type == "voices" and isinstance(msg.media, MessageMediaDocument):
                 attributes = getattr(msg.media.document, 'attributes', [])
                 if any(getattr(a, 'voice', False) for a in attributes):
+                    ist_date = msg.date + datetime.timedelta(hours=5, minutes=30)
                     extracted_items.append({
                         "id": msg.id,
-                        "date": msg.date.strftime("%d %b %H:%M"),
+                        "date": ist_date.strftime("%d %b %H:%M"),  # 🔥 FIX: Converted to IST
                         "duration": "Voice Note Clip"
                     })
         return {"status": "success", "media_type": media_type, "items": extracted_items}

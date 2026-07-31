@@ -185,13 +185,14 @@ class CloudVoiceChatEngine:
                 # Remove stale cache entry
                 del self._client_cache[cache_key]
             
-            client = TelegramClient(
+                client = TelegramClient(
                 StringSession(session_str), api_id, api_hash,
                 device_model=device.get("device_model", "PC 64bit"),
                 system_version=device.get("system_version", "Windows 11"),
                 app_version=device.get("app_version", "4.8.4"),
-                # 🔥 CRITICAL: Limit entity cache to prevent RAM explosion
                 entity_cache_limit=50,
+                sequential_updates=False,
+                receive_updates=False,
             )
             
             try:
@@ -248,6 +249,14 @@ class CloudVoiceChatEngine:
 
         # Final flush for remaining items
         await self._flush_batches(batch_active_updates, batch_backup_upserts, batch_removals)
+
+        # Clean up client cache to free resources
+        for client in self._client_cache.values():
+            try:
+                await client.disconnect()
+            except:
+                pass
+        self._client_cache.clear()
 
         return {
             "processed": len(all_accounts),
@@ -487,10 +496,9 @@ class CloudVoiceChatEngine:
             device_model=device.get("device_model", "PC 64bit"),
             system_version=device.get("system_version", "Windows 11"),
             app_version=device.get("app_version", "4.8.4"),
-            # 🔥 KEY: Limit entity cache to prevent Telethon from caching thousands of users
             entity_cache_limit=30,
-            # 🔥 KEY: Disable sequential updates for performance
             sequential_updates=False,
+            receive_updates=False,
         )
         
         # 🔥 NEW: Disable entity saving - we don't need persistent entity cache
@@ -664,7 +672,7 @@ class CloudVoiceChatEngine:
             self.db.release_lock(phone)
             # 🔥 NEW: Force garbage collection after each stream ends
             if gc.isenabled():
-                gc.collect()
+                asyncio.get_running_loop().run_in_executor(None, gc.collect)
 
     # 🔥 NEW: Periodic cleanup method to prevent memory accumulation
     async def _periodic_stream_cleanup(self, client):
@@ -729,9 +737,6 @@ class CloudVoiceChatEngine:
         for backup_doc in backup_accounts_pool:
             await replacement_queue.put(backup_doc)
 
-        # 🔥 OPTIMIZATION: Create a connection semaphore to limit concurrent spawns
-        # 10 concurrent connections max to prevent CPU/memory spike
-        self._connection_semaphore = asyncio.Semaphore(10)
         
         # 🔥 OPTIMIZATION: Staggered launch with semaphore
         launch_tasks = []
@@ -802,7 +807,7 @@ class CloudVoiceChatEngine:
             
             # 🔥 NEW: Force garbage collection after shutdown
             if gc.isenabled():
-                gc.collect()
+                asyncio.get_running_loop().run_in_executor(None, gc.collect)
             
             print("✅ [VOICECHAT MASTER] All accounts cleanly disconnected. Cluster is offline.", flush=True)
 

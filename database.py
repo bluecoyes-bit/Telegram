@@ -594,14 +594,19 @@ class SuiteDatabase:
             "account_sequence_index": (
                 existing.get("account_sequence_index", 1) if existing else 1
             ),
-            "timestamp": int(time.time()),
             "last_updated": datetime.utcnow(),
         }
         
         try:
             self.src_accounts.update_one(
                 {"phone": clean_phone},
-                {"$set": payload},
+                {
+                    "$set": payload,
+                    "$setOnInsert": {
+                        "timestamp": int(time.time()),
+                        "authenticated_at": datetime.utcnow()
+                    }
+                },
                 upsert=True
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
@@ -703,7 +708,6 @@ class SuiteDatabase:
             "app_version": (device or {}).get("app_version", "4.8.4"),
             "status": "active",
             "sync_status": "migrated_active",
-            "timestamp": datetime.utcnow(),
             "last_verified": datetime.utcnow(),
             "migrated_at": datetime.utcnow(),
         }
@@ -711,7 +715,13 @@ class SuiteDatabase:
         try:
             self.src_accounts.update_one(
                 {"phone": clean_phone},
-                {"$set": payload},
+                {
+                    "$set": payload,
+                    "$setOnInsert": {
+                        "timestamp": int(time.time()),
+                        "authenticated_at": datetime.utcnow()
+                    }
+                },
                 upsert=True
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
@@ -1184,3 +1194,21 @@ class SuiteDatabase:
         except Exception as e:
             logger.error(f"compute_status_bar_data error: {e}")
             return {"total": 0, "active": 0, "revoked": 0, "pending": 0, "failed": 0}
+        
+        
+    async def fetch_unprocessed_scraped_pool_paginated(self, skip: int, limit: int) -> list:
+        """
+        Fetch a page of unprocessed scraped members using $skip/$limit.
+        This avoids loading the entire result set into memory.
+        """
+        self._ensure_connection()
+        pipeline = [
+            {"$lookup": {"from": MONGODB_SETTINGS["PROCESSED_MEMBERS_COLLECTION"],
+                         "localField": "user_id", "foreignField": "user_identifier", "as": "processed_match"}},
+            {"$match": {"processed_match": {"$size": 0}}},
+            {"$project": {"processed_match": 0}},
+            {"$skip": skip},
+            {"$limit": limit}
+        ]
+        # Use aggregation with allowDiskUse to handle large datasets
+        return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))        

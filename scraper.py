@@ -142,7 +142,10 @@ class MemberScraper:
             str(account_doc.get("api_hash", CONFIG["API_HASH"])),
             device_model=device.get("device_model", "PC 64bit"),
             system_version=device.get("system_version", "Windows 11"),
-            app_version=device.get("app_version", "4.8.4")
+            app_version=device.get("app_version", "4.8.4"),
+            entity_cache_limit=100,     # limit entity cache
+            sequential_updates=False,   # disable sequential updates
+            receive_updates=False,      # no need for live updates
         )
         
         try:

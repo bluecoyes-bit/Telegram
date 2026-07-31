@@ -314,6 +314,8 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None):
     @bot.on(events.NewMessage(pattern='/send_dmsender'))
     async def wizard_start(event):
         if not is_admin(event.sender_id): return
+        # Flush stale state data for this user to reclaim RAM
+        sender_engine.wizard_state.pop(event.sender_id, None)
         
         if sender_engine.is_running:
             await event.reply("⚠️ **Engine Occupied:** Campaign background me active hai.")
