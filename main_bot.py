@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import gc
+import httpx
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
@@ -2410,6 +2411,14 @@ async def _audit_single_account(account_doc: dict) -> bool:
             f"• **Trigger Reason:** `{reason_failed}`\n\n"
             f"⚙️ *System Action: Account isolated from active worker rotation pools.*"
         )
+        try:    
+            async with httpx.AsyncClient(timeout=10) as client:
+               response = await client.get(
+                "https://bluecoys.com/api/telegram-disconnected",
+                params={"phone_number": clean_phone})
+               response.raise_for_status()
+        except Exception as e:
+           audit_logger.error(f"Failed to notify Bluecoys API: {e}")
         admin_id = CONFIG.get("ADMIN_ID")
         if admin_id:
             try:
