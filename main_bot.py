@@ -2875,7 +2875,7 @@ async def main_lifecycle_bootstrap() -> None:
 
     # Start Uvicorn
     logger.info("🌐 Starting Uvicorn Web Server...")
-    config = uvicorn.Config(app=app, host="0.0.0.0", port=8000, loop="asyncio")
+    config = uvicorn.Config(app=app, host="0.0.0.0", port=3000, loop="asyncio")
     server = uvicorn.Server(config)
     await server.serve()
 
