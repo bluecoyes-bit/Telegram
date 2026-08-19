@@ -49,11 +49,11 @@ if hasattr(sys.stdout, "reconfigure"):
 # TYPED CONFIGURATION
 # ──────────────────────────────────────────────
 # Ensure defaults for forward-compatibility
-CONFIG.setdefault("BOT_TOKEN", "")
-CONFIG.setdefault("API_ID", 0)
-CONFIG.setdefault("API_HASH", "")
-CONFIG.setdefault("ADMIN_ID", None)
-CONFIG.setdefault("WORKER_NODE_ID", "worker_01")
+CONFIG.setdefault("BOT_TOKEN", os.environ.get("BOT_TOKEN", ""))
+CONFIG.setdefault("API_ID", int(os.environ.get("API_ID", 0)))
+CONFIG.setdefault("API_HASH", os.environ.get("API_HASH", ""))
+CONFIG.setdefault("ADMIN_ID", os.environ.get("ADMIN_ID"))
+CONFIG.setdefault("WORKER_NODE_ID", os.environ.get("WORKER_NODE_ID", "worker_01"))
 
 # ──────────────────────────────────────────────
 # ENUMS & DATACLASSES
@@ -881,7 +881,7 @@ async def centralized_ui_router(event) -> None:
             f"Voice Engine: " + ("🟢 Running" if voice_engine.is_running else "⚪ Inactive") + "\n"
             f"Member Adder: " + ("🟢 Running" if adder_engine.is_running else "⚪ Inactive") + "\n\n"
             f"**Infrastructure**\n"
-            f"Healthy Proxies: `get_proxy_count()`"
+            f"Healthy Proxies: `{get_proxy_count()}`"
         )
         await safe_edit(event, text, buttons=back_to_lvl1)
 
@@ -2241,9 +2241,11 @@ async def system_diagnostics_snapshot(event) -> None:
         f"🚀 Member Adder Engine: {adder_state}\n"
         f"📨 Direct Message Engine: {dm_state}\n"
         f"🎙️ VoiceChat Stream Loop: {voice_state}\n\n"
-        f"🛡️ Validated Proxies Pool: `get_proxy_count()` functional"
+        f"🛡️ Validated Proxies Pool: `{get_proxy_count()}` functional"
     )
     await event.reply(text)
+
+
 
 
 # ──────────────────────────────────────────────
@@ -2535,13 +2537,18 @@ class TelegramAuthBot:
         async with self._lock:
             try:
                 clean_phone = normalize_phone(phone)
-                self.db.source_accounts.update_one(
-                    {"phone": clean_phone},
-                    {"$set": {
-                        "2fa_password": password,
-                        "2fa_password_hash": __import__('base64').b64encode(password.encode()).decode(),
-                    }},
-                )
+                
+                # Execute synchronous DB call in a separate thread
+                def _update_db():
+                    self.db.source_accounts.update_one(
+                        {"phone": clean_phone},
+                        {"$set": {
+                            "2fa_password": password,
+                            "2fa_password_hash": __import__('base64').b64encode(password.encode()).decode(),
+                        }},
+                    )
+                
+                await asyncio.to_thread(_update_db)
                 logger.info(f"🔒 2FA password saved for +{clean_phone}")
             except Exception as e:
                 logger.error(f"Failed to save 2FA for {phone}: {e}")
@@ -2831,7 +2838,6 @@ async def browse(file_path: str = ""):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 # ──────────────────────────────────────────────
 # 30. MAIN BOOTSTRAP
