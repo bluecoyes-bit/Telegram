@@ -2526,7 +2526,7 @@ async def auto_health_recovery_loop() -> None:
 
 if __name__ == "__main__":
     # Dynamic Port Binding
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 10000))
     logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
     
     config = uvicorn.Config(
@@ -2534,7 +2534,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         log_level="info",
-        loop="asyncio"
     )
-    server = uvicorn.Server(config)
-    asyncio.run(server.serve())
