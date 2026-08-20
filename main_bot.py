@@ -2351,7 +2351,10 @@ async def continuous_session_auditor() -> None:
             await asyncio.sleep(60)
 
 
-# ── 🔥 NEW: Single account audit task ──
+# ──────────────────────────────────────────────
+# 26. AUDIT TASK & EXCEPTION HANDLING
+# ──────────────────────────────────────────────
+
 async def _audit_single_account(account_doc: dict) -> bool:
     """
     Check one account's session health.
@@ -2415,12 +2418,13 @@ async def _audit_single_account(account_doc: dict) -> bool:
         )
         try:    
             async with httpx.AsyncClient(timeout=10) as client:
-               response = await client.get(
-                "https://bluecoys.com/api/telegram-disconnected",
-                params={"phone_number": clean_phone})
-               response.raise_for_status()
+                response = await client.get(
+                    "https://bluecoys.com/api/telegram-disconnected",
+                    params={"phone_number": clean_phone})
+                response.raise_for_status()
         except Exception as e:
-           audit_logger.error(f"Failed to notify Bluecoys API: {e}")
+            audit_logger.error(f"Failed to notify Bluecoys API: {e}")
+            
         admin_id = CONFIG.get("ADMIN_ID")
         if admin_id:
             try:
@@ -2430,6 +2434,57 @@ async def _audit_single_account(account_doc: dict) -> bool:
         return False
 
     return True
+
+
+# ──────────────────────────────────────────────
+# 27. FASTAPI & WEB SERVER LAUNCHER (RENDER INTEGRATION)
+# ──────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Start Telethon Bot directly on Uvicorn's active event loop
+    logger.info("⚡ Starting Telethon Bot on active Uvicorn event loop...")
+    await bot.start(bot_token=CONFIG["BOT_TOKEN"])
+    
+    # 2. Register background auditor task on the same event loop
+    auditor_task = asyncio.create_task(continuous_session_auditor())
+    GLOBAL.register_task(auditor_task)
+    
+    logger.info("🌐 Service & Telegram Bot are online and synced!")
+    yield
+    
+    # Cleanup on server stop
+    logger.info("🛑 Gracefully shutting down Telethon Bot & Auditor...")
+    auditor_task.cancel()
+    await bot.disconnect()
+
+
+app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
+app.include_router(console_router, prefix="/console")
+
+@app.get("/")
+async def root_health_check():
+    return {"status": "online", "service": "Telegram Bot Suite", "console": "/console"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+if __name__ == "__main__":
+    # Render Dynamic Port Binding
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
+    
+    config = uvicorn.Config(
+        app=app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        loop="asyncio"
+    )
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())
 
 
 # ──────────────────────────────────────────────
@@ -2881,7 +2936,7 @@ async def main_lifecycle_bootstrap() -> None:
 
     # Start Uvicorn
     logger.info("🌐 Starting Uvicorn Web Server...")
-    config = uvicorn.Config(app=app, host="0.0.0.0", port=10000, loop="asyncio")
+    config = uvicorn.Config(app=app, host="0.0.0.0", port=3000, loop="asyncio")
     server = uvicorn.Server(config)
     await server.serve()
 
