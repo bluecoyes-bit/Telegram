@@ -2523,15 +2523,18 @@ async def auto_health_recovery_loop() -> None:
 # ──────────────────────────────────────────────
 # 29. SERVER LAUNCHER (MUST BE AT THE VERY END)
 # ──────────────────────────────────────────────
-
 if __name__ == "__main__":
-    # Dynamic Port Binding
+    # Dynamic Port Binding (Render's default is 10000)
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
     
-    config = uvicorn.Config(
-        app=app,
+    # Standard, production-ready Uvicorn entry point.
+    # workers=1 is critical to prevent background tasks (auditor/recovery) 
+    # from running multiple times and conflicting with each other.
+    uvicorn.run(
+        app,
         host="0.0.0.0",
         port=port,
         log_level="info",
+        workers=1
     )
