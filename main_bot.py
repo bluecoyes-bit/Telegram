@@ -2438,57 +2438,6 @@ async def _audit_single_account(account_doc: dict) -> bool:
 
 
 # ──────────────────────────────────────────────
-# 27. FASTAPI & WEB SERVER LAUNCHER (RENDER INTEGRATION)
-# ──────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 1. Start Telethon Bot directly on Uvicorn's active event loop
-    logger.info("⚡ Starting Telethon Bot on active Uvicorn event loop...")
-    await bot.start(bot_token=CONFIG["BOT_TOKEN"])
-    
-    # 2. Register background auditor task on the same event loop
-    auditor_task = asyncio.create_task(continuous_session_auditor())
-    GLOBAL.register_task(auditor_task)
-    
-    logger.info("🌐 Service & Telegram Bot are online and synced!")
-    yield
-    
-    # Cleanup on server stop
-    logger.info("🛑 Gracefully shutting down Telethon Bot & Auditor...")
-    auditor_task.cancel()
-    await bot.disconnect()
-
-
-app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
-app.include_router(console_router, prefix="/console")
-
-@app.get("/")
-async def root_health_check():
-    return {"status": "online", "service": "Telegram Bot Suite", "console": "/console"}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
-
-
-if __name__ == "__main__":
-    # Render Dynamic Port Binding
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
-    
-    config = uvicorn.Config(
-        app=app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        loop="asyncio"
-    )
-    server = uvicorn.Server(config)
-    asyncio.run(server.serve())
-
-
-# ──────────────────────────────────────────────
 # 27. FASTAPI SERVER & BACKGROUND TASKS LIFESPAN
 # ──────────────────────────────────────────────
 
@@ -2513,8 +2462,11 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Gracefully shutting down Telethon Bot & Background Tasks...")
     auditor_task.cancel()
     recovery_task.cancel()
+    try:
+        await asyncio.gather(auditor_task, recovery_task)
+    except asyncio.CancelledError:
+        pass
     await bot.disconnect()
-
 
 app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
 app.include_router(console_router, prefix="/console")
@@ -2526,7 +2478,6 @@ async def root_health_check():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
-
 
 # ──────────────────────────────────────────────
 # 28. AUTO-RECOVERY LOOP
@@ -2561,47 +2512,20 @@ async def auto_health_recovery_loop() -> None:
                                 await client.send_message("SpamBot", "/start")
                                 db.update_session_status(phone, AccountStatus.ACTIVE, client.session.save())
                                 recovered += 1
-                    except Exception:
-                        pass
-                    await asyncio.sleep(2)
-
-                if recovered > 0:
-                    admin_id = CONFIG.get("ADMIN_ID")
-                    if admin_id:
-                        msg = (
-                            f"🏥 **Auto-Recovery Alert!**\n"
-                            f"System ne background check run kiya aur `{recovered}` accounts ko "
-                            f"Spam Mute se successfully nikal kar `ACTIVE` pool mein add kar diya hai! 🟢"
-                        )
-                        try:
-                            await bot.send_message(int(str(admin_id).strip()), msg)
-                        except Exception:
-                            pass
-
+                    except Exception as e:
+                        audit_logger.error(f"Auto-recovery failed for {phone}: {e}")
+            
         except Exception as e:
-            audit_logger.error(f"Auto-recovery error: {e}")
-
-        await asyncio.sleep(43200)  # 12 hours
-
+            audit_logger.error(f"Recovery loop error: {e}")
+        
+        await asyncio.sleep(43200) # Check every 12 hours
 
 # ──────────────────────────────────────────────
-# 29. TELEGRAM AUTH BOT CLASS & ENTRYPOINT
+# 29. SERVER LAUNCHER (MUST BE AT THE VERY END)
 # ──────────────────────────────────────────────
-
-class TelegramAuthBot:
-    """
-    Thread-safe auth bot helper for FastAPI integration.
-    """
-
-    def __init__(self, config: dict, database: SuiteDatabase):
-        self.config = config
-        self.db = database
-        self.sessions: Dict[str, TelegramClient] = {}
-        self.pending_codes: Dict[str, dict] = {}
-        self._lock = asyncio.Lock()
-
 
 if __name__ == "__main__":
+    # Dynamic Port Binding
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
     
