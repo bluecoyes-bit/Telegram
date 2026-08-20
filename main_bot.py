@@ -1496,7 +1496,8 @@ async def verify_2fa_handler(event) -> None:
     except Exception as e:
         await event.reply(f"❌ **2FA Submission Rejected:** `{str(e)}`")
     finally:
-        if db_clean_phone not in [k for k in GLOBAL.auth_states.keys()]:
+        active_state = await GLOBAL.get_auth_state(db_clean_phone)
+        if not active_state:
             try:
                 await client.disconnect()
             except Exception:
@@ -2488,7 +2489,47 @@ if __name__ == "__main__":
 
 
 # ──────────────────────────────────────────────
-# 27. AUTO-RECOVERY LOOP
+# 27. FASTAPI SERVER & BACKGROUND TASKS LIFESPAN
+# ──────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Start Telethon Bot directly on Uvicorn's active event loop
+    logger.info("⚡ Starting Telethon Bot on active Uvicorn event loop...")
+    await bot.start(bot_token=CONFIG["BOT_TOKEN"])
+    
+    # 2. Register background auditor task
+    auditor_task = asyncio.create_task(continuous_session_auditor())
+    GLOBAL.register_task(auditor_task)
+
+    # 3. Register auto-recovery loop task
+    recovery_task = asyncio.create_task(auto_health_recovery_loop())
+    GLOBAL.register_task(recovery_task)
+    
+    logger.info("🌐 Service, Telegram Bot, Auditor, and Recovery Loops are online!")
+    yield
+    
+    # Cleanup on server stop
+    logger.info("🛑 Gracefully shutting down Telethon Bot & Background Tasks...")
+    auditor_task.cancel()
+    recovery_task.cancel()
+    await bot.disconnect()
+
+
+app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
+app.include_router(console_router, prefix="/console")
+
+@app.get("/")
+async def root_health_check():
+    return {"status": "online", "service": "Telegram Bot Suite", "console": "/console"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+# ──────────────────────────────────────────────
+# 28. AUTO-RECOVERY LOOP
 # ──────────────────────────────────────────────
 
 async def auto_health_recovery_loop() -> None:
@@ -2497,7 +2538,6 @@ async def auto_health_recovery_loop() -> None:
     audit_logger.info("🏥 Auto-Recovery Background Engine Started.")
 
     while True:
-        # 🔥 AUTO-PAUSE: Automatically skip recovery cycles if heavy campaigns are running
         if not await GLOBAL.is_health_check_active() or adder_engine.is_running or dm_engine.is_running or voice_engine.is_running:
             await asyncio.sleep(60)
             continue
@@ -2545,13 +2585,12 @@ async def auto_health_recovery_loop() -> None:
 
 
 # ──────────────────────────────────────────────
-# 28. TELEGRAM AUTH BOT CLASS
+# 29. TELEGRAM AUTH BOT CLASS & ENTRYPOINT
 # ──────────────────────────────────────────────
 
 class TelegramAuthBot:
     """
-    Thread-safe auth bot for FastAPI integration.
-    Uses asyncio locks (not threading) for async safety.
+    Thread-safe auth bot helper for FastAPI integration.
     """
 
     def __init__(self, config: dict, database: SuiteDatabase):
@@ -2561,403 +2600,17 @@ class TelegramAuthBot:
         self.pending_codes: Dict[str, dict] = {}
         self._lock = asyncio.Lock()
 
-    def create_user_client(self, phone: str) -> TelegramClient:
-        return TelegramClient(
-            StringSession(),
-            api_id=int(self.config.get("API_ID", 0)),
-            api_hash=str(self.config.get("API_HASH", "")),
-        )
 
-    async def save_account_metadata(self, phone: str, password: str = None, device: dict = None) -> None:
-        async with self._lock:
-            clean_phone = normalize_phone(phone)
-            client = self.sessions.get(phone)
-            if not client:
-                return
-            try:
-                session_str = client.session.save()
-                if not device:
-                    record = self.db.get_session_by_phone(clean_phone)
-                    device = get_device_profile(record) if record else (
-                        random.choice(DEVICE_PROFILES) if DEVICE_PROFILES else {}
-                    )
-                self.db.update_session_status(clean_phone, AccountStatus.ACTIVE, session_str)
-                if hasattr(self.db, "save_authorized_session"):
-                    self.db.save_authorized_session(clean_phone, session_str, AccountStatus.ACTIVE, device, two_fa_password=password)
-                    logger.info(f"💾 Session +{clean_phone} secured with hardware profile.")
-            except Exception as e:
-                logger.error(f"Failed to save metadata for {phone}: {e}")
-
-    async def save_twofa_password(self, phone: str, password: str) -> None:
-        async with self._lock:
-            try:
-                clean_phone = normalize_phone(phone)
-                
-                # Execute synchronous DB call in a separate thread
-                def _update_db():
-                    self.db.source_accounts.update_one(
-                        {"phone": clean_phone},
-                        {"$set": {
-                            "2fa_password": password,
-                            "2fa_password_hash": __import__('base64').b64encode(password.encode()).decode(),
-                        }},
-                    )
-                
-                await asyncio.to_thread(_update_db)
-                logger.info(f"🔒 2FA password saved for +{clean_phone}")
-            except Exception as e:
-                logger.error(f"Failed to save 2FA for {phone}: {e}")
-
-
-# ──────────────────────────────────────────────
-# 29. FASTAPI APPLICATION
-# ──────────────────────────────────────────────
-
-BASE_DIR = Path(__file__).parent.absolute()
-app = FastAPI(title="Telegram Suite API", version="2.0.0")
-app.include_router(console_router)
-auth_bot: TelegramAuthBot = None  # Set in main()
-
-
-# ── FastAPI Models ──
-class LoginReq(BaseModel):
-    phone: str
-
-class VerifyReq(BaseModel):
-    phone: str
-    code: str
-
-class Verify2FAReq(BaseModel):
-    phone: str
-    password: str
-
-class BulkLoginReq(BaseModel):
-    phones: list[str]
-
-class MessageResponse(BaseModel):
-    status: str
-    phone: str
-    message: str = ""
-    phone_code_hash: str = ""
-
-
-# ── FastAPI Endpoints ──
-
-@app.post("/login", response_model=MessageResponse)
-async def api_login(req: LoginReq):
-    if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
-
-    phone_normalized = normalize_phone(req.phone)
-
-    async with auth_bot._lock:
-        if phone_normalized in auth_bot.pending_codes:
-            old_state = auth_bot.pending_codes.pop(phone_normalized, None)
-            if old_state and old_state.get("client"):
-                try:
-                    await old_state["client"].disconnect()
-                except Exception:
-                    pass
-
-    try:
-        result = await shared_login_process(req.phone)
-        client = result["client"]
-        code_hash = result["code_hash"]
-
-        async with auth_bot._lock:
-            auth_bot.pending_codes[phone_normalized] = {
-                "client": client,
-                "phone_code_hash": code_hash,
-                "timeout": 120,
-                "device": result["device"],
-            }
-
-        return MessageResponse(
-            status="code_sent",
-            phone=req.phone,
-            message="OTP Code Sent Successfully! Please submit the verification code.",
-            phone_code_hash=code_hash,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/verify")
-async def api_verify(req: VerifyReq):
-    if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
-    phone_normalized = normalize_phone(req.phone)
-
-    async with auth_bot._lock:
-        if phone_normalized not in auth_bot.pending_codes:
-            raise HTTPException(404, "No pending login for this number.")
-        pending = auth_bot.pending_codes[phone_normalized]
-        client = pending["client"]
-        device = pending.get("device")
-
-    try:
-        await client.sign_in(phone=req.phone, code=req.code.strip(), phone_code_hash=pending["phone_code_hash"])
-        async with auth_bot._lock:
-            auth_bot.sessions[phone_normalized] = client
-            del auth_bot.pending_codes[phone_normalized]
-
-        await auth_bot.save_account_metadata(phone_normalized, password=None, device=device)
-        me = await client.get_me()
-        return {"status": "ok", "phone": req.phone, "name": f"{me.first_name or ''} {me.last_name or ''}".strip(), "id": me.id}
-    except SessionPasswordNeededError:
-        # 🔥 FIX: Save partially authenticated session string and update status to TWOFA_REQUIRED
-        session_str = client.session.save()
-        auth_bot.db.save_authorized_session(phone_normalized, session_str, "2fa_required", device, two_fa_password=None)
-        return {"status": "2fa_required", "phone": req.phone}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/verify_2fa")
-async def api_verify_2fa(req: Verify2FAReq):
-    if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
-    phone_normalized = normalize_phone(req.phone)
-
-    async with auth_bot._lock:
-        if phone_normalized not in auth_bot.pending_codes:
-            raise HTTPException(404, "No pending login context.")
-        pending = auth_bot.pending_codes[phone_normalized]
-        client = pending["client"]
-        device = pending.get("device")
-
-    try:
-        await client.sign_in(password=req.password)
-        async with auth_bot._lock:
-            auth_bot.sessions[phone_normalized] = client
-            del auth_bot.pending_codes[phone_normalized]
-
-        await auth_bot.save_account_metadata(phone_normalized, password=req.password, device=device)
-        await auth_bot.save_twofa_password(phone_normalized, req.password)
-        me = await client.get_me()
-        return {"status": "ok", "phone": req.phone, "name": f"{me.first_name or ''} {me.last_name or ''}".strip(), "id": me.id}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.get("/sessions")
-async def api_sessions():
-    if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
-    async with auth_bot._lock:
-        return {"active": list(auth_bot.sessions.keys()), "pending": list(auth_bot.pending_codes.keys())}
-
-
-@app.get("/otp/{phone}")
-async def get_otp(phone: str, limit: int = 5, since_seconds: int = 300):
-    if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
-    phone_normalized = normalize_phone(phone)
-    async with auth_bot._lock:
-        if phone_normalized not in auth_bot.sessions:
-            raise HTTPException(404, "No active session for this number. Login first via /login.")
-        client = auth_bot.sessions[phone_normalized]
-    try:
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=since_seconds)
-        messages = await client.get_messages(777000, limit=limit)
-        results = []
-        for msg in messages:
-            if msg.date < cutoff:
-                continue
-            ist = msg.date + timedelta(hours=5, minutes=30)
-            results.append({
-                "id": msg.id,
-                "text": msg.message,
-                "received_at_ist": ist.strftime("%d-%m-%Y %H:%M:%S"),
-                "received_at_utc": msg.date.strftime("%d-%m-%Y %H:%M:%S"),
-            })
-        return {"phone": phone, "count": len(results), "messages": results}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.get("/session/{phone}")
-async def api_check(phone: str):
-    if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
-    phone_normalized = normalize_phone(phone)
-    async with auth_bot._lock:
-        if phone_normalized in auth_bot.sessions:
-            try:
-                me = await auth_bot.sessions[phone_normalized].get_me()
-                return {"status": "active", "name": f"{me.first_name or ''} {me.last_name or ''}".strip(), "username": me.username}
-            except Exception:
-                return {"status": "expired"}
-        if phone_normalized in auth_bot.pending_codes:
-            return {"status": "pending_otp"}
-    raise HTTPException(404, "No session found")
-
-
-@app.delete("/session/{phone}")
-async def api_logout(phone: str):
-    if not auth_bot:
-        raise HTTPException(503, "Bot not initialized")
-    phone_normalized = normalize_phone(phone)
-    async with auth_bot._lock:
-        if phone_normalized in auth_bot.sessions:
-            try:
-                await auth_bot.sessions[phone_normalized].log_out()
-            except Exception:
-                pass
-            try:
-                await auth_bot.sessions[phone_normalized].disconnect()
-            except Exception:
-                pass
-            del auth_bot.sessions[phone_normalized]
-            return {"status": "logged_out"}
-        if phone_normalized in auth_bot.pending_codes:
-            try:
-                await auth_bot.pending_codes[phone_normalized]["client"].disconnect()
-            except Exception:
-                pass
-            del auth_bot.pending_codes[phone_normalized]
-            return {"status": "cancelled"}
-    raise HTTPException(404, "No session found")
-
-
-@app.post("/bulk_login")
-async def api_bulk_login(req: BulkLoginReq):
-    if not auth_bot:
-        raise HTTPException(status_code=503, detail="Bot not initialized")
-    results = {"sent": [], "already": [], "failed": {}}
-    for raw_phone in req.phones:
-        phone = normalize_phone(raw_phone)
-        try:
-            async with auth_bot._lock:
-                if phone in auth_bot.sessions or phone in auth_bot.pending_codes:
-                    results["already"].append(raw_phone)
-                    continue
-            
-            # 🔥 FIX: Use shared_login_process to properly store the session to the DB and acquire device profiles
-            login_result = await shared_login_process(raw_phone)
-            
-            async with auth_bot._lock:
-                auth_bot.pending_codes[phone] = {
-                    "client": login_result["client"], 
-                    "phone_code_hash": login_result["code_hash"], 
-                    "timeout": 120,
-                    "device": login_result["device"]
-                }
-            results["sent"].append(raw_phone)
-            await asyncio.sleep(3)
-        except Exception as e:
-            results["failed"][raw_phone] = str(e)
-    return results
-
-
-# ── File Browser ──
-
-def _dir_listing(directory: Path, url_path: str) -> HTMLResponse:
-    entries = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
-    rows = ""
-    if url_path.strip("/"):
-        parent = "/" + "/".join(url_path.strip("/").split("/")[:-1])
-        rows += f'<tr><td><a href="/files{parent}">.. (up)</a></td><td></td></tr>'
-    for entry in entries:
-        entry_url = f"/files/{url_path.strip('/')}/{entry.name}".replace("//", "/")
-        size = f"{entry.stat().st_size:,} B" if entry.is_file() else "—"
-        icon = "📄" if entry.is_file() else "📁"
-        rows += f'<tr><td><a href="{entry_url}">{icon} {entry.name}</a></td><td>{size}</td></tr>'
-    html = f"""<!DOCTYPE html>
-<html><head><title>/{url_path}</title>
-<style>body{{font-family:monospace;padding:20px}}table{{border-collapse:collapse;width:100%}}
-td{{padding:6px 12px;border-bottom:1px solid #eee}}a{{text-decoration:none;color:#0066cc}}a:hover{{text-decoration:underline}}</style>
-</head><body>
-<h2>/{url_path}</h2><hr>
-<table><tr><th align=left>Name</th><th align=left>Size</th></tr>{rows}</table>
-</body></html>"""
-    return HTMLResponse(html)
-
-
-@app.get("/files", response_class=HTMLResponse)
-@app.get("/files/{file_path:path}")
-async def browse(file_path: str = ""):
-    target = (BASE_DIR / file_path).resolve()
-    base_resolved = BASE_DIR.resolve()
-    try:
-        target.relative_to(base_resolved)
-    except ValueError:
-        raise HTTPException(403, "Access denied")
-    if not target.exists():
-        raise HTTPException(404, "Not found")
-    if target.is_dir():
-        return _dir_listing(target, file_path)
-    return FileResponse(target, filename=target.name)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-# ──────────────────────────────────────────────
-# 30. MAIN BOOTSTRAP
-# ──────────────────────────────────────────────
-
-async def main_lifecycle_bootstrap() -> None:
-    """Initialize all subsystems, start background tasks, and run the server."""
-    global auth_bot
-    auth_bot = TelegramAuthBot(CONFIG, db)
-    logger.info("✅ TelegramAuthBot initialized.")
-
-    # Web console routes
-    router_bound = setup_console_routes(db)
-    app.include_router(router_bound)
-
-    # Static files
-    web_view_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_view")
-    if os.path.exists(web_view_path):
-        app.mount("/console", StaticFiles(directory=web_view_path, html=True), name="console")
-        logger.info("🌐 Web frontend mounted at /console.")
-    else:
-        logger.warning("🚨 'web_view' directory not found.")
-
-    # Start background proxy scan
-    proxy_manager.start_background_testing()
-
-    # Start bot
-    await bot.start(bot_token=CONFIG["BOT_TOKEN"])
-    logger.info("🤖 Master Telegram Bot online.")
-
-    # Start background tasks
-    task1 = asyncio.create_task(continuous_session_auditor())
-    task2 = asyncio.create_task(auto_health_recovery_loop())
-    GLOBAL.register_task(task1)
-    GLOBAL.register_task(task2)
-    logger.info("✅ Background auditor & recovery tasks registered.")
-
-    # Log pool settings
-    pool_max = CONFIG.get("MAX_POOL_SIZE", 50)
-    logger.info(f"🔧 Client pool max: {pool_max}, Auth state TTL: 300s, Pool max idle: 7200s")
-
-    # Start Uvicorn
-    logger.info("🌐 Starting Uvicorn Web Server...")
-    config = uvicorn.Config(app=app, host="0.0.0.0", port=3000, loop="asyncio")
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
+    
+    config = uvicorn.Config(
+        app=app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        loop="asyncio"
+    )
     server = uvicorn.Server(config)
-    await server.serve()
-
-
-# ──────────────────────────────────────────────
-# 31. RUNTIME ENTRY POINT
-# ──────────────────────────────────────────────
-
-if __name__ == '__main__':
-    print("=" * 70)
-    print("🌐 Enterprise Master Control Router Engine v2.0")
-    print("   Stable • Efficient • Production-Grade")
-    print("=" * 70)
-
-    # Windows event loop policy
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-    try:
-        asyncio.run(main_lifecycle_bootstrap())
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received. Initiating graceful shutdown...")
-    except Exception as boot_err:
-        logger.fatal(f"🚨 Fatal boot error: {boot_err}", exc_info=True)
+    asyncio.run(server.serve())
