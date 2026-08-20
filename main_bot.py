@@ -339,7 +339,42 @@ scraper_engine = MemberScraper(db)
 voice_engine = CloudVoiceChatEngine(db)
 adder_engine = EnterpriseMemberAdder(db, proxy_manager)
 
-bot = TelegramClient(StringSession(), CONFIG["API_ID"], CONFIG["API_HASH"])
+# ──────────────────────────────────────────────
+# TELETHON BOT PROXY (Solves Event Loop Mismatch in Uvicorn)
+# ──────────────────────────────────────────────
+class BotProxy:
+    def __init__(self):
+        self._bot = None
+        self._pending_handlers = []
+
+    def on(self, event_builder):
+        def decorator(func):
+            if self._bot is not None:
+                self._bot.add_event_handler(func, event_builder)
+            else:
+                self._pending_handlers.append((func, event_builder))
+            return func
+        return decorator
+
+    def add_event_handler(self, callback, event=None):
+        if self._bot is not None:
+            self._bot.add_event_handler(callback, event)
+        else:
+            self._pending_handlers.append((callback, event))
+
+    def initialize(self, *args, **kwargs):
+        self._bot = TelegramClient(*args, **kwargs)
+        for callback, event_builder in self._pending_handlers:
+            self._bot.add_event_handler(callback, event_builder)
+        self._pending_handlers.clear()
+        return self._bot
+
+    def __getattr__(self, name):
+        if self._bot is None:
+            raise RuntimeError(f"Bot not initialized yet. Cannot access '{name}'. Call initialize() first.")
+        return getattr(self._bot, name)
+
+bot = BotProxy()
 dm_engine = setup_dmsender_handlers(bot, db, proxy_manager)
 
 # ──────────────────────────────────────────────
@@ -2437,20 +2472,17 @@ async def _audit_single_account(account_doc: dict) -> bool:
     return True
 
 
-# ──────────────────────────────────────────────
-# 27. FASTAPI SERVER & BACKGROUND TASKS LIFESPAN
-# ──────────────────────────────────────────────
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Start Telethon Bot directly on Uvicorn's active event loop
+    # 1. Initialize and start Telethon Bot on Uvicorn's active event loop
     logger.info("⚡ Starting Telethon Bot on active Uvicorn event loop...")
-    await bot.start(bot_token=CONFIG["BOT_TOKEN"])
+    real_bot = bot.initialize(StringSession(), CONFIG["API_ID"], CONFIG["API_HASH"])
+    await real_bot.start(bot_token=CONFIG["BOT_TOKEN"])
     
     # 2. Register background auditor task
     auditor_task = asyncio.create_task(continuous_session_auditor())
     GLOBAL.register_task(auditor_task)
-
+    
     # 3. Register auto-recovery loop task
     recovery_task = asyncio.create_task(auto_health_recovery_loop())
     GLOBAL.register_task(recovery_task)
@@ -2466,7 +2498,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(auditor_task, recovery_task)
     except asyncio.CancelledError:
         pass
-    await bot.disconnect()
+    await real_bot.disconnect()
 
 app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
 app.include_router(console_router, prefix="/console")
@@ -2524,12 +2556,8 @@ async def auto_health_recovery_loop() -> None:
 # 29. SERVER LAUNCHER (MUST BE AT THE VERY END)
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    # Dynamic Port Binding (Render's default is 10000)
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
-    
-    # Standard, production-ready Uvicorn entry point.
-    # This guarantees proper socket binding and signal handling in containers.
     uvicorn.run(
         app,
         host="0.0.0.0",
