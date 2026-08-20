@@ -2529,8 +2529,7 @@ if __name__ == "__main__":
     logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
     
     # Standard, production-ready Uvicorn entry point.
-    # workers=1 is critical to prevent background tasks (auditor/recovery) 
-    # from running multiple times and conflicting with each other.
+    # This guarantees proper socket binding and signal handling in containers.
     uvicorn.run(
         app,
         host="0.0.0.0",
