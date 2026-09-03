@@ -2342,12 +2342,14 @@ async def continuous_session_auditor() -> None:
             for i in range(0, len(active_accounts), BATCH_SIZE):
                 if not await GLOBAL.is_health_check_active():
                     break
-
                 batch = active_accounts[i:i+BATCH_SIZE]
                 results = []
                 for acc in batch:
-                    # 🔥 Give control back to the event loop so DM/Adder workers can run
-                    await asyncio.sleep(3.0) 
+                    # 🔥 HUMAN-LIKE DELAY: Randomized sleep between 10 to 20 seconds per account.
+                    # This prevents rapid-fire API requests that trigger Telegram's anti-spam filters.
+                    human_delay = random.uniform(10.0, 20.0)
+                    await asyncio.sleep(human_delay)
+                    
                     res = await _audit_single_account(acc)
                     results.append(res)
 
@@ -2395,7 +2397,7 @@ async def continuous_session_auditor() -> None:
 
 # ── 🔥 SESSION AUTHORIZATION CACHE (lightweight optimization) ──
 _last_auth_check: Dict[str, float] = {}
-AUTH_CHECK_CACHE_SECONDS = 300  # Skip duplicate checks within 5 minutes
+AUTH_CHECK_CACHE_SECONDS = 3600  # Skip duplicate checks within 5 minutes
 
 
 async def check_session_authorization(client, phone_display: str = "") -> tuple:
@@ -2520,8 +2522,12 @@ async def _audit_single_account(account_doc: dict) -> bool:
                     reason_failed = f"Deep verification failed: {str(e)[:120]}"
 
     except AuthKeyDuplicatedError as e:
-        reason_failed = f"⚠️ CRITICAL CONFLICT: Auth Key Duplication! ({e})"
-        is_duplicate = True
+        audit_logger.warning(
+            f"⚠️ AuthKeyDuplicated for +{clean_phone}. "
+            f"Account is likely active on a personal device. Skipping audit to prevent session invalidation."
+        )
+        return True
+    
     except (UserDeactivatedError, UserDeactivatedBanError) as e:
         reason_failed = f"Account Terminated: {e}"
     except (asyncio.TimeoutError, OSError, ConnectionError, ssl.SSLError):
@@ -2580,7 +2586,8 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting ProxyLeaseManager (Auto-Reaper active)...")
     # Proxies are loaded in ProxyManager.__init__ via _load_proxies()
     await proxy_lease_manager.start()
-    
+    proxy_manager.start_background_testing()  
+
     # 3. Register background auditor task
     auditor_task = asyncio.create_task(continuous_session_auditor())
     GLOBAL.register_task(auditor_task)

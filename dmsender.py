@@ -355,17 +355,79 @@ class EnterpriseDMSender:
                 try: os.remove(str(media_path))
                 except: pass
 
-    def _generate_live_status(self) -> str:
+    def _generate_detailed_status(self) -> str:
+        """
+        🔥 COMPREHENSIVE LIVE STATUS - Shows exactly what's happening
+        """
+        import time
+        
+        # Calculate runtime & rate
+        elapsed = max(1, int(time.time() - getattr(self, '_campaign_start_time', time.time())))
+        elapsed_min = elapsed / 60
+        rate = round(self.stats['total_sent'] / elapsed_min, 1) if elapsed_min > 0.1 else 0
+        
+        # ETA calculation
+        remaining = max(0, self.stats['total_targets'] - self.stats['total_sent'] - self.stats['failed'])
+        if rate > 0:
+            eta_min = round(remaining / rate)
+            eta_str = f"{eta_min // 60}h {(eta_min % 60)}m" if eta_min > 60 else f"{eta_min}m"
+        else:
+            eta_str = "Calculating..."
+        
+        # Proxy stats (if lease manager available)
+        proxy_stats = ""
+        if self.proxy_lease_manager:
+            stats = self.proxy_lease_manager.get_stats()
+            proxy_stats = (
+                f"🛡️ **PROXY POOL**\n"
+                f"   🟢 Available: `{stats['available_proxies']}`\n"
+                f"   🔒 Leased: `{stats['current_active_leases']}`\n"
+                f"   🧊 In Cooldown: `{stats['proxies_in_cooldown']}`\n"
+                f"   📊 Total Acquires: `{stats['total_acquires']}`\n"
+            )
+        
+        # Worker activity indicator
+        active_workers = sum(1 for t in getattr(self, '_active_workers', []) if not t.done())
+        
+        # Status emoji based on health
+        if self.stats['accounts_down'] > self.stats['accounts_used'] * 0.5:
+            health_icon = "🔴"
+            health_text = "CRITICAL - Many accounts down"
+        elif self.stats['accounts_down'] > self.stats['accounts_used'] * 0.2:
+            health_icon = "🟠"
+            health_text = "WARNING - Accounts dropping"
+        elif rate > 0:
+            health_icon = "🟢"
+            health_text = "HEALTHY - Sending normally"
+        else:
+            health_icon = "🟡"
+            health_text = "WAITING - No proxies available"
+        
         return (
-            "📊 **LIVE DM ENGINE TRACKER**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📨 Messages Delivered: `{self.stats['total_sent']} / {self.stats['total_targets']}`\n"
-            f"🚫 Failed / Skipped Users: `{self.stats['failed']}`\n"
-            f"⚡ Total Accounts Initialized: `{self.stats['accounts_used']}`\n"
-            f"💀 Accounts Banned/Dropped: `{self.stats['accounts_down']}`\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Status: `{'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}`"
-        )
+            f"📊 **LIVE DM CAMPAIGN DASHBOARD**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{health_icon} **System Health:** {health_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📨 **MESSAGING METRICS**\n"
+            f"   ✅ Sent: `{self.stats['total_sent']}`\n"
+            f"   ❌ Failed: `{self.stats['failed']}`\n"
+            f"   🎯 Total Targets: `{self.stats['total_targets']}`\n"
+            f"   📈 Progress: `{round((self.stats['total_sent'] + self.stats['failed']) / max(1, self.stats['total_targets']) * 100, 1)}%`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ **PERFORMANCE**\n"
+            f"   🚀 Rate: `{rate} msgs/min`\n"
+            f"   ⏱️ Runtime: `{elapsed // 60}m {elapsed % 60}s`\n"
+            f"   🕒 ETA: `{eta_str}`\n"
+            f"   👷 Active Workers: `{active_workers}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👥 **ACCOUNT POOL**\n"
+            f"   🟢 Total Accounts: `{self.stats['accounts_used']}`\n"
+            f"   💀 Banned/Dropped: `{self.stats['accounts_down']}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{proxy_stats}"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔄 *Auto-updates every 8s • `/dm_status` for manual check*"
+        )    
 
     async def _dynamic_rolling_worker(
         self, target_list: list, final_text: Optional[str], media_path: str,
@@ -400,6 +462,19 @@ class EnterpriseDMSender:
         
         last_ui_update = datetime.now()
         active_workers = []
+    
+        # 🔥 NEW: Independent Reporter Task for Live UI Updates
+        async def _reporter():
+            while self.is_running and active_workers:
+                if any(not w.done() for w in active_workers):
+                    try:
+                        await ui_callback(self._generate_live_status())
+                    except Exception:
+                        pass
+                await asyncio.sleep(8)
+    
+        reporter_task = asyncio.create_task(_reporter())
+        
         
         async def dm_worker(worker_id: int):
             current_client = None
@@ -579,6 +654,13 @@ class EnterpriseDMSender:
             await asyncio.gather(*active_workers)
         except asyncio.CancelledError:
             pass
+        finally:
+            # 🔥 NEW: Cleanup reporter task
+            reporter_task.cancel()
+            try:
+                await reporter_task
+            except asyncio.CancelledError:
+                pass
         
         self.is_running = False
         final_msg = "✅ **DM CAMPAIGN COMPLETED** ✅\n" if target_queue.empty() else "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
@@ -748,6 +830,17 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None, proxy_l
             sender_engine.active_task = asyncio.create_task(
                 sender_engine.execute_dm_campaign(target_list, msg_txt, media_pth, limit_val, update_ui_status)
             )
+
+    @bot.on(events.NewMessage(pattern='/dm_status'))
+    async def dm_status_check(event):
+        if not is_admin(event.sender_id): return
+        if not sender_engine.is_running:
+            await event.reply("ℹ️ **No DM campaign is currently running.**\n\nUse `/send_dmsender` to start a new campaign.")
+            return
+        
+        # Generate and send detailed status
+        status_msg = sender_engine._generate_detailed_status()
+        await event.reply(status_msg)
 
     @bot.on(events.NewMessage(pattern='/stop_dmsender'))
     async def wizard_stop(event):

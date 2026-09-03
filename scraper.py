@@ -35,8 +35,10 @@ if hasattr(sys.stdout, "reconfigure"):
 class MemberScraper:
     """Handles universal group link decoding, filtering, and hidden participant crawling."""
     
-    def __init__(self, db):
+    def __init__(self, db, proxy_manager=None, proxy_lease_manager=None):
         self.db = db
+        self.proxy_manager = proxy_manager
+        self.proxy_lease_manager = proxy_lease_manager
 
     def resolve_group_link(self, link_str: str) -> tuple[bool, str]:
         """

@@ -14,7 +14,7 @@ import gc  # 🔥 NEW: Garbage collection control
 from typing import List, Dict, Optional, Any, Tuple, Set, TYPE_CHECKING
 from weakref import WeakSet  # 🔥 NEW: Weak references for task tracking
 
-
+from datetime import datetime, timezone
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
@@ -107,8 +107,12 @@ def get_channel_peer_id(entity) -> int:
 class CloudVoiceChatEngine:
     """Manages secure WebRTC streaming loops, session cross-logins, and official service OTP wipes."""
     
-    def __init__(self, db: SuiteDatabase):
+    def __init__(self, db: SuiteDatabase, proxy_manager=None, proxy_lease_manager=None):
+
         self.db = db
+        self.proxy_manager = proxy_manager
+        self.proxy_lease_manager = proxy_lease_manager
+        self.scraper_helper = MemberScraper(db)
         self.scraper_helper = MemberScraper(db)
         self.is_running = False
         # 🔥 FIX 1: WeakSet instead of List for task tracking - avoids memory leaks
