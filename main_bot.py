@@ -2391,6 +2391,63 @@ async def continuous_session_auditor() -> None:
 # 26. AUDIT TASK & EXCEPTION HANDLING
 # ──────────────────────────────────────────────
 
+# ── 🔥 SESSION AUTHORIZATION CACHE (lightweight optimization) ──
+_last_auth_check: Dict[str, float] = {}
+AUTH_CHECK_CACHE_SECONDS = 300  # Skip duplicate checks within 5 minutes
+
+
+async def check_session_authorization(client, phone_display: str = "") -> tuple:
+    """
+    Lightweight session health check using is_user_authorized().
+    
+    Returns:
+        (True, "authorized")     - Account is healthy/authorized
+        (False, "unauthorized")  - Session not authorized
+        (False, "revoked")       - Auth key unregistered/revoked
+        (False, "timeout")       - Authorization check timed out
+        (False, "connection_error") - Network/connection failure
+        (False, "unknown")       - Other unexpected error
+    """
+    try:
+        if not client.is_connected():
+            return False, "disconnected"
+
+        authorized = await asyncio.wait_for(
+            client.is_user_authorized(),
+            timeout=10.0
+        )
+
+        if authorized:
+            if phone_display:
+                audit_logger.info(f"[SessionCheck] +{phone_display} authorized")
+            return True, "authorized"
+
+        if phone_display:
+            audit_logger.info(f"[SessionCheck] +{phone_display} unauthorized")
+        return False, "unauthorized"
+
+    except (AuthKeyUnregisteredError, SessionRevokedError):
+        if phone_display:
+            audit_logger.info(f"[SessionCheck] +{phone_display} revoked")
+        return False, "revoked"
+
+    except asyncio.TimeoutError:
+        if phone_display:
+            audit_logger.info(f"[SessionCheck] +{phone_display} timeout")
+        return False, "timeout"
+
+    except (ConnectionError, OSError, ssl.SSLError):
+        if phone_display:
+            audit_logger.info(f"[SessionCheck] +{phone_display} connection_error")
+        return False, "connection_error"
+
+    except Exception as e:
+        audit_logger.warning(
+            f"[SessionCheck] +{phone_display} Authorization check failed: {e}"
+        )
+        return False, "unknown"
+
+
 async def _audit_single_account(account_doc: dict) -> bool:
     """
     Check one account's session health.
@@ -2408,21 +2465,61 @@ async def _audit_single_account(account_doc: dict) -> bool:
         await GLOBAL.pool_remove(clean_phone)
         return False
 
+    # ── 🔥 LIGHT CACHING: Skip if recently checked successfully ──
+    now = time.time()
+    last_check = _last_auth_check.get(clean_phone, 0.0)
+    if (now - last_check) < AUTH_CHECK_CACHE_SECONDS:
+        audit_logger.debug(f"[SessionCheck] +{clean_phone} skipped (cached)")
+        return True
+
     reason_failed = None
     is_duplicate = False
 
     try:
         async with managed_client(account_doc, use_pool=False) as client:
-            me = await asyncio.wait_for(client.get_me(), timeout=10.0)
-            if not me:
-                return True  # Not a failure, just empty response
-            return True
+            # Ensure connection first
+            if not client.is_connected():
+                try:
+                    await asyncio.wait_for(client.connect(), timeout=15.0)
+                except Exception as conn_err:
+                    audit_logger.debug(f"[SessionCheck] +{clean_phone} reconnect failed: {conn_err}")
+                    return True  # Transient, skip permanent marking
+
+            # Step 1: Lightweight authorization check
+            authorized, reason = await check_session_authorization(client, clean_phone)
+
+            if authorized:
+                # Account is healthy/authorized - cache timestamp
+                _last_auth_check[clean_phone] = time.time()
+                return True
+
+            # Step 2: Handle specific failure reasons
+            if reason == "revoked":
+                reason_failed = "Session revoked/unregistered"
+            elif reason == "unauthorized":
+                reason_failed = "Session unauthorized"
+            elif reason == "timeout":
+                reason_failed = "Authorization check timeout"
+            elif reason == "connection_error":
+                reason_failed = "Connection error"
+            else:
+                # IMPORTANT: For ambiguous/unknown failures, perform ONE deep fallback verification
+                try:
+                    me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+                    if me:
+                        # Deep check passed - account is actually healthy
+                        _last_auth_check[clean_phone] = time.time()
+                        return True
+                    else:
+                        reason_failed = "Deep identity verification failed"
+                except (AuthKeyUnregisteredError, SessionRevokedError):
+                    reason_failed = "Session revoked/unregistered"
+                except Exception as e:
+                    reason_failed = f"Deep verification failed: {str(e)[:120]}"
 
     except AuthKeyDuplicatedError as e:
         reason_failed = f"⚠️ CRITICAL CONFLICT: Auth Key Duplication! ({e})"
         is_duplicate = True
-    except (AuthKeyUnregisteredError, SessionRevokedError) as e:
-        reason_failed = f"Session Revoked: {e}"
     except (UserDeactivatedError, UserDeactivatedBanError) as e:
         reason_failed = f"Account Terminated: {e}"
     except (asyncio.TimeoutError, OSError, ConnectionError, ssl.SSLError):
@@ -2446,13 +2543,13 @@ async def _audit_single_account(account_doc: dict) -> bool:
         now_str = ist_time.strftime("%d-%m-%Y | %H:%M:%S")
         icon = "⚠️" if is_duplicate else "❌"
         alert = (
-            f"{icon} **Session Status login removed!**\n\n"
+            f"{icon} **Session Status login removed!\n\n"
             f"• **Phone:** `+{clean_phone}`\n"
             f"• **Detected at:** `{now_str}`\n"
             f"• **Trigger Reason:** `{reason_failed}`\n\n"
             f"⚙️ *System Action: Account isolated from active worker rotation pools.*"
         )
-        try:    
+        try:
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.get(
                     "https://bluecoys.com/api/telegram-disconnected",
@@ -2460,7 +2557,7 @@ async def _audit_single_account(account_doc: dict) -> bool:
                 response.raise_for_status()
         except Exception as e:
             audit_logger.error(f"Failed to notify Bluecoys API: {e}")
-            
+
         admin_id = CONFIG.get("ADMIN_ID")
         if admin_id:
             try:
@@ -2469,11 +2566,9 @@ async def _audit_single_account(account_doc: dict) -> bool:
                 audit_logger.error(f"Admin notification failed: {send_err}")
         return False
 
-    return True
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     # 1. Initialize and start Telethon Bot on Uvicorn's active event loop
     logger.info("⚡ Starting Telethon Bot on active Uvicorn event loop...")
     real_bot = bot.initialize(StringSession(), CONFIG["API_ID"], CONFIG["API_HASH"])
