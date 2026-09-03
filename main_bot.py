@@ -337,8 +337,8 @@ db = SuiteDatabase()
 proxy_manager = ProxyManager()
 proxy_lease_manager = ProxyLeaseManager(proxy_manager)
 
-scraper_engine = MemberScraper(db)
-voice_engine = CloudVoiceChatEngine(db)
+scraper_engine = MemberScraper(db, proxy_manager, proxy_lease_manager)
+voice_engine = CloudVoiceChatEngine(db, proxy_manager, proxy_lease_manager)
 adder_engine = EnterpriseMemberAdder(db, proxy_manager, proxy_lease_manager)
 
 # ──────────────────────────────────────────────
@@ -2342,14 +2342,12 @@ async def continuous_session_auditor() -> None:
             for i in range(0, len(active_accounts), BATCH_SIZE):
                 if not await GLOBAL.is_health_check_active():
                     break
+
                 batch = active_accounts[i:i+BATCH_SIZE]
                 results = []
                 for acc in batch:
-                    # 🔥 HUMAN-LIKE DELAY: Randomized sleep between 10 to 20 seconds per account.
-                    # This prevents rapid-fire API requests that trigger Telegram's anti-spam filters.
-                    human_delay = random.uniform(30.4, 64.7)
-                    await asyncio.sleep(human_delay)
-                    
+                    # 🔥 Give control back to the event loop so DM/Adder workers can run
+                    await asyncio.sleep(3.0) 
                     res = await _audit_single_account(acc)
                     results.append(res)
 
@@ -2397,7 +2395,7 @@ async def continuous_session_auditor() -> None:
 
 # ── 🔥 SESSION AUTHORIZATION CACHE (lightweight optimization) ──
 _last_auth_check: Dict[str, float] = {}
-AUTH_CHECK_CACHE_SECONDS = 3600  # Skip duplicate checks within 1 hour
+AUTH_CHECK_CACHE_SECONDS = 300  # Skip duplicate checks within 5 minutes
 
 
 async def check_session_authorization(client, phone_display: str = "") -> tuple:
@@ -2580,8 +2578,8 @@ async def lifespan(app: FastAPI):
     
     # 2. Start Proxy Lease Manager (Auto-Reaper)
     logger.info("🚀 Starting ProxyLeaseManager (Auto-Reaper active)...")
+    await proxy_manager.load_proxies()
     await proxy_lease_manager.start()
-    proxy_manager.start_background_testing()
     
     # 3. Register background auditor task
     auditor_task = asyncio.create_task(continuous_session_auditor())

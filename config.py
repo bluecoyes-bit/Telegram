@@ -127,12 +127,12 @@ class MongoConfig:
 # Hardcoded fallbacks are provided ONLY for local dev; set env vars in production.
 CONFIG: Dict[str, Any] = {
     # ── Core API Credentials (NO HARDCODED DEFAULTS - Must set env vars) ──
-    "API_ID": _env_int("API_ID", 38223087, min_val=1),
-    "API_HASH": _env_str("API_HASH", "f3448783d23ace67fecdef3f392d2e47"),
-    "BOT_TOKEN": _env_str("BOT_TOKEN", "8932487693:AAEhRuyQc0V8G0g4cLtAXzrfHLneiB5gVVk"),
+    "API_ID": _env_int("API_ID", 0, min_val=1),
+    "API_HASH": _env_str("API_HASH", ""),
+    "BOT_TOKEN": _env_str("BOT_TOKEN", ""),
 
     # ── Admin (NO HARDCODED DEFAULT) ──
-    "ADMIN_ID": _env_str("ADMIN_ID", "5599766250"),
+    "ADMIN_ID": _env_str("ADMIN_ID", ""),
 
     # ── Worker Identity ──
     "WORKER_NODE_ID": _env_str("WORKER_NODE_ID", "worker_01"),
@@ -162,9 +162,9 @@ CONFIG: Dict[str, Any] = {
 
     # ── Auditor ──
     "AUDITOR_BATCH_SIZE": _env_int("AUDITOR_BATCH_SIZE", 10, 1, 100),
-    "AUDITOR_BATCH_STAGGER": _env_int("AUDITOR_BATCH_STAGGER", 90, 5, 320),
-    "AUDITOR_COOLDOWN_MIN": _env_int("AUDITOR_COOLDOWN_MIN", 43200, 3600, 86400),
-    "AUDITOR_COOLDOWN_MAX": _env_int("AUDITOR_COOLDOWN_MAX", 86400, 7200, 172800),
+    "AUDITOR_BATCH_STAGGER": _env_int("AUDITOR_BATCH_STAGGER", 15, 5, 120),
+    "AUDITOR_COOLDOWN_MIN": _env_int("AUDITOR_COOLDOWN_MIN", 43200, 300, 86400),
+    "AUDITOR_COOLDOWN_MAX": _env_int("AUDITOR_COOLDOWN_MAX", 86400, 600, 172800),
     "AUDITOR_ENABLED": _env_bool("AUDITOR_ENABLED", True),
 
     # ── Adder ──
@@ -223,14 +223,14 @@ MONGO_CFG = MongoConfig()
 # ────────────────────────────────────────────────────────────────
 
 # Build Mongo URI from env with secure fallback (NO HARDCODED CREDENTIALS)
-_MONGO_USER = _env_str("MONGO_USER", "sandeeptrip90_db_user")
-_MONGO_PASS = _env_str("MONGO_PASS", "1234568h")
+_MONGO_USER = _env_str("MONGO_USER", "")
+_MONGO_PASS = _env_str("MONGO_PASS", "")
 _MONGO_HOST = _env_str("MONGO_HOST", "cluster0.vcdatid.mongodb.net")
 _MONGO_OPTIONS = _env_str("MONGO_OPTIONS", "retryWrites=true&w=majority&appName=Cluster0")
 
 _MONGO_URI_BUILT = _env_str(
     "MONGO_URI", 
-    "mongodb+srv://sandeeptrip90_db_user:HybnovOJjg7Mr1ao@cluster0.vcdatid.mongodb.net/?appName=Cluster0"
+    ""
 )
 
 MONGODB_SETTINGS = {
