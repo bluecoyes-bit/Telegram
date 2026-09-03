@@ -179,9 +179,11 @@ async def status_updater_loop(client, chat_id, message_id, state: AdderState):
 class EnterpriseMemberAdder:
     """Manages multi-account smart rotation loops, safe bursts padding, and anti-ban tracking matrix."""
     
-    def __init__(self, db: SuiteDatabase, proxy_manager: Optional[ProxyManager] = None):
+    def __init__(self, db: SuiteDatabase, proxy_manager: Optional[ProxyManager] = None, 
+                 proxy_lease_manager=None):
         self.db = db
         self.proxy_manager = proxy_manager
+        self.proxy_lease_manager = proxy_lease_manager  # 🔥 NEW: Lease manager integration
         self.scraper_helper = MemberScraper(db)
         self.is_running = False
         self.adder_state: Optional[AdderState] = None # Added for state tracking
@@ -248,11 +250,63 @@ class EnterpriseMemberAdder:
 
         async def initialize_account(acc_doc: dict):
             phone = str(acc_doc.get("phone"))
+            clean_phone = phone.replace("+", "")
             self.db.acquire_lock(phone) # 🔒 Lock account instantly so auditor ignores it
             
             session_str = acc_doc.get("session_string") or acc_doc.get("session")
             device = acc_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
             
+            # 🔥 NEW: Use ProxyLeaseManager if available for dynamic rolling batch
+            use_lease_manager = (self.proxy_lease_manager is not None and 
+                                hasattr(self.proxy_lease_manager, '_is_running') and 
+                                self.proxy_lease_manager._is_running)
+            
+            if use_lease_manager:
+                # Dynamic rolling batch mode - acquire proxy via lease manager
+                proxy_dict = await self.proxy_lease_manager.acquire_proxy(clean_phone)
+                if not proxy_dict:
+                    logger.warning(f"⚠️ Lease manager returned no proxy for {phone}")
+                    self.db.release_lock(phone)
+                    return None
+                
+                client = TelegramClient(
+                    StringSession(session_str),
+                    int(acc_doc.get("api_id", CONFIG["API_ID"])),
+                    str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
+                    device_model=device.get("device_model", "PC 64bit"),
+                    system_version=device.get("system_version", "Windows 11"),
+                    app_version=device.get("app_version", "4.8.4"),
+                    proxy=proxy_dict
+                )
+                
+                try:
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        return {
+                            "phone": phone,
+                            "clean_phone": clean_phone,
+                            "client": client,
+                            "proxy_url": proxy_dict.get("url", "") or f"{proxy_dict.get('addr')}:{proxy_dict.get('port')}",
+                            "burst_count": 0,
+                        }
+                    else:
+                        raise ValueError("Session Unauthorized/Dead")
+                except Exception as e:
+                    logger.debug(f"🔄 Connect failed for {phone}: {e}")
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    # Release proxy on failure
+                    proxy_url = proxy_dict.get("url", "") or f"{proxy_dict.get('addr')}:{proxy_dict.get('port')}"
+                    await self.proxy_lease_manager.release_proxy(
+                        proxy_url, clean_phone,
+                        should_cooldown=False, cooldown_reason="Connection failed"
+                    )
+                    self.db.release_lock(phone)
+                    return None
+            
+            # Legacy mode (fallback if lease manager not available)
             # 🚀 PATCH: 5 Attempts with Strict Proxy Rotation (No Direct Connection)
             max_attempts = 5
             client = None
@@ -434,12 +488,21 @@ class EnterpriseMemberAdder:
                         if self.adder_state: self.adder_state.total_delay_sum += sleep_time
                         await asyncio.sleep(sleep_time)
 
-                    except (PeerFloodError, FloodWaitError):
+                    except (PeerFloodError, FloodWaitError) as e:
                         self.accounts_down += 1
                         if self.adder_state:
                             self.adder_state.failures += 1
                             self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
                         await members_queue.put(member) # 🔥 Repopulate queue on drop
+                        
+                        # 🔥 NEW: Release proxy with cooldown if using lease manager
+                        if use_lease_manager and worker_account.get("proxy_url"):
+                            await self.proxy_lease_manager.release_proxy(
+                                worker_account["proxy_url"], worker_account["clean_phone"],
+                                should_cooldown=True,
+                                cooldown_reason=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}"
+                            )
+                        
                         try:
                             await worker_account["client"].disconnect()
                         except Exception:
@@ -465,6 +528,15 @@ class EnterpriseMemberAdder:
                                 self.db.mark_account_failed(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
                             else:
                                 self.db.mark_account_revoked(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
+                            
+                            # 🔥 NEW: Release proxy with cooldown if using lease manager
+                            if use_lease_manager and worker_account.get("proxy_url"):
+                                await self.proxy_lease_manager.release_proxy(
+                                    worker_account["proxy_url"], worker_account["clean_phone"],
+                                    should_cooldown=True,
+                                    cooldown_reason=f"Banned/Deactivated: {err_msg[:40]}"
+                                )
+                            
                             try:
                                 await worker_account["client"].disconnect()
                             except Exception:
@@ -480,6 +552,13 @@ class EnterpriseMemberAdder:
             finally:
                 # Loop khatam hone ke baad final cleanup
                 if worker_account is not None:
+                    # 🔥 NEW: Release proxy without cooldown on normal exit
+                    if use_lease_manager and worker_account.get("proxy_url"):
+                        await self.proxy_lease_manager.release_proxy(
+                            worker_account["proxy_url"], worker_account["clean_phone"],
+                            should_cooldown=False
+                        )
+                    
                     if self.adder_state:
                         self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
                     try:
