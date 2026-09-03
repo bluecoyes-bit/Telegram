@@ -969,7 +969,7 @@ async def centralized_ui_router(event) -> None:
         page = nav_state["current_page"]
 
         # Filter
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
         filter_map = {
@@ -1052,8 +1052,8 @@ async def centralized_ui_router(event) -> None:
             await event.answer("Record not found.", alert=True)
             return
 
-        last_check_raw = record.get("last_checked_time") or record.get("last_updated") or datetime.utcnow()
-        time_diff = datetime.utcnow() - last_check_raw if isinstance(last_check_raw, datetime) else timedelta(0)
+        last_check_raw = record.get("last_checked_time") or record.get("last_updated") or datetime.now(timezone.utc)
+        time_diff = datetime.now(timezone.utc) - last_check_raw if isinstance(last_check_raw, datetime) else timedelta(0)
         minutes_ago = int(time_diff.total_seconds() // 60)
         check_lbl = f"{minutes_ago}m ago" if minutes_ago > 0 else "Just now"
 
@@ -2578,7 +2578,7 @@ async def lifespan(app: FastAPI):
     
     # 2. Start Proxy Lease Manager (Auto-Reaper)
     logger.info("🚀 Starting ProxyLeaseManager (Auto-Reaper active)...")
-    await proxy_manager.load_proxies()
+    # Proxies are loaded in ProxyManager.__init__ via _load_proxies()
     await proxy_lease_manager.start()
     
     # 3. Register background auditor task

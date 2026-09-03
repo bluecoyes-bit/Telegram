@@ -391,7 +391,7 @@ class SuiteDatabase:
                 {"phone": clean_phone},
                 {"$set": {
                     "proxy": proxy_entry,
-                    "proxy_updated_at": datetime.utcnow(),
+                    "proxy_updated_at": datetime.now(timezone.utc),
                 }}
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
@@ -541,7 +541,7 @@ class SuiteDatabase:
                 "status_snapshot": original_doc.get("status"),
                 "api_id": original_doc.get("api_id"),
                 "api_hash": original_doc.get("api_hash"),
-                "backup_created_at": datetime.utcnow(),
+                "backup_created_at": datetime.now(timezone.utc),
             }
             self.session_backups.insert_one(backup_payload)
             return True
@@ -594,7 +594,7 @@ class SuiteDatabase:
             "account_sequence_index": (
                 existing.get("account_sequence_index", 1) if existing else 1
             ),
-            "last_updated": datetime.utcnow(),
+            "last_updated": datetime.now(timezone.utc),
         }
         
         try:
@@ -604,7 +604,7 @@ class SuiteDatabase:
                     "$set": payload,
                     "$setOnInsert": {
                         "timestamp": int(time.time()),
-                        "authenticated_at": datetime.utcnow()
+                        "authenticated_at": datetime.now(timezone.utc)
                     }
                 },
                 upsert=True
@@ -642,9 +642,9 @@ class SuiteDatabase:
             "device_metadata": device,
             "2fa_password": two_fa_password,
             "password_2fa": two_fa_password or "",
-            "last_updated": datetime.utcnow(),
-            "last_verified": datetime.utcnow(),
-            "verified_at": datetime.utcnow(),
+            "last_updated": datetime.now(timezone.utc),
+            "last_verified": datetime.now(timezone.utc),
+            "verified_at": datetime.now(timezone.utc),
         }
         
         try:
@@ -653,8 +653,8 @@ class SuiteDatabase:
                 {
                     "$set": set_payload,
                     "$setOnInsert": {
-                        "authenticated_at": datetime.utcnow(),
-                        "created_at": datetime.utcnow(),
+                        "authenticated_at": datetime.now(timezone.utc),
+                        "created_at": datetime.now(timezone.utc),
                     }
                 },
                 upsert=True
@@ -673,7 +673,7 @@ class SuiteDatabase:
         self.backup_original_session(clean_phone)
         update_data = {
             "status": status.value if hasattr(status, 'value') else status, # 🔥 FIX: Parse Enum
-            "last_updated": datetime.utcnow(),
+            "last_updated": datetime.now(timezone.utc),
         }
         if session_str:
             update_data["session"] = session_str
@@ -708,8 +708,8 @@ class SuiteDatabase:
             "app_version": (device or {}).get("app_version", "4.8.4"),
             "status": "active",
             "sync_status": "migrated_active",
-            "last_verified": datetime.utcnow(),
-            "migrated_at": datetime.utcnow(),
+            "last_verified": datetime.now(timezone.utc),
+            "migrated_at": datetime.now(timezone.utc),
         }
         
         try:
@@ -719,7 +719,7 @@ class SuiteDatabase:
                     "$set": payload,
                     "$setOnInsert": {
                         "timestamp": int(time.time()),
-                        "authenticated_at": datetime.utcnow()
+                        "authenticated_at": datetime.now(timezone.utc)
                     }
                 },
                 upsert=True
@@ -744,8 +744,8 @@ class SuiteDatabase:
                 {"$set": {
                     "status": "failed",
                     "last_error": str(error_msg)[:500],
-                    "updated_at": datetime.utcnow(),
-                    "last_checked_time": datetime.utcnow(),
+                    "updated_at": datetime.now(timezone.utc),
+                    "last_checked_time": datetime.now(timezone.utc),
                 }}
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
@@ -764,8 +764,8 @@ class SuiteDatabase:
                 {"$set": {
                     "status": "revoked",
                     "revocation_reason": str(system_reason)[:500],
-                    "last_checked_time": datetime.utcnow(),
-                    "revoked_at": datetime.utcnow(),
+                    "last_checked_time": datetime.now(timezone.utc),
+                    "revoked_at": datetime.now(timezone.utc),
                 }}
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
@@ -801,7 +801,7 @@ class SuiteDatabase:
                 "sender": str(sender),
                 "message": str(message_text),
                 "timestamp": int(time.time()),
-                "date_received": datetime.utcnow(),
+                "date_received": datetime.now(timezone.utc),
             })
         except Exception as e:
             logger.error(f"log_received_otp failed: {e}")
@@ -833,7 +833,7 @@ class SuiteDatabase:
         enriched = []
         for m in member_list:
             m["source_group"] = str(source_group)
-            m["scraped_at"] = datetime.utcnow()
+            m["scraped_at"] = datetime.now(timezone.utc)
             enriched.append(m)
         
         def run_bulk():
@@ -909,7 +909,7 @@ class SuiteDatabase:
                     "username": str(username),
                     "outcome": str(outcome),
                     "timestamp": int(time.time()),
-                    "date_recorded": datetime.utcnow(),
+                    "date_recorded": datetime.now(timezone.utc),
                 }},
                 upsert=True
             )
@@ -924,7 +924,7 @@ class SuiteDatabase:
         """Log system telemetry event (non-blocking on failure)."""
         try:
             self.telemetry.insert_one({
-                "timestamp": datetime.utcnow(),
+                "timestamp": datetime.now(timezone.utc),
                 "event_type": str(event_type),
                 "details": str(details)[:1000],
                 "severity": str(severity),
@@ -1211,4 +1211,13 @@ class SuiteDatabase:
             {"$limit": limit}
         ]
         # Use aggregation with allowDiskUse to handle large datasets
-        return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))        
+        return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))
+
+    def close(self):
+        """Close MongoDB connection gracefully on shutdown."""
+        try:
+            if hasattr(self, 'client') and self.client:
+                self.client.close()
+                logger.info("✅ MongoDB connection closed.")
+        except Exception as e:
+            logger.error(f"Error closing MongoDB: {e}")        

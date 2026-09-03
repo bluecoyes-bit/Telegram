@@ -196,6 +196,54 @@ class EnterpriseMemberAdder:
         self.accounts_down = 0
         self.privacy_skips = 0
 
+    # ──────────────────────────────────────────────
+    # 🔥 ROBUST CLIENT CLEANUP (prevents ghost tasks & Future exception spam)
+    # ──────────────────────────────────────────────
+    @staticmethod
+    async def _force_cleanup_client(client: Optional[TelegramClient]) -> None:
+        """Deeply terminates Telethon client, cancelling internal sender loops and closing raw sockets."""
+        if not client:
+            return
+        try:
+            sender = getattr(client, '_sender', None)
+            if sender:
+                sender._connecting = False
+                
+                # 🔥 CRITICAL FIX 1: Cancel MTProtoSender loops
+                for loop_name in ['_recv_loop', '_send_loop', '_ping_loop']:
+                    task = getattr(sender, loop_name, None)
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await task  # Explicitly retrieve exception to silence event loop
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                
+                # 🔥 CRITICAL FIX 2: Cancel Connection loops (stops "Task was destroyed" spam)
+                connection = getattr(sender, '_connection', None)
+                if connection:
+                    for loop_name in ['_recv_loop', '_send_loop', '_ping_loop']:
+                        task = getattr(connection, loop_name, None)
+                        if task and not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                
+                # 🔥 CRITICAL FIX 3: Force close raw transport/socket
+                transport = getattr(sender, '_transport', None)
+                if transport:
+                    try:
+                        await asyncio.wait_for(transport.close(), timeout=1.0)
+                    except Exception:
+                        pass
+            
+            if client.is_connected():
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+        except Exception:
+            pass
+
     async def execute_adding_pipeline(self, target_group_link: str, update_callback, adder_state: Optional[AdderState] = None) -> str:
         """
         Executes structural lookups from Scraped DB pool, starts multiple account workers,
