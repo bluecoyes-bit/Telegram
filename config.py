@@ -126,13 +126,13 @@ class MongoConfig:
 # ── CORE CREDENTIALS (set via env vars for security) ──
 # Hardcoded fallbacks are provided ONLY for local dev; set env vars in production.
 CONFIG: Dict[str, Any] = {
-    # ── Core API Credentials ──
-    "API_ID": _env_int("API_ID", 38223087, min_val=1),
-    "API_HASH": _env_str("API_HASH", "f3448783d23ace67fecdef3f392d2e47"),
-    "BOT_TOKEN": _env_str("BOT_TOKEN", "8966015094:AAEKmjOFJ36CNH7dMZdt5raAFcgPgB9DtSU"),
+    # ── Core API Credentials (NO HARDCODED DEFAULTS - Must set env vars) ──
+    "API_ID": _env_int("API_ID", 0, min_val=1),
+    "API_HASH": _env_str("API_HASH", ""),
+    "BOT_TOKEN": _env_str("BOT_TOKEN", ""),
 
-    # ── Admin ──
-    "ADMIN_ID": _env_str("ADMIN_ID", "5599766250"),
+    # ── Admin (NO HARDCODED DEFAULT) ──
+    "ADMIN_ID": _env_str("ADMIN_ID", ""),
 
     # ── Worker Identity ──
     "WORKER_NODE_ID": _env_str("WORKER_NODE_ID", "worker_01"),
@@ -222,15 +222,15 @@ MONGO_CFG = MongoConfig()
 # 5. MONGODB SETTINGS (single-DB ecosystem, 5 collections)
 # ────────────────────────────────────────────────────────────────
 
-# Build Mongo URI from env with secure fallback
-_MONGO_USER = _env_str("MONGO_USER", "sandeeptrip90_db_user")
-_MONGO_PASS = _env_str("MONGO_PASS", "1234568h")
+# Build Mongo URI from env with secure fallback (NO HARDCODED CREDENTIALS)
+_MONGO_USER = _env_str("MONGO_USER", "")
+_MONGO_PASS = _env_str("MONGO_PASS", "")
 _MONGO_HOST = _env_str("MONGO_HOST", "cluster0.vcdatid.mongodb.net")
 _MONGO_OPTIONS = _env_str("MONGO_OPTIONS", "retryWrites=true&w=majority&appName=Cluster0")
 
 _MONGO_URI_BUILT = _env_str(
     "MONGO_URI", 
-    f"mongodb+srv://sandeeptrip90_db_user:1234568h@cluster0.vcdatid.mongodb.net/?appName=Cluster0"
+    ""
 )
 
 MONGODB_SETTINGS = {
@@ -281,18 +281,28 @@ def validate_config() -> List[str]:
     """
     warnings: List[str] = []
 
-    # API credentials
-    if CONFIG["API_ID"] < 1000:
-        warnings.append(f"API_ID ({CONFIG['API_ID']}) looks like a placeholder. Set via env API_ID.")
-    if not CONFIG["API_HASH"] or len(CONFIG["API_HASH"]) < 5:
-        warnings.append("API_HASH is missing or too short. Set via env API_HASH.")
-    if not CONFIG["BOT_TOKEN"] or len(CONFIG["BOT_TOKEN"]) < 20:
-        warnings.append("BOT_TOKEN is missing or too short. Set via env BOT_TOKEN.")
+    # API credentials - FATAL if missing
+    if CONFIG["API_ID"] == 0:
+        warnings.append("FATAL: API_ID is not set. Set environment variable API_ID.")
+    if not CONFIG["API_HASH"]:
+        warnings.append("FATAL: API_HASH is not set. Set environment variable API_HASH.")
+    if not CONFIG["BOT_TOKEN"]:
+        warnings.append("FATAL: BOT_TOKEN is not set. Set environment variable BOT_TOKEN.")
+    if not CONFIG["ADMIN_ID"]:
+        warnings.append("FATAL: ADMIN_ID is not set. Set environment variable ADMIN_ID.")
 
-    # MongoDB
+    # MongoDB - FATAL if missing
     mongo_uri = MONGODB_SETTINGS.get("MONGO_URI", "")
-    if "xxxxx" in mongo_uri or not mongo_uri:
-        warnings.append("MONGO_URI contains placeholder. Set env MONGO_URI or MONGO_USER/MONGO_PASS/MONGO_HOST.")
+    if not mongo_uri:
+        # Try building from components
+        user = _MONGO_USER
+        pwd = _MONGO_PASS
+        host = _MONGO_HOST
+        if user and pwd and host:
+            mongo_uri = f"mongodb+srv://{user}:{pwd}@{host}/?{_MONGO_OPTIONS}"
+            MONGODB_SETTINGS["MONGO_URI"] = mongo_uri
+        else:
+            warnings.append("FATAL: MONGO_URI is not set. Set environment variable MONGO_URI or MONGO_USER/MONGO_PASS/MONGO_HOST.")
 
     # Pool sizing sanity
     if CONFIG["MAX_POOL_SIZE"] > CONFIG["MAX_POOL_ABSOLUTE"]:
