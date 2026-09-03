@@ -7,6 +7,7 @@ Features:
 - Thread-safe operations with proper locking
 - Automatic proxy download from online sources
 - Rotation and failure tracking
+- 🔥 NEW: ProxyLeaseManager for dynamic rolling batch architecture
 """
 
 import asyncio
@@ -16,8 +17,10 @@ import socket
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
-from typing import List, Dict, Optional, Tuple, Callable, Any
+from typing import List, Dict, Optional, Tuple, Callable, Any, Set
 from urllib.parse import urlparse
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -54,6 +57,276 @@ MIN_WORKING_PROXIES_TO_START: int = 1
 TEST_BATCH_SIZE: int = 50
 MAX_WORKERS_DEFAULT: int = 30
 CONNECTION_POOL_SIZE: int = 20
+
+# 🔥 NEW: Proxy Lease & Cooldown Configuration
+PROXY_COOLDOWN_SECONDS: int = 600  # 10 minutes default cooldown
+ACCOUNT_COOLDOWN_SECONDS: int = 900  # 15 minutes for accounts
+COOLDOWN_CHECK_INTERVAL: float = 5.0  # Check expired cooldowns every 5 seconds
+
+
+@dataclass
+class ProxyNode:
+    """Enterprise proxy node with lease tracking and cooldown state."""
+    addr: str
+    host: str
+    port: int
+    proxy_type: str
+    username: Optional[str]
+    password: Optional[str]
+    url: str
+    latency: float = 5000.0
+    is_leased: bool = False
+    leased_to: Optional[str] = None  # phone number
+    lease_time: float = 0.0
+    cooldown_until: float = 0.0
+    failures: int = 0
+    added_at: float = field(default_factory=time.time)
+    
+    def to_telethon_dict(self) -> Dict[str, Any]:
+        """Convert to Telethon proxy dict format."""
+        return {
+            "proxy_type": self.proxy_type,
+            "addr": self.addr,
+            "port": self.port,
+            "rdns": True,
+            "username": self.username,
+            "password": self.password
+        }
+    
+    def is_in_cooldown(self) -> bool:
+        """Check if proxy is currently in cooldown."""
+        return time.time() < self.cooldown_until
+    
+    def acquire(self, phone: str) -> bool:
+        """Attempt to acquire lease for this proxy."""
+        now = time.time()
+        if self.is_leased or self.is_in_cooldown():
+            return False
+        self.is_leased = True
+        self.leased_to = phone
+        self.lease_time = now
+        return True
+    
+    def release(self) -> None:
+        """Release the proxy lease."""
+        self.is_leased = False
+        self.leased_to = None
+        self.lease_time = 0.0
+    
+    def put_in_cooldown(self, duration_seconds: int = PROXY_COOLDOWN_SECONDS) -> None:
+        """Place proxy in cooldown."""
+        self.release()
+        self.cooldown_until = time.time() + duration_seconds
+        logger.warning(f"Proxy {self.url} placed in cooldown until {datetime.fromtimestamp(self.cooldown_until).strftime('%H:%M:%S')}")
+
+
+class ProxyLeaseManager:
+    """
+    🔥 Enterprise Proxy Lease & Cooldown Engine
+    
+    Features:
+    - Zero-CPU blocking via asyncio.Condition
+    - Dynamic concurrency based on available proxies
+    - Automatic cooldown expiration with Auto-Reaper
+    - Account-proxy binding for targeted bans
+    """
+    
+    def __init__(self, proxy_manager: "ProxyManager"):
+        self.proxy_manager = proxy_manager
+        self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition(self._lock)
+        
+        # Proxy nodes indexed by URL for O(1) lookup
+        self.proxy_nodes: Dict[str, ProxyNode] = {}
+        
+        # Cooldown pools
+        self.proxy_cooldown: Set[str] = set()  # URLs of proxies in cooldown
+        self.account_cooldown: Dict[str, float] = {}  # phone -> cooldown_until
+        
+        # Auto-reaper task
+        self._reaper_task: Optional[asyncio.Task] = None
+        self._is_running = False
+        
+        # Statistics
+        self.stats = {
+            "total_acquires": 0,
+            "total_releases": 0,
+            "cooldown_activations": 0,
+            "current_active_leases": 0
+        }
+    
+    async def start(self) -> None:
+        """Start the auto-reaper background task."""
+        if self._is_running:
+            return
+        self._is_running = True
+        self._reaper_task = asyncio.create_task(self._auto_reaper_loop())
+        logger.info("🔥 ProxyLeaseManager started with auto-reaper")
+    
+    async def stop(self) -> None:
+        """Stop the auto-reaper task."""
+        self._is_running = False
+        if self._reaper_task:
+            self._reaper_task.cancel()
+            try:
+                await self._reaper_task
+            except asyncio.CancelledError:
+                pass
+            self._reaper_task = None
+        logger.info("ProxyLeaseManager stopped")
+    
+    def _sync_proxies(self) -> None:
+        """Sync working proxies from ProxyManager into ProxyNodes."""
+        for proxy_dict in self.proxy_manager.working_proxies:
+            url = proxy_dict.get("url", "")
+            if url and url not in self.proxy_nodes:
+                node = ProxyNode(
+                    addr=proxy_dict.get("host", ""),
+                    host=proxy_dict.get("host", ""),
+                    port=proxy_dict.get("port", 0),
+                    proxy_type=proxy_dict.get("type", "socks5"),
+                    username=proxy_dict.get("username"),
+                    password=proxy_dict.get("password"),
+                    url=url,
+                    latency=proxy_dict.get("latency", 5000.0)
+                )
+                self.proxy_nodes[url] = node
+    
+    async def _auto_reaper_loop(self) -> None:
+        """
+        Background task that wakes up exactly when cooldowns expire.
+        Uses efficient sleep with periodic checks.
+        """
+        while self._is_running:
+            try:
+                now = time.time()
+                expired_proxies = []
+                expired_accounts = []
+                
+                # Check expired proxy cooldowns
+                for url in list(self.proxy_cooldown):
+                    node = self.proxy_nodes.get(url)
+                    if node and not node.is_in_cooldown():
+                        expired_proxies.append(url)
+                    elif node is None:
+                        expired_proxies.append(url)  # Remove stale entries
+                
+                # Check expired account cooldowns
+                for phone, cooldown_until in list(self.account_cooldown.items()):
+                    if now >= cooldown_until:
+                        expired_accounts.append(phone)
+                
+                # Remove expired entries and notify waiters
+                if expired_proxies or expired_accounts:
+                    async with self._condition:
+                        for url in expired_proxies:
+                            self.proxy_cooldown.discard(url)
+                            logger.debug(f"Auto-Reaper: Proxy {url} cooldown expired")
+                        
+                        for phone in expired_accounts:
+                            del self.account_cooldown[phone]
+                            logger.debug(f"Auto-Reaper: Account +{phone} cooldown expired")
+                        
+                        # Wake up all waiting workers
+                        self._condition.notify_all()
+                
+                # Sleep until next check or use smart sleep until earliest expiry
+                await asyncio.sleep(COOLDOWN_CHECK_INTERVAL)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Auto-Reaper error: {e}")
+                await asyncio.sleep(COOLDOWN_CHECK_INTERVAL)
+    
+    async def acquire_proxy(self, phone: str) -> Optional[Dict[str, Any]]:
+        """
+        Acquire a proxy lease for the given account.
+        Blocks efficiently (0% CPU) if no proxies are available.
+        
+        Returns:
+            Telethon proxy dict or None if interrupted
+        """
+        self._sync_proxies()
+        
+        async with self._condition:
+            while self._is_running:
+                # Check if account is in cooldown
+                if phone in self.account_cooldown:
+                    remaining = self.account_cooldown[phone] - time.time()
+                    if remaining > 0:
+                        logger.debug(f"Account +{phone} in cooldown for {remaining:.0f}s more")
+                        await self._condition.wait()
+                        continue
+                    else:
+                        del self.account_cooldown[phone]
+                
+                # Find an available proxy
+                for url, node in self.proxy_nodes.items():
+                    if url in self.proxy_cooldown:
+                        continue
+                    if node.acquire(phone):
+                        self.stats["total_acquires"] += 1
+                        self.stats["current_active_leases"] += 1
+                        logger.debug(f"Proxy {url} leased to +{phone}")
+                        return node.to_telethon_dict()
+                
+                # No proxy available - wait efficiently
+                logger.debug(f"No proxies available for +{phone}, waiting...")
+                await self._condition.wait()
+            
+            return None
+    
+    async def release_proxy(self, proxy_url: str, phone: str, 
+                           should_cooldown: bool = False,
+                           cooldown_reason: str = "") -> None:
+        """
+        Release a proxy lease.
+        
+        Args:
+            proxy_url: The URL of the proxy to release
+            phone: The phone number that was using it
+            should_cooldown: If True, place both proxy and account in cooldown
+            cooldown_reason: Reason for cooldown (FloodWait, PeerFlood, Ban, etc.)
+        """
+        async with self._condition:
+            node = self.proxy_nodes.get(proxy_url)
+            if node:
+                if should_cooldown:
+                    node.put_in_cooldown(PROXY_COOLDOWN_SECONDS)
+                    self.proxy_cooldown.add(proxy_url)
+                    self.account_cooldown[phone] = time.time() + ACCOUNT_COOLDOWN_SECONDS
+                    self.stats["cooldown_activations"] += 1
+                    logger.warning(
+                        f"Cooldown activated for +{phone} & proxy {proxy_url}: {cooldown_reason}"
+                    )
+                else:
+                    node.release()
+                
+                self.stats["total_releases"] += 1
+                self.stats["current_active_leases"] = max(0, self.stats["current_active_leases"] - 1)
+                
+                # Notify waiting workers
+                self._condition.notify()
+    
+    def get_available_count(self) -> int:
+        """Get count of available (not leased, not in cooldown) proxies."""
+        self._sync_proxies()
+        count = 0
+        now = time.time()
+        for url, node in self.proxy_nodes.items():
+            if url not in self.proxy_cooldown and not node.is_leased and not node.is_in_cooldown():
+                count += 1
+        return count
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current lease manager statistics."""
+        return {
+            **self.stats,
+            "available_proxies": self.get_available_count(),
+            "proxies_in_cooldown": len(self.proxy_cooldown),
+            "accounts_in_cooldown": len(self.account_cooldown)
+        }
 
 
 class ProxyManager:

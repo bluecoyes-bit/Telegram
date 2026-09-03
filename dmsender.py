@@ -2,6 +2,8 @@
 """
 Ultimate Enterprise Telegram Suite - DM Sender Engine (Database Integrated)
 Filename: dmsender.py
+
+🔥 NEW: Proxy-Driven Dynamic Rolling Batch Architecture
 """
 
 import os
@@ -9,7 +11,7 @@ import asyncio
 import logging
 import random
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -17,7 +19,7 @@ from telethon.tl.types import DocumentAttributeAudio, InputPeerUser
 from telethon.errors import (
     PeerIdInvalidError, FloodWaitError, UserBannedInChannelError,
     UserDeactivatedError, AuthKeyUnregisteredError, SessionRevokedError,
-    UserIsBlockedError, UserPrivacyRestrictedError
+    UserIsBlockedError, UserPrivacyRestrictedError, PeerFloodError
 )
 from pymongo import MongoClient
 
@@ -28,9 +30,11 @@ logger = logging.getLogger("DMSenderEngine")
 # Priority Override: ADMIN_ID mapped to environment variable as per system rules
 ADMIN_ID = os.environ.get("ADMIN_ID")
 
+
 class EnterpriseDMSender:
-    def __init__(self, db):
+    def __init__(self, db, proxy_lease_manager=None):
         self.db = db
+        self.proxy_lease_manager = proxy_lease_manager  # 🔥 NEW: Lease manager integration
         self.is_running = False
         self.active_task = None
         self.wizard_state: Dict[int, Dict[str, Any]] = {}
@@ -66,9 +70,14 @@ class EnterpriseDMSender:
 
     async def execute_dm_campaign(self, target_list: list, message_text: str, media_path: str, limit: int, ui_callback):
         """
-        Robust background engine for distributed DM sending.
-        Rotates accounts safely, handles blank string validation errors dynamically,
-        and uses dynamic throughput optimization for maximum speed without bans.
+        🔥 Proxy-Driven Dynamic Rolling Batch DM Campaign Engine
+        
+        Golden Rule: If an account hits a ban/limit, its proxy goes to cooldown,
+        and the worker immediately picks the NEXT available account to complete
+        the SAME target. Process never halts waiting for other accounts.
+        
+        Parallel Execution: If N proxies are available, N workers run in parallel.
+        If a proxy dies, worker instantly swaps to next available proxy.
         """
         self.is_running = True
         self.reset_stats()
@@ -89,17 +98,25 @@ class EnterpriseDMSender:
             self.is_running = False
             return
 
+        # 🔥 NEW: Use dynamic rolling batch based on available proxies
+        use_lease_manager = self.proxy_lease_manager is not None and self.proxy_lease_manager._is_running
+        
+        if use_lease_manager:
+            # Dynamic rolling batch mode - let lease manager dictate concurrency
+            return await self._dynamic_rolling_worker(
+                target_list, final_text, media_path, limit, ui_callback, all_accounts
+            )
+        
+        # Legacy mode (fallback if lease manager not available)
         account_pool = []
         for acc in all_accounts:
             phone = acc.get("phone")
             if phone:
-                # 🔥 FIX 3: Accurately ACQUIRE locks at the start to protect from the Auditor loop
                 self.db.acquire_lock(phone)
             
             session_str = acc.get("session_string") or acc.get("session")
             api_id = int(acc.get("api_id", CONFIG["API_ID"]))
             api_hash = str(acc.get("api_hash", CONFIG["API_HASH"]))
-            # 🔥 MAINTAIN DEVICE FINGERPRINT
             device = acc.get("device_metadata") or random.choice(DEVICE_PROFILES)
             
             client = TelegramClient(
@@ -302,9 +319,238 @@ class EnterpriseDMSender:
             f"Status: `{'🟢 RUNNING' if self.is_running else '🔴 STOPPED'}`"
         )
 
+    async def _dynamic_rolling_worker(
+        self, target_list: list, final_text: Optional[str], media_path: str,
+        limit: int, ui_callback, all_accounts: list
+    ):
+        """
+        🔥 Dynamic Rolling Batch Worker using ProxyLeaseManager
+        
+        Each worker:
+        1. Picks a target from queue
+        2. Acquires proxy lease (blocks efficiently if none available)
+        3. Connects account with leased proxy
+        4. Executes DM action
+        5. Releases proxy (with cooldown if FloodWait/PeerFlood/Ban occurred)
+        6. Immediately picks next target - never waits for other accounts
+        """
+        targets = target_list[:limit] if limit > 0 else target_list
+        self.stats["total_targets"] = len(targets)
+        self.stats["accounts_used"] = len(all_accounts)
+        
+        await ui_callback(f"🚀 **DM Engine Started (Dynamic Rolling Batch)!**\n"
+                         f"Targets: `{len(targets)}`, Accounts: `{len(all_accounts)}`\n"
+                         f"Concurrency dictated by available proxies.")
+        
+        target_queue = asyncio.Queue()
+        for t in targets:
+            await target_queue.put(t)
+        
+        account_queue = asyncio.Queue()
+        for acc in all_accounts:
+            await account_queue.put(acc)
+        
+        last_ui_update = datetime.now()
+        active_workers = []
+        
+        async def dm_worker(worker_id: int):
+            current_client = None
+            current_phone = None
+            current_proxy_url = None
+            consecutive_failures = 0
+            
+            try:
+                while self.is_running and not target_queue.empty():
+                    # Step 1: Get next target
+                    try:
+                        target_data = target_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    
+                    # Step 2: Get next account
+                    try:
+                        account_doc = account_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        # No more accounts available, re-queue target
+                        await target_queue.put(target_data)
+                        break
+                    
+                    phone = account_doc.get("phone")
+                    if not phone:
+                        continue
+                    
+                    clean_phone = str(phone).replace("+", "")
+                    
+                    # Step 3: Acquire proxy lease (blocks efficiently if none available)
+                    proxy_dict = await self.proxy_lease_manager.acquire_proxy(clean_phone)
+                    if not proxy_dict:
+                        # Lease manager stopped, re-queue and exit
+                        await target_queue.put(target_data)
+                        break
+                    
+                    current_proxy_url = proxy_dict.get("url", "") or f"{proxy_dict.get('addr')}:{proxy_dict.get('port')}"
+                    
+                    # Step 4: Connect with proxy
+                    session_str = account_doc.get("session_string") or account_doc.get("session")
+                    api_id = int(account_doc.get("api_id", CONFIG["API_ID"]))
+                    api_hash = str(account_doc.get("api_hash", CONFIG["API_HASH"]))
+                    device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
+                    
+                    client = TelegramClient(
+                        StringSession(session_str), api_id, api_hash,
+                        device_model=device.get("device_model", "PC 64bit"),
+                        system_version=device.get("system_version", "Windows 11"),
+                        app_version=device.get("app_version", "4.8.4"),
+                        proxy=proxy_dict
+                    )
+                    
+                    current_client = client
+                    current_phone = clean_phone
+                    
+                    try:
+                        await client.connect()
+                        if not await client.is_user_authorized():
+                            raise AuthKeyUnregisteredError(request=None)
+                        
+                        # Step 5: Execute DM action
+                        entity = None
+                        if isinstance(target_data, dict):
+                            user_id = target_data.get("user_id")
+                            access_hash = target_data.get("access_hash")
+                            username = target_data.get("username")
+                            
+                            if username and str(username).strip() and str(username).lower() != "none":
+                                u_str = str(username).strip()
+                                entity = u_str if u_str.startswith("@") else f"@{u_str}"
+                            elif user_id and access_hash and str(access_hash) != "0":
+                                try:
+                                    entity = InputPeerUser(int(user_id), int(access_hash))
+                                except Exception:
+                                    entity = None
+                                    
+                            if not entity and user_id:
+                                entity = int(user_id)
+                        else:
+                            target_str = str(target_data).strip()
+                            if target_str.isdigit():
+                                entity = int(target_str)
+                            else:
+                                entity = target_str if target_str.startswith("@") else f"@{target_str}"
+                        
+                        if not entity:
+                            raise ValueError("Could not construct entity tokens.")
+                        
+                        should_cooldown = False
+                        cooldown_reason = ""
+                        
+                        if media_path and os.path.exists(str(media_path)):
+                            is_voice = str(media_path).lower().endswith(('.ogg', '.mp3', '.m4a'))
+                            attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
+                            await client.send_file(
+                                entity, str(media_path), caption=final_text,
+                                voice_note=is_voice, attributes=attributes
+                            )
+                        else:
+                            await client.send_message(entity, final_text)
+                        
+                        self.stats["total_sent"] += 1
+                        consecutive_failures = 0
+                        
+                        # Human-like delay
+                        dynamic_delay = max(0.5, 45.0 / max(1, self.proxy_lease_manager.get_available_count()))
+                        await asyncio.sleep(random.uniform(dynamic_delay, dynamic_delay + 1.0))
+                        
+                    except (PeerIdInvalidError, ValueError) as e:
+                        self.stats["failed"] += 1
+                        consecutive_failures = 0
+                        
+                    except (UserIsBlockedError, UserPrivacyRestrictedError):
+                        self.stats["failed"] += 1
+                        consecutive_failures = 0
+                        
+                    except (FloodWaitError, PeerFloodError) as e:
+                        consecutive_failures += 1
+                        should_cooldown = True
+                        cooldown_reason = f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}"
+                        self.stats["accounts_down"] += 1
+                        
+                    except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError):
+                        should_cooldown = True
+                        cooldown_reason = "Session revoked/unauthorized"
+                        self.stats["accounts_down"] += 1
+                        if hasattr(self.db, "mark_account_revoked"):
+                            self.db.mark_account_revoked(current_phone, cooldown_reason)
+                            
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if any(x in error_str for x in ["banned", "deactivated", "revoked", "unauthorized"]):
+                            should_cooldown = True
+                            cooldown_reason = f"Runtime drop: {error_str[:40]}"
+                            self.stats["accounts_down"] += 1
+                            if hasattr(self.db, "mark_account_revoked"):
+                                self.db.mark_account_revoked(current_phone, cooldown_reason)
+                        else:
+                            consecutive_failures += 1
+                            if consecutive_failures >= 2:
+                                should_cooldown = True
+                                cooldown_reason = f"Multiple failures: {consecutive_failures}"
+                    
+                    finally:
+                        # Step 6: Release proxy (with cooldown if needed)
+                        if current_proxy_url:
+                            await self.proxy_lease_manager.release_proxy(
+                                current_proxy_url, current_phone,
+                                should_cooldown=should_cooldown,
+                                cooldown_reason=cooldown_reason
+                            )
+                        
+                        # Cleanup client
+                        if current_client:
+                            try:
+                                await current_client.disconnect()
+                            except Exception:
+                                pass
+                            current_client = None
+                        
+                        # UI update
+                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
+                            await ui_callback(self._generate_live_status())
+                            last_ui_update = datetime.now()
+                
+            except asyncio.CancelledError:
+                pass
+            finally:
+                # Final cleanup
+                if current_client:
+                    try:
+                        await current_client.disconnect()
+                    except Exception:
+                        pass
+        
+        # Launch workers concurrently
+        num_workers = min(len(all_accounts), 20)  # Cap at 20 concurrent workers
+        for i in range(num_workers):
+            task = asyncio.create_task(dm_worker(i))
+            active_workers.append(task)
+        
+        try:
+            await asyncio.gather(*active_workers)
+        except asyncio.CancelledError:
+            pass
+        
+        self.is_running = False
+        final_msg = "✅ **DM CAMPAIGN COMPLETED** ✅\n" if target_queue.empty() else "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
+        await ui_callback(final_msg + self._generate_live_status())
+        
+        if media_path and os.path.exists(str(media_path)):
+            try:
+                os.remove(str(media_path))
+            except Exception:
+                pass
 
-def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None):
-    sender_engine = EnterpriseDMSender(db)
+
+def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None, proxy_lease_manager=None):
+    sender_engine = EnterpriseDMSender(db, proxy_lease_manager)
 
     def is_admin(sender_id):
         if ADMIN_ID:

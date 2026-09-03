@@ -28,14 +28,17 @@ logger = logging.getLogger("VideoChatEngineFallback")
 # =====================================================================
 # 🔥 FIXED: TRUE UNIVERSAL PYTGCALLS ADAPTER (V3 & LEGACY SUPPORT)
 # =====================================================================
+PYTGCALLS_AVAILABLE = False
 try:
     from pytgcalls import PyTgCalls
     from pytgcalls.types import MediaStream
     logger.info("✅ PyTgCalls V3 Engine Loaded Successfully.")
+    PYTGCALLS_AVAILABLE = True
 except (ModuleNotFoundError, ImportError):
     try:
         from pytgcalls import GroupCallFactory
         logger.info("✅ PyTgCalls Legacy Engine Loaded Successfully.")
+        PYTGCALLS_AVAILABLE = True
         
         class MediaStream:
             def __init__(self, media_path: str, *args, **kwargs):
@@ -67,8 +70,20 @@ except (ModuleNotFoundError, ImportError):
                     try: await self._group_call.stop()
                     except: pass
     except Exception as crash_reason:
-        logger.critical(f"🚨 FATAL: pytgcalls library is completely missing or broken! Fix your environment. ({crash_reason})")
-        raise crash_reason
+        logger.warning(f"⚠️ PyTgCalls not available - Voice Chat features disabled. ({crash_reason})")
+        
+        # Create stub classes to prevent import errors
+        class MediaStream:
+            def __init__(self, media_path: str, *args, **kwargs):
+                self.media_path = media_path
+
+        class PyTgCalls:
+            def __init__(self, client):
+                self.client = client
+            async def start(self): pass
+            async def play(self, *args): pass
+            async def change_volume(self, *args): pass
+            async def stop(self): pass
 
 
 from config import CONFIG, DEVICE_PROFILES
