@@ -53,6 +53,54 @@ class EnterpriseDMSender:
         except Exception as e:
             logger.error(f"❌ Fatal Mapping Fault in Database Router: {e}")
 
+    @staticmethod
+    async def _force_cleanup_client(client: Optional[TelegramClient]) -> None:
+        """
+        🔥 ROBUST CLIENT CLEANUP (prevents ghost tasks & Future exception spam)
+        Deeply terminates Telethon client, cancelling internal sender loops and closing raw sockets.
+        """
+        if not client:
+            return
+        try:
+            sender = getattr(client, '_sender', None)
+            if sender:
+                sender._connecting = False
+                
+                # Cancel MTProtoSender loops
+                for loop_name in ['_recv_loop', '_send_loop', '_ping_loop']:
+                    task = getattr(sender, loop_name, None)
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await task  # Explicitly retrieve exception to silence event loop
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                
+                # Cancel Connection loops (stops "Task was destroyed" spam)
+                connection = getattr(sender, '_connection', None)
+                if connection:
+                    for loop_name in ['_recv_loop', '_send_loop', '_ping_loop']:
+                        task = getattr(connection, loop_name, None)
+                        if task and not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                
+                # Force close raw transport/socket
+                transport = getattr(sender, '_transport', None)
+                if transport:
+                    try:
+                        await asyncio.wait_for(transport.close(), timeout=1.0)
+                    except Exception:
+                        pass
+            
+            if client.is_connected():
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
+        except Exception:
+            pass
+
     def reset_stats(self):
         self.stats = {
             "total_sent": 0,
@@ -504,12 +552,9 @@ class EnterpriseDMSender:
                                 cooldown_reason=cooldown_reason
                             )
                         
-                        # Cleanup client
+                        # Cleanup client with robust method
                         if current_client:
-                            try:
-                                await current_client.disconnect()
-                            except Exception:
-                                pass
+                            await self._force_cleanup_client(current_client)
                             current_client = None
                         
                         # UI update
@@ -522,10 +567,7 @@ class EnterpriseDMSender:
             finally:
                 # Final cleanup
                 if current_client:
-                    try:
-                        await current_client.disconnect()
-                    except Exception:
-                        pass
+                    await self._force_cleanup_client(current_client)
         
         # Launch workers concurrently
         num_workers = min(len(all_accounts), 20)  # Cap at 20 concurrent workers

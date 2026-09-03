@@ -503,10 +503,8 @@ class EnterpriseMemberAdder:
                                 cooldown_reason=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}"
                             )
                         
-                        try:
-                            await worker_account["client"].disconnect()
-                        except Exception:
-                            pass
+                        # Cleanup client with robust method
+                        await self._force_cleanup_client(worker_account["client"])
                         self.db.release_lock(worker_account["phone"]) # 🔓 Unlock dropped account
                         worker_account = None
                         continue

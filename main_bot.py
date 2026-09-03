@@ -27,7 +27,7 @@ import httpx
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
-from proxy_manager import ProxyManager
+from proxy_manager import ProxyManager, ProxyLeaseManager
 from scraper import MemberScraper
 from videochat import CloudVoiceChatEngine
 from adder import EnterpriseMemberAdder, AdderState, status_updater_loop
@@ -335,9 +335,11 @@ GLOBAL.initialize()
 # ──────────────────────────────────────────────
 db = SuiteDatabase()
 proxy_manager = ProxyManager()
-scraper_engine = MemberScraper(db)
-voice_engine = CloudVoiceChatEngine(db)
-adder_engine = EnterpriseMemberAdder(db, proxy_manager)
+proxy_lease_manager = ProxyLeaseManager(proxy_manager)
+
+scraper_engine = MemberScraper(db, proxy_manager, proxy_lease_manager)
+voice_engine = CloudVoiceChatEngine(db, proxy_manager, proxy_lease_manager)
+adder_engine = EnterpriseMemberAdder(db, proxy_manager, proxy_lease_manager)
 
 # ──────────────────────────────────────────────
 # TELETHON BOT PROXY (Solves Event Loop Mismatch in Uvicorn)
@@ -375,7 +377,7 @@ class BotProxy:
         return getattr(self._bot, name)
 
 bot = BotProxy()
-dm_engine = setup_dmsender_handlers(bot, db, proxy_manager)
+dm_engine = setup_dmsender_handlers(bot, db, proxy_manager, proxy_lease_manager)
 
 # ──────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -2574,25 +2576,37 @@ async def lifespan(app: FastAPI):
     real_bot = bot.initialize(StringSession(), CONFIG["API_ID"], CONFIG["API_HASH"])
     await real_bot.start(bot_token=CONFIG["BOT_TOKEN"])
     
-    # 2. Register background auditor task
+    # 2. Start Proxy Lease Manager (Auto-Reaper)
+    logger.info("🚀 Starting ProxyLeaseManager (Auto-Reaper active)...")
+    await proxy_manager.load_proxies()
+    await proxy_lease_manager.start()
+    
+    # 3. Register background auditor task
     auditor_task = asyncio.create_task(continuous_session_auditor())
     GLOBAL.register_task(auditor_task)
     
-    # 3. Register auto-recovery loop task
+    # 4. Register auto-recovery loop task
     recovery_task = asyncio.create_task(auto_health_recovery_loop())
     GLOBAL.register_task(recovery_task)
     
-    logger.info("🌐 Service, Telegram Bot, Auditor, and Recovery Loops are online!")
+    logger.info("🌐 Service, Telegram Bot, Auditor, Recovery Loops, and ProxyLeaseManager are online!")
     yield
     
     # Cleanup on server stop
-    logger.info("🛑 Gracefully shutting down Telethon Bot & Background Tasks...")
+    logger.info("🛑 Gracefully shutting down Telethon Bot, Background Tasks, and ProxyLeaseManager...")
     auditor_task.cancel()
     recovery_task.cancel()
     try:
         await asyncio.gather(auditor_task, recovery_task)
     except asyncio.CancelledError:
         pass
+    
+    # Stop lease manager
+    await proxy_lease_manager.stop()
+    
+    # Close database connection
+    db.close()
+    
     await real_bot.disconnect()
 
 app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
