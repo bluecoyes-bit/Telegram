@@ -184,6 +184,9 @@ class EnterpriseMemberAdder:
         self.db = db
         self.proxy_manager = proxy_manager
         self.proxy_lease_manager = proxy_lease_manager  # 🔥 NEW: Lease manager integration
+        self.use_lease_manager = (proxy_lease_manager is not None and 
+                                  hasattr(proxy_lease_manager, '_is_running') and 
+                                  proxy_lease_manager._is_running)
         self.scraper_helper = MemberScraper(db)
         self.is_running = False
         self.adder_state: Optional[AdderState] = None # Added for state tracking
@@ -256,12 +259,8 @@ class EnterpriseMemberAdder:
             session_str = acc_doc.get("session_string") or acc_doc.get("session")
             device = acc_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
             
-            # 🔥 NEW: Use ProxyLeaseManager if available for dynamic rolling batch
-            use_lease_manager = (self.proxy_lease_manager is not None and 
-                                hasattr(self.proxy_lease_manager, '_is_running') and 
-                                self.proxy_lease_manager._is_running)
-            
-            if use_lease_manager:
+            # 🔥 Use instance variable self.use_lease_manager instead of local variable
+            if self.use_lease_manager:
                 # Dynamic rolling batch mode - acquire proxy via lease manager
                 proxy_dict = await self.proxy_lease_manager.acquire_proxy(clean_phone)
                 if not proxy_dict:
@@ -495,8 +494,8 @@ class EnterpriseMemberAdder:
                             self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
                         await members_queue.put(member) # 🔥 Repopulate queue on drop
                         
-                        # 🔥 NEW: Release proxy with cooldown if using lease manager
-                        if use_lease_manager and worker_account.get("proxy_url"):
+                        # 🔥 Release proxy with cooldown if using lease manager
+                        if self.use_lease_manager and worker_account.get("proxy_url"):
                             await self.proxy_lease_manager.release_proxy(
                                 worker_account["proxy_url"], worker_account["clean_phone"],
                                 should_cooldown=True,
@@ -527,8 +526,8 @@ class EnterpriseMemberAdder:
                             else:
                                 self.db.mark_account_revoked(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
                             
-                            # 🔥 NEW: Release proxy with cooldown if using lease manager
-                            if use_lease_manager and worker_account.get("proxy_url"):
+                            # 🔥 Release proxy with cooldown if using lease manager
+                            if self.use_lease_manager and worker_account.get("proxy_url"):
                                 await self.proxy_lease_manager.release_proxy(
                                     worker_account["proxy_url"], worker_account["clean_phone"],
                                     should_cooldown=True,
@@ -550,8 +549,8 @@ class EnterpriseMemberAdder:
             finally:
                 # Loop khatam hone ke baad final cleanup
                 if worker_account is not None:
-                    # 🔥 NEW: Release proxy without cooldown on normal exit
-                    if use_lease_manager and worker_account.get("proxy_url"):
+                    # 🔥 Release proxy without cooldown on normal exit
+                    if self.use_lease_manager and worker_account.get("proxy_url"):
                         await self.proxy_lease_manager.release_proxy(
                             worker_account["proxy_url"], worker_account["clean_phone"],
                             should_cooldown=False
