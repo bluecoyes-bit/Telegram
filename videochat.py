@@ -301,7 +301,7 @@ class CloudVoiceChatEngine:
                         "status": "active",
                         "session": session_str,
                         "session_string": session_str,
-                        "last_updated": datetime.utcnow()
+                        "last_updated": datetime.now(timezone.utc)
                     }}
                 )
         
@@ -310,7 +310,7 @@ class CloudVoiceChatEngine:
             from datetime import datetime
             for clean_p, session_str, device, acc in backup_upserts:
                 existing = backups_coll.find_one({"phone": clean_p})
-                orig_auth_at = existing.get("authenticated_at") if existing else (acc.get("authenticated_at") or acc.get("timestamp") or datetime.utcnow())
+                orig_auth_at = existing.get("authenticated_at") if existing else (acc.get("authenticated_at") or acc.get("timestamp") or datetime.now(timezone.utc))
                 backups_coll.update_one(
                     {"phone": clean_p},
                     {"$set": {
@@ -322,7 +322,7 @@ class CloudVoiceChatEngine:
                         "app_version": device["app_version"],
                         "2fa_password": acc.get("2fa_password"),
                         "authenticated_at": orig_auth_at,
-                        "last_backup_sync": datetime.utcnow()
+                        "last_backup_sync": datetime.now(timezone.utc)
                     }},
                     upsert=True
                 )
