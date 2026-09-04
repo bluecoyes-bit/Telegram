@@ -137,6 +137,12 @@ CONFIG: Dict[str, Any] = {
     # ── Admin ──
     "ADMIN_ID": _env_str("ADMIN_ID", ""),
 
+    # ── Web API security ──
+    # Token required to call any /console/api/* route (Authorization: Bearer or
+    # X-API-Token header). Unset -> requests are rejected with 503 until the
+    # operator configures it. NEVER leave the REST console unauthenticated.
+    "WEB_API_TOKEN": _env_str("WEB_API_TOKEN", ""),
+
     # ── Worker Identity ──
     "WORKER_NODE_ID": _env_str("WORKER_NODE_ID", "worker_01"),
 

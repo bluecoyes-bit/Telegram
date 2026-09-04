@@ -10,7 +10,7 @@ import time
 import asyncio
 import random
 import logging
-import gc  # 🔥 NEW: Garbage collection control
+
 from typing import List, Dict, Optional, Any, Tuple, Set, TYPE_CHECKING
 from weakref import WeakSet  # 🔥 NEW: Weak references for task tracking
 
@@ -67,7 +67,7 @@ except (ModuleNotFoundError, ImportError):
             async def stop(self):
                 if self._group_call:
                     try: await self._group_call.stop()
-                    except: pass
+                    except Exception: pass
     except Exception as crash_reason:
         logger.warning(f"⚠️ PyTgCalls not available - Voice Chat features disabled. ({crash_reason})")
         
@@ -121,10 +121,7 @@ class CloudVoiceChatEngine:
         # 🔥 FIX 1: WeakSet instead of List for task tracking - avoids memory leaks
         self._active_tasks: WeakSet = WeakSet()
         self._running_calls: List[PyTgCalls] = []
-        self._running_clients: List[TelegramClient] = []
         self._last_status: Dict[str, str] = {}
-        # 🔥 FIX 2: Client factory cache to reuse client objects
-        self._client_cache: Dict[str, TelegramClient] = {}
         # 🔥 FIX 3: Periodic GC interval tracker
         self._last_gc_time = time.monotonic()
         # 🔥 FIX 4: Semaphore to limit concurrent connections
@@ -187,80 +184,32 @@ class CloudVoiceChatEngine:
             else:
                 device = random.choice(DEVICE_PROFILES) if DEVICE_PROFILES else {}
             
-            # 🔥 OPTIMIZATION: Reuse client from cache if available
-            cache_key = f"{clean_p}_{api_id}"
-            if cache_key in self._client_cache:
-                client = self._client_cache[cache_key]
-                # Check if still connected
-                if client.is_connected():
-                    try:
-                        await client.get_me()
-                        # Still valid, skip reconnection
-                        success_count += 1
-                        current_session_str = client.session.save()
-                        # Batch the update instead of immediate DB write
-                        batch_active_updates.append((clean_p, current_session_str))
-                        batch_backup_upserts.append((clean_p, current_session_str, device, acc))
-                        continue
-                    except:
-                        pass  # Fall through to reconnect
-                # Remove stale cache entry
-                del self._client_cache[cache_key]
-            
-                client = self.session_manager._create_client(
-                    session_str=session_str,
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    device=device,
-                    proxy=acc.get("proxy"),
-                )
-            
-            try:
-                await client.connect()
-                # 🔥 OPTIMIZATION: Disable update receiving - we don't need live updates
-                # This saves massive CPU/bandwidth
-                # await client.catch_up()  # Not needed for validation
+            async with self.session_manager.acquire(
+                clean_p,
+                module="videochat_audit",
+                auto_release=True,
+            ) as lease:
+                if not lease:
+                    batch_removals.append(phone)
+                    banned_count += 1
+                    error_logs.append({"phone": phone, "error": "Session unavailable or terminal."})
+                    continue
+                
+                client = lease.client
+                if not client.is_connected():
+                    await client.connect()
                 
                 is_authorized = await client.is_user_authorized()
                 
                 if is_authorized:
-                    # Cache the client for potential reuse
-                    self._client_cache[cache_key] = client
                     success_count += 1
                     current_session_str = client.session.save()
-                    
-                    # Batch the update
                     batch_active_updates.append((clean_p, current_session_str))
                     batch_backup_upserts.append((clean_p, current_session_str, device, acc))
                 else:
                     batch_removals.append(phone)
                     banned_count += 1
                     error_logs.append({"phone": phone, "error": "Session unauthorized."})
-                    # Don't cache unauthorized clients
-                    try: await client.disconnect()
-                    except: pass
-                    
-            except Exception as e:
-                error_str = str(e).lower()
-                banned_count += 1
-                
-                if "auth_key_duplicated" in error_str:
-                    reason = "The authorization key was used under two different IP addresses simultaneously."
-                elif any(m in error_str for m in ["auth_key_unregistered", "expired", "unauthorized"]):
-                    reason = "Session unauthorized."
-                elif any(m in error_str for m in ["user_deactivated", "banned"]):
-                    reason = "Account has been banned by Telegram infrastructure."
-                else:
-                    reason = f"Handshake Collapse: {str(e)[:60]}"
-                
-                batch_removals.append(phone)
-                error_logs.append({"phone": phone, "error": reason})
-                try: await client.disconnect()
-                except: pass
-                
-            finally:
-                # 🔥 OPTIMIZATION: Reduced sleep from 0.4s to 0.1s
-                await asyncio.sleep(0.1)
             
             # 🔥 OPTIMIZATION: Flush batches periodically
             if len(batch_active_updates) >= BATCH_SIZE:
@@ -269,14 +218,6 @@ class CloudVoiceChatEngine:
 
         # Final flush for remaining items
         await self._flush_batches(batch_active_updates, batch_backup_upserts, batch_removals)
-
-        # Clean up client cache to free resources
-        for client in self._client_cache.values():
-            try:
-                await client.disconnect()
-            except:
-                pass
-        self._client_cache.clear()
 
         return {
             "processed": len(all_accounts),
@@ -389,55 +330,55 @@ class CloudVoiceChatEngine:
                     error_logs.append({"phone": phone, "error": "Manual OTP only: DB1 missing session_string. Use /login <phone>."})
                     return
 
-                server_client = self.session_manager._create_client(
-                    session_str=session_str,
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    device=device_metadata if isinstance(device_metadata, dict) else random.choice(list(DEVICE_PROFILES)),
-                )
-
-                try:
-                    await server_client.connect()
-                    # 🔥 OPTIMIZATION: Disable session save_entities for migration tasks
-                    # We don't need to cache entities for a one-time migration
-                    server_client.session.save_entities = False
-
-                    if not await server_client.is_user_authorized():
-                        raise Exception("Session is not authorized. Use /login <phone> for manual OTP.")
+                async with self.session_manager.acquire(
+                    phone,
+                    module="videochat_migration",
+                    auto_release=True,
+                ) as lease:
+                    if not lease:
+                        failed_count += 1
+                        error_logs.append({"phone": phone, "error": "Session unavailable or terminal."})
+                        return
+                    
+                    server_client = lease.client
+                    if not server_client.is_connected():
+                        await server_client.connect()
 
                     try:
-                        service_peer = await server_client.get_input_entity(777000)
-                        await server_client(
-                            DeleteHistoryRequest(
-                                peer=service_peer,
-                                max_id=0,
-                                just_clear=False,
-                                revoke=True,
+                        # 🔥 OPTIMIZATION: Disable session save_entities for migration tasks
+                        server_client.session.save_entities = False
+
+                        if not await server_client.is_user_authorized():
+                            raise Exception("Session is not authorized. Use /login <phone> for manual OTP.")
+
+                        try:
+                            service_peer = await server_client.get_input_entity(777000)
+                            await server_client(
+                                DeleteHistoryRequest(
+                                    peer=service_peer,
+                                    max_id=0,
+                                    just_clear=False,
+                                    revoke=True,
+                                )
                             )
+                        except Exception as clean_err:
+                            logger.debug(f"Notification cleanup failed for {phone}: {clean_err}")
+
+                        new_session_str = server_client.session.save()
+                        self.db.save_migrated_session(
+                            phone=phone,
+                            api_id=api_id,
+                            api_hash=api_hash,
+                            session_str=new_session_str,
+                            device=device_metadata if isinstance(device_metadata, dict) else random.choice(list(DEVICE_PROFILES)),
                         )
-                    except Exception as clean_err:
-                        logger.debug(f"Notification cleanup failed for {phone}: {clean_err}")
 
-                    new_session_str = server_client.session.save()
-                    self.db.save_migrated_session(
-                        phone=phone,
-                        api_id=api_id,
-                        api_hash=api_hash,
-                        session_str=new_session_str,
-                        device=device_metadata if isinstance(device_metadata, dict) else random.choice(list(DEVICE_PROFILES)),
-                    )
+                        success_count += 1
 
-                    success_count += 1
+                    except Exception as crash:
+                        failed_count += 1
+                        error_logs.append({"phone": phone, "error": str(crash)[:80]})
 
-                except Exception as crash:
-                    failed_count += 1
-                    error_logs.append({"phone": phone, "error": str(crash)[:80]})
-                finally:
-                    try:
-                        await server_client.disconnect()
-                    except Exception:
-                        pass
-                    # 🔥 OPTIMIZATION: Reduced sleep
                     await asyncio.sleep(0.2)
 
         # Create tasks with proper semaphore control
@@ -491,31 +432,29 @@ class CloudVoiceChatEngine:
         """Asynchronously spawns separate instances for independent audio delivery loops with Native PyTgCalls Takeover Guard."""
         phone = str(acc_doc.get("phone"))
         
-        # 🔒 LOCK ACCOUNT
-        self.db.acquire_lock(phone)
-        
         resolved_audio_path = self._resolve_audio_path(audio_path)
         if not resolved_audio_path:
             msg = f"Audio file not found: {audio_path}"
             self._voice_log(phone, msg, "error")
-            self.db.release_lock(phone)
             await self._trigger_replacement_spawn(replacement_queue, group_link, audio_path)
             return
 
         device = acc_doc.get("device_metadata") or acc_doc.get("device_fingerprint") or random.choice(DEVICE_PROFILES)
         
-        # 🔥 CRITICAL OPTIMIZATION: entity_cache_limit + receive_updates=False
-        client = self.session_manager._create_client(
-            session_str=acc_doc.get("session_string", ""),
-            api_id=int(acc_doc.get("api_id", CONFIG["API_ID"])),
-            api_hash=str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-            device=device,
+        lease_context = self.session_manager.acquire(
+            phone,
+            module="videochat_stream",
+            auto_release=False,
         )
-        
-        # 🔥 NEW: Disable entity saving - we don't need persistent entity cache
+        lease = await lease_context.__aenter__()
+        if not lease:
+            msg = f"Session unavailable for {phone}"
+            self._voice_log(phone, msg, "error")
+            await self._trigger_replacement_spawn(replacement_queue, group_link, audio_path)
+            return
+        client = lease.client
         client.session.save_entities = False
         
-        self._running_clients.append(client)
         target_entity = None
         app = None
         
@@ -602,12 +541,11 @@ class CloudVoiceChatEngine:
                                         try:
                                             if app in self._running_calls: self._running_calls.remove(app)
                                             await app.stop()
-                                        except: pass
+                                        except Exception: pass
                                         try:
-                                            if client in self._running_clients: self._running_clients.remove(client)
-                                            await client.disconnect()
-                                        except: pass
-                                        self.db.release_lock(phone)
+                                            await self.session_manager.release_lease(lease)
+                                        except Exception:
+                                            pass
                                     
                                     asyncio.create_task(force_exit_routine())
                                     return
@@ -674,32 +612,19 @@ class CloudVoiceChatEngine:
             try:
                 if app and app in self._running_calls: self._running_calls.remove(app)
                 if app: await app.stop()
-            except: pass
+            except Exception: pass
             try:
-                if client in self._running_clients: self._running_clients.remove(client)
-                await client.disconnect()
-            except: pass
-            
-            self.db.release_lock(phone)
-            # 🔥 NEW: Force garbage collection after each stream ends
-            if gc.isenabled():
-                asyncio.get_running_loop().run_in_executor(None, gc.collect)
+                await self.session_manager.release_lease(lease)
+            except Exception:
+                pass
 
     # 🔥 NEW: Periodic cleanup method to prevent memory accumulation
     async def _periodic_stream_cleanup(self, client):
         """Periodic cleanup to prevent entity cache from growing unbounded."""
         try:
-            # Clear Telethon's internal entity cache
             if hasattr(client, '_entity_cache'):
-                # Keep only essential entities (the target channel)
                 client._entity_cache.clear()
                 logger.debug(f"Entity cache cleared for a running stream client")
-            
-            # Force garbage collection every 5 cycles
-            if gc.isenabled():
-                collected = gc.collect(0)  # Only generation 0 (fast)
-                gc.collect(1)             # Generation 1
-                logger.debug(f"GC collected {collected} objects")
         except Exception:
             pass
 
@@ -777,7 +702,7 @@ class CloudVoiceChatEngine:
         # 1. Cancel pending deployment tasks immediately
         for task in list(self._active_tasks):
             try: task.cancel()
-            except: pass
+            except Exception: pass
         self._active_tasks.clear()
 
         async def _graceful_teardown():
@@ -790,35 +715,16 @@ class CloudVoiceChatEngine:
                     pass
             self._running_calls.clear()
             
-            # Step B: Reduced cooldown from 2.0s to 1.0s
+            # Step B: Reduced cooldown from 1.0s to 1.0s (kept for stream teardown)
             await asyncio.sleep(1.0)
             
-            # Step C: Disconnect all Telethon clients
-            print("🔌 [VOICECHAT] Disconnecting Telegram Client Sockets...", flush=True)
-            for client in list(self._running_clients):
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            self._running_clients.clear()
-            
-            # 🔥 NEW: Clear client cache
-            for client in list(self._client_cache.values()):
-                try:
-                    await client.disconnect()
-                except: pass
-            self._client_cache.clear()
-            
-            # Step D: Release database locks
+            # Step C: Release any in-memory session reservations (SessionManager owns sessions)
+            print("🔌 [VOICECHAT] Releasing session reservations...", flush=True)
             try:
-                self.db.release_all_locks()
+                await self.session_manager.disconnect_all()
             except Exception: pass
             
             self._last_status.clear()
-            
-            # 🔥 NEW: Force garbage collection after shutdown
-            if gc.isenabled():
-                asyncio.get_running_loop().run_in_executor(None, gc.collect)
             
             print("✅ [VOICECHAT MASTER] All accounts cleanly disconnected. Cluster is offline.", flush=True)
 

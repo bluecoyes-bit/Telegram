@@ -135,7 +135,6 @@ class MemberScraper:
     async def scrape_standard_pool(self, account_doc: Dict, group_link: str, mode: str) -> int:
         """Executes standard lookup operations with active filters (all, 24h, weekly)."""
         phone = str(account_doc.get("phone", ""))
-        self.db.acquire_lock(phone)  # 🔒 Lock before scraping starts
 
         session_str = account_doc.get("session_string") or account_doc.get("session")
         device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
@@ -146,7 +145,6 @@ class MemberScraper:
             auto_release=True,
         ) as lease:
             if not lease:
-                self.db.release_lock(phone)
                 return 0
             client = lease.client
             try:
@@ -196,13 +194,10 @@ class MemberScraper:
             except ChatAdminRequiredError:
                 print("  ❌ Administrative security clearance required to parse member lists here.")
                 return 0
-            finally:
-                self.db.release_lock(phone)  # 🔓 Safe release when done
 
     async def scrape_hidden_matrix(self, account_doc: Dict, group_link: str) -> int:
         """Scans historical channels history and active live tracking streams to gather hidden participants data logs."""
         phone = str(account_doc.get("phone", ""))
-        self.db.acquire_lock(phone)  # 🔒 Lock before hidden scraping starts
 
         session_str = account_doc.get("session_string") or account_doc.get("session")
         device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
@@ -213,7 +208,6 @@ class MemberScraper:
             auto_release=True,
         ) as lease:
             if not lease:
-                self.db.release_lock(phone)
                 return 0
             client = lease.client
             try:
@@ -314,13 +308,10 @@ class MemberScraper:
             except Exception as e:
                 logger.error(f"Hidden compiler structural failure occurred: {e}")
                 return 0
-            finally:
-                self.db.release_lock(phone)  # 🔓 Safe release when done
             
     async def scrape_voicechat_matrix(self, account_doc: Dict, group_link: str) -> int:
         """Scans the active live Voice Chat (Group Call) to extract all currently connected members."""
         phone = str(account_doc.get("phone", ""))
-        self.db.acquire_lock(phone)  # 🔒 Lock before VC scraping starts
 
         session_str = account_doc.get("session_string") or account_doc.get("session")
         device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
@@ -331,7 +322,6 @@ class MemberScraper:
             auto_release=True,
         ) as lease:
             if not lease:
-                self.db.release_lock(phone)
                 return 0
             client = lease.client
             try:
@@ -403,5 +393,3 @@ class MemberScraper:
             except Exception as e:
                 logger.error(f"VoiceChat extraction structural failure occurred: {e}")
                 return 0
-            finally:
-                self.db.release_lock(phone)  # 🔓 Safe release when done

@@ -28,9 +28,6 @@ from pymongo.errors import (
 from pymongo.read_preferences import ReadPreference
 from pymongo.write_concern import WriteConcern
 
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-
 from config import CONFIG, DEVICE_PROFILES, MONGODB_SETTINGS, MONGO_CFG
 
 logger = logging.getLogger("SuiteDatabase")
@@ -360,47 +357,57 @@ class SuiteDatabase:
             logger.debug(f"🧹 Cleaned {len(expired)} expired locks.")
         self._last_lock_cleanup = now
     
+    # ══════════════════════════════════════════════════════════════
+    # DEPRECATED DB LOCK SYSTEM — ISOLATED (P0-CLOSEOUT)
+    # ══════════════════════════════════════════════════════════════
+    # These legacy account locks were removed from all normal runtime
+    # modules (main_bot, scraper, videochat, adder, dmsender, web_console).
+    # Session ownership is now exclusively managed by SessionManager /
+    # AccountLeaseManager. These methods are intentionally NOT called by
+    # any runtime code and exist only for backward-compat during transition.
+    # They raise OSError if invoked at runtime so accidental use is loud.
+    # MARKED DEPRECATED — DO NOT CALL.
     def acquire_lock(self, phone: str) -> None:
-        """Lock account globally. Expires after LOCK_TTL_SECONDS (prevents deadlocks)."""
-        clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
-        self._active_task_locks[clean_phone] = time.time() + LOCK_TTL_SECONDS
-        self._cleanup_expired_locks()
+        """[DEPRECATED] Global account lock. No runtime caller remains."""
+        raise NotImplementedError(
+            "database.acquire_lock is DEPRECATED and removed from runtime "
+            "use. Session ownership is managed by SessionManager."
+        )
 
     async def acquire_lock_async(self, phone: str) -> bool:
-        """Async-safe lock acquisition with proper locking."""
-        clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
-        async with self._async_lock:
-            self._active_task_locks[clean_phone] = time.time() + LOCK_TTL_SECONDS
-            self._cleanup_expired_locks()
-            return True
+        """[DEPRECATED] Async lock. Removed from runtime use."""
+        raise NotImplementedError(
+            "database.acquire_lock_async is DEPRECATED and removed from "
+            "runtime use. Use SessionManager."
+        )
 
     def release_lock(self, phone: str) -> None:
-        """Release global lock for account."""
-        clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
-        self._active_task_locks.pop(clean_phone, None)
+        """[DEPRECATED] Release lock. Removed from runtime use."""
+        raise NotImplementedError(
+            "database.release_lock is DEPRECATED and removed from runtime "
+            "use. Use SessionManager."
+        )
 
     async def release_lock_async(self, phone: str) -> None:
-        """Async-safe lock release."""
-        clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
-        async with self._async_lock:
-            self._active_task_locks.pop(clean_phone, None)
+        """[DEPRECATED] Async release. Removed from runtime use."""
+        raise NotImplementedError(
+            "database.release_lock_async is DEPRECATED and removed from "
+            "runtime use. Use SessionManager."
+        )
 
     def is_locked(self, phone: str) -> bool:
-        """Check if account is locked (auto-handles expired locks)."""
-        clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
-        expiry = self._active_task_locks.get(clean_phone, 0)
-        if expiry == 0:
-            return False
-        if time.time() > expiry:
-            self._active_task_locks.pop(clean_phone, None)
-            return False
-        return True
+        """[DEPRECATED] Check if account is locked. Removed from runtime use."""
+        raise NotImplementedError(
+            "database.is_locked is DEPRECATED and removed from runtime use. "
+            "Use SessionManager / AccountLeaseManager."
+        )
 
     def release_all_locks(self) -> None:
-        """Brute-force purge all locks. Emergency use only."""
-        count = len(self._active_task_locks)
-        self._active_task_locks.clear()
-        logger.info(f"🔓 Released {count} locks (emergency purge).")
+        """[DEPRECATED] Purge all locks. Removed from runtime use."""
+        raise NotImplementedError(
+            "database.release_all_locks is DEPRECATED and removed from "
+            "runtime use. Use SessionManager.disconnect_all()."
+        )
 
     # ────────────────────────────────────────────────────────────
     # STATUS TRANSITION API (single authoritative path)
@@ -1140,113 +1147,20 @@ class SuiteDatabase:
         """
         Process local session files → DB1 source_accounts.
         Streams progress updates to Telegram UI.
+
+        DELEGATES to session_migration.migrate_local_sessions — the ONLY offline
+        migration utility that constructs a user-session TelegramClient. This
+        keeps normal runtime free of direct client creation.
         """
-        vars_data = self.parse_vars_txt(vars_path)
-        sessions_path = pathlib.Path(sessions_dir)
-        sessions_path.mkdir(parents=True, exist_ok=True)
-        
-        staged = migrated = failed = skipped = 0
-        errors = []
-        
-        # Load 2FA JSON
-        twofa_map = {}
-        json_file = pathlib.Path(json_2fa_path)
-        if json_file.exists() and json_file.stat().st_size > 0:
-            try:
-                with open(json_file, "r", encoding="utf-8") as jf:
-                    raw_json_data = json.load(jf)
-                    if isinstance(raw_json_data, dict):
-                        for k, v in raw_json_data.items():
-                            clean_k = self._normalize(k)
-                            if clean_k:
-                                twofa_map[clean_k] = str(v).strip()
-            except Exception as json_err:
-                logger.error(f"⚠️ JSON parse error: {json_err}")
-                errors.append({"phone": "JSON_Config", "error": f"JSON parse error: {str(json_err)[:100]}"})
-        
-        if not vars_data:
-            return {"staged": 0, "migrated": 0, "failed": 0, "skipped": 0, "errors": [{"phone": "All", "error": "vars.txt missing or empty."}]}
-        
-        total_accounts = len(vars_data)
-        processed_count = 0
-        
-        for phone, creds in vars_data.items():
-            processed_count += 1
-            clean_phone_key = self._normalize(phone)
-            session_path = self.resolve_session_path(phone, sessions_path)
-            
-            # UI progress update
-            if event:
-                try:
-                    await event.edit(
-                        f"⏳ **Live Account Sync...**\n\n"
-                        f"🔄 `[{processed_count}/{total_accounts}]`\n"
-                        f"🟢 Migrated: `{migrated}`\n"
-                        f"🔴 Failed: `{failed}`\n"
-                        f"🟡 Skipped: `{skipped}`\n"
-                        f"⚙️ `+{clean_phone_key}`"
-                    )
-                except Exception:
-                    pass
-            
-            if not session_path:
-                skipped += 1
-                errors.append({"phone": phone, "error": "Session file missing."})
-                continue
-            
-            device = random.choice(DEVICE_PROFILES) if DEVICE_PROFILES else {
-                "device_model": "PC 64bit", "system_version": "Windows 11 Pro 23H2", "app_version": "5.1.0"
-            }
-            
-            client = TelegramClient(
-                str(session_path),
-                int(creds["api_id"]),
-                str(creds["api_hash"]),
-                device_model=device["device_model"],
-                system_version=device["system_version"],
-                app_version=device["app_version"],
-            )
-            
-            try:
-                await client.connect()
-                if not await client.is_user_authorized():
-                    failed += 1
-                    errors.append({"phone": phone, "error": "Session unauthorized."})
-                    await client.disconnect()
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
-                    continue
-                
-                session_str = StringSession.save(client.session)
-                matched_2fa = twofa_map.get(clean_phone_key, None)
-                
-                self.save_authorized_session(
-                    phone=phone,
-                    session_str=session_str,
-                    status="active",
-                    device=device,
-                    two_fa_password=matched_2fa
-                )
-                
-                staged += 1
-                migrated += 1
-                
-            except Exception as exc:
-                failed += 1
-                errors.append({"phone": phone, "error": str(exc)[:100]})
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                await asyncio.sleep(random.uniform(0.3, 1.0))
-        
-        return {
-            "staged": staged,
-            "migrated": migrated,
-            "failed": failed,
-            "skipped": skipped,
-            "errors": errors,
-        }
+        from session_migration import migrate_local_sessions
+
+        return await migrate_local_sessions(
+            db=self,
+            event=event,
+            sessions_dir=sessions_dir,
+            vars_path=vars_path,
+            json_2fa_path=json_2fa_path,
+        )
     
     # ────────────────────────────────────────────────────────────
     # 12. STATUS BAR CACHE (for UI)
