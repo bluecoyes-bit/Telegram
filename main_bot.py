@@ -29,7 +29,7 @@ import httpx
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
 from proxy_manager import ProxyManager, ProxyLeaseManager
-from session_manager import SessionManager, SessionAlreadyOwnedError
+from session_manager import SessionManager, SessionAlreadyOwnedError, SessionLifecycleState
 from account_lease_manager import AccountLeaseManager, AccountState, TERMINAL_DB_STATUSES, ELIGIBLE_DB_STATUSES
 from exception_classifier import (
     ErrorCategory,
@@ -80,7 +80,7 @@ from scraper import MemberScraper
 from videochat import CloudVoiceChatEngine
 from adder import EnterpriseMemberAdder, AdderState, status_updater_loop
 from dmsender import setup_dmsender_handlers
-from web_console import console_router, init_console_db, setup_console_routes, init_console_session_manager
+from web_console import console_router, init_console_db, setup_console_routes, init_console_session_manager, shutdown_background_tasks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MasterSuiteBot")
@@ -186,13 +186,6 @@ class GlobalState:
         # Auth states (bounded)
         self.auth_states: Dict[str, AuthState] = {}
 
-        # ── 🔥 DYNAMIC POOL SIZE ──
-        # Base pool size from config, will auto-scale up to 10% of total accounts
-        self._base_pool_max_size: int = CONFIG.get("MAX_POOL_SIZE", 50)
-        self._pool_max_size: int = self._base_pool_max_size
-        # Client pool (bounded LRU-like)
-        self.client_pool: Dict[str, ClientPoolEntry] = {}
-
         # ── 🔥 STATUS BAR CACHE ──
         self._status_bar_cache: str = ""
         self._status_bar_expires: float = 0.0
@@ -205,14 +198,6 @@ class GlobalState:
         self.background_tasks: Set[asyncio.Task] = set()
 
         self._initialized = True
-
-    # ── 🔥 NEW: Adjust pool size dynamically ──
-    async def adjust_pool_size(self, total_accounts: int) -> None:
-        """Scale pool to ~10% of total accounts, clamped between base and 200 max."""
-        desired = max(self._base_pool_max_size, total_accounts // 10)
-        desired = min(desired, CONFIG.get("MAX_POOL_ABSOLUTE", 200))
-        async with self._pool_lock:
-            self._pool_max_size = desired
 
     # ── 🔥 NEW: Cached status bar ──
 
@@ -304,63 +289,6 @@ class GlobalState:
                 except Exception:
                     pass
             return len(stale)
-
-    # ── Client Pool ──
-    async def pool_get(self, phone: str) -> Optional[ClientPoolEntry]:
-        async with self._pool_lock:
-            entry = self.client_pool.get(phone)
-            if entry:
-                entry.last_used = time.time()
-            return entry
-
-    async def pool_set(self, phone: str, entry: ClientPoolEntry) -> None:
-        async with self._pool_lock:
-            # Evict oldest if at capacity
-            if len(self.client_pool) >= self._pool_max_size:
-                oldest_key = min(self.client_pool, key=lambda k: self.client_pool[k].last_used)
-                oldest = self.client_pool.pop(oldest_key)
-                try:
-                    await oldest.client.disconnect()
-                except Exception:
-                    pass
-                logger.debug(f"Evicted oldest pooled client: {oldest_key}")
-            self.client_pool[phone] = entry
-
-    async def pool_remove(self, phone: str) -> Optional[ClientPoolEntry]:
-        async with self._pool_lock:
-            entry = self.client_pool.pop(phone, None)
-            if entry:
-                try: await entry.client.disconnect()
-                except Exception: pass
-            return entry
-
-    async def pool_cleanup_stale(self, max_idle: float = 3600) -> int:
-        """Remove clients idle for more than max_idle seconds."""
-        async with self._pool_lock:
-            now = time.time()
-            stale = [k for k, v in self.client_pool.items() if (now - v.last_used) > max_idle]
-            for k in stale:
-                entry = self.client_pool.pop(k)
-                try:
-                    await entry.client.disconnect()
-                except Exception:
-                    pass
-            return len(stale)
-
-    async def pool_clear(self) -> int:
-        async with self._pool_lock:
-            count = len(self.client_pool)
-            for entry in self.client_pool.values():
-                try:
-                    await entry.client.disconnect()
-                except Exception:
-                    pass
-            self.client_pool.clear()
-            return count
-
-    async def pool_size(self) -> int:
-        async with self._pool_lock:
-            return len(self.client_pool)
 
     # ── Health Check ──
     async def is_health_check_active(self) -> bool:
@@ -622,12 +550,10 @@ async def managed_client(record: dict, use_pool: bool = True):
             # Release proxy lease if one was acquired
             if lease and lease.proxy_url and session_manager.proxy_lease_manager:
                 await session_manager.proxy_lease_manager.release_proxy(
-                    lease.proxy_url, phone
+                    proxy_url=lease.proxy_url, phone=phone
                 )
-            # Release session lease
-            await session_manager._release_lease(
-                session_manager._session_key(phone), lease.owner
-            )
+            # Release session lease through the public interface
+            await session_manager.release_lease(lease)
             # Disconnect if not pooling
             if not use_pool:
                 try:
@@ -956,7 +882,6 @@ async def centralized_ui_router(event) -> None:
     # ── LEVEL 1: DIAGNOSTICS ──
     elif route == "nav_lvl1_diag":
         worker_id = CONFIG.get("WORKER_NODE_ID", "worker_01")
-        pool_size = await GLOBAL.pool_size()
         health_active = await GLOBAL.is_health_check_active()
 
         text = (
@@ -965,7 +890,6 @@ async def centralized_ui_router(event) -> None:
             f"{status_bar}\n"
             "🖥️ **RUNTIME INFRASTRUCTURE LOGS:**\n"
             f"• Core Worker Node: `{worker_id}`\n"
-            f"• Connection Pool Engine: `{pool_size}` active client threads\n"
             f"• Shared Task Queues: `🟢 SYSTEM IDLE / READY`\n\n"
             f"• Auditor State: `{'🟢 ACTIVE' if health_active else '🔴 PAUSED'}`\n"
             "📡 **LIVE TELEMETRY PARAMETERS:**\n"
@@ -1296,9 +1220,8 @@ async def centralized_ui_router(event) -> None:
         )
 
     elif route == "diag_runtime_stats":
-        pool_size = await GLOBAL.pool_size()
         await event.edit(
-            f"**Runtime Status**\n\nActive Workers: `4`\nTask Queue: `Idle`\nCached Connections: `{pool_size}`",
+            f"**Runtime Status**\n\nActive Workers: `4`\nTask Queue: `Idle`\nCached Connections: `0` (pool removed)",
             buttons=back_to_lvl1,
         )
 
@@ -1393,9 +1316,16 @@ async def login_handler(event) -> None:
     raw_phone = event.pattern_match.group(1)
     phone = clean_phone_input(raw_phone)
     db_clean_phone = normalize_phone(phone)
+    login_owner = f"login:{db_clean_phone}"
 
     await event.reply(f"⏳ **Initializing Login Pipeline for:** `{phone}`...\nConnecting to Telegram Core Matrix...")
     logger.info(f"⚙️ Login request for: {phone}")
+
+    # Reserve the phone for login so no other module can acquire it concurrently
+    reserved = await session_manager.reserve_login(db_clean_phone, login_owner)
+    if not reserved:
+        await event.reply("❌ **Login Blocked:** Phone is already owned by another module (login/auditor/DM/adder/scraper/videochat/web). Try again later.")
+        return
 
     try:
         login_result = await shared_login_process(phone)
@@ -1403,6 +1333,16 @@ async def login_handler(event) -> None:
         device = login_result["device"]
         code_hash = login_result["code_hash"]
         proxy_used = login_result.get("proxy_used", "Direct / None")  # 🔥 Extract proxy info
+
+        # Attach the login client to the reservation (same client reused across OTP/2FA)
+        await session_manager.set_login_stage(
+            db_clean_phone, login_owner, SessionLifecycleState.OTP_WAITING
+        )
+        async with session_manager._lock:
+            info = session_manager._sessions.get(db_clean_phone)
+            if info and info.owner == login_owner:
+                info.client = client
+                info.last_error = None
 
         # Store auth state with TTL
         await GLOBAL.set_auth_state(db_clean_phone, AuthState(
@@ -1422,12 +1362,15 @@ async def login_handler(event) -> None:
 
 
     except asyncio.TimeoutError:
+        await session_manager.release_login(db_clean_phone, login_owner)
         logger.error(f"Timeout for {phone}")
         await event.reply("❌ **Network Connection Timeout:** Telegram core server ne response nahi diya. Please check your system internet or proxies.")
     except FloodWaitError as fwe:
+        await session_manager.release_login(db_clean_phone, login_owner)
         logger.error(f"FloodWait {fwe.seconds}s for {phone}")
         await event.reply(f"❌ **FloodWait:** Telegram ne `{fwe.seconds}` seconds ka wait karne ko kaha hai.")
     except Exception as e:
+        await session_manager.release_login(db_clean_phone, login_owner)
         logger.error(f"Login error for {phone}: {e}", exc_info=True)
         await event.reply(f"❌ **Login Initiation Failed!**\nReason: `{str(e)}`")
 
@@ -1445,6 +1388,7 @@ async def verify_handler(event) -> None:
     code = str(event.pattern_match.group(2)).strip()
     clean_phone_with_plus = clean_phone_input(phone_in)
     db_clean_phone = normalize_phone(clean_phone_with_plus)
+    login_owner = f"login:{db_clean_phone}"
 
     await event.reply(f"⚡ **Submitting Verification Token `{code}`** for `{clean_phone_with_plus}`...")
 
@@ -1454,10 +1398,16 @@ async def verify_handler(event) -> None:
     phone_code_hash = state.phone_code_hash if state else None
     device = state.device if state else None
 
+    # If no live login client in memory, fall back to the DB pending session.
+    # This is still a login-flow client, so it must go through reserve_login.
     if not client or not phone_code_hash:
         # Fallback: try DB
+        if not await session_manager.reserve_login(db_clean_phone, login_owner):
+            await event.reply("❌ **Error:** Phone is owned by another module. Run `/login` fresh.")
+            return
         record = db.get_session_by_phone(db_clean_phone)
         if not record or not safe_session_str(record):
+            await session_manager.release_login(db_clean_phone, login_owner)
             await event.reply("❌ **Error:** No active login state found for this phone. Run `/login` first.")
             return
         device = get_device_profile(record)
@@ -1468,6 +1418,10 @@ async def verify_handler(event) -> None:
             device=device,
             proxy=record.get("proxy"),
         )
+        async with session_manager._lock:
+            info = session_manager._sessions.get(db_clean_phone)
+            if info and info.owner == login_owner:
+                info.client = client
         await client.connect()
         phone_code_hash = record.get("phone_code_hash")
 
@@ -1484,11 +1438,14 @@ async def verify_handler(event) -> None:
         await fetch_past_otps(client, db_clean_phone)
 
         await GLOBAL.pop_auth_state(db_clean_phone)
+        await session_manager.release_login(db_clean_phone, login_owner)
         await event.reply(f"✅ **Login Successful!**\nSession for `{clean_phone_with_plus}` is now live and saved in DB 1 ecosystem.")
 
     except SessionPasswordNeededError:
         session_str = client.session.save()
         db.save_authorized_session(db_clean_phone, session_str, AccountStatus.ACTIVE, device, two_fa_password=None)
+        # Stay reserved in TWOFA_WAITING — same client is reused by /verify_2fa
+        await session_manager.set_login_stage(db_clean_phone, login_owner, SessionLifecycleState.TWOFA_WAITING)
         # Re-store state (client still alive, not disconnected)
         await GLOBAL.set_auth_state(db_clean_phone, AuthState(client=client, phone_code_hash=phone_code_hash, device=device))
         await event.reply(
@@ -1499,10 +1456,7 @@ async def verify_handler(event) -> None:
     except Exception as e:
         await event.reply(f"❌ **Verification Failed!**\nTraceback: `{str(e)}`")
         await GLOBAL.pop_auth_state(db_clean_phone)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await session_manager.release_login(db_clean_phone, login_owner)
 
 
 # ──────────────────────────────────────────────
@@ -1517,6 +1471,7 @@ async def verify_2fa_handler(event) -> None:
     password = str(event.pattern_match.group(2)).strip()
     clean_phone_with_plus = clean_phone_input(phone_in)
     db_clean_phone = normalize_phone(clean_phone_with_plus)
+    login_owner = f"login:{db_clean_phone}"
 
     await event.reply(f"🔒 **Submitting 2FA security matrix password** for `{clean_phone_with_plus}`...")
 
@@ -1525,8 +1480,13 @@ async def verify_2fa_handler(event) -> None:
     device = state.device if state else None
 
     if not client:
+        # No live login client — must reserve before creating one.
+        if not await session_manager.reserve_login(db_clean_phone, login_owner):
+            await event.reply("❌ **Error:** Phone is owned by another module. Run `/login` fresh.")
+            return
         record = db.get_session_by_phone(db_clean_phone)
         if not record:
+            await session_manager.release_login(db_clean_phone, login_owner)
             await event.reply("❌ **Error:** No session data located for this index.")
             return
         device = get_device_profile(record)
@@ -1537,6 +1497,10 @@ async def verify_2fa_handler(event) -> None:
             device=device,
             proxy=record.get("proxy"),
         )
+        async with session_manager._lock:
+            info = session_manager._sessions.get(db_clean_phone)
+            if info and info.owner == login_owner:
+                info.client = client
         await client.connect()
 
     try:
@@ -1557,13 +1521,16 @@ async def verify_2fa_handler(event) -> None:
         await fetch_past_otps(client, db_clean_phone)
 
         await GLOBAL.pop_auth_state(db_clean_phone)
+        await session_manager.release_login(db_clean_phone, login_owner)
         await event.reply(f"🎉 **2FA Bypass Complete & Password Saved!**\n`{clean_phone_with_plus}` status elevated to `active` inside DB 1.")
 
     except Exception as e:
         await event.reply(f"❌ **2FA Submission Rejected:** `{str(e)}`")
+        await session_manager.release_login(db_clean_phone, login_owner)
     finally:
         active_state = await GLOBAL.get_auth_state(db_clean_phone)
         if not active_state:
+            await session_manager.release_login(db_clean_phone, login_owner)
             try:
                 await client.disconnect()
             except Exception:
@@ -1719,9 +1686,7 @@ async def terminate_manual_login(event) -> None:
         await status_msg.edit(f"⚠️ **Query Exception:** `{phone}` Target DB clusters me nahi mila.")
         return
 
-    # Evict from pool first
     clean_phone = normalize_phone(phone)
-    await GLOBAL.pool_remove(clean_phone)
 
     async with managed_client(matched_acc, use_pool=False) as client:
         try:
@@ -1835,7 +1800,6 @@ async def account_purge_router(event) -> None:
         return
     phone = args[1].strip()
     clean_phone = normalize_phone(phone)
-    await GLOBAL.pool_remove(clean_phone)
     if db.remove_account_permanently(phone):
         await event.reply(f"🗑️ **Data Record Dropped:** `{phone}` completely purged from system clusters.")
     else:
@@ -2150,13 +2114,7 @@ async def run_member_adder_matrix(event) -> None:
     chat_id = event.chat_id
     target_group_link = event.pattern_match.group(1).strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
 
-    # Lock all active accounts safely before campaign
-    active_accounts = await db.get_active_target_sessions()
-    for acc in active_accounts:
-        phone = acc.get("phone")
-        if phone:
-            db.acquire_lock(normalize_phone(str(phone)))
-
+    # Session ownership is handled by SessionManager/AccountLeaseManager
     logger.info(f"⚡ Launching enterprise adder to target: {target_group_link}")
 
     try:
@@ -2187,13 +2145,6 @@ async def run_member_adder_matrix(event) -> None:
     except Exception as e:
         logger.error(f"Adder error: {e}")
         await event.reply(f"❌ **Adder System Exception:** `{str(e)[:200]}`")
-    finally:
-        # Release account locks after completion/failure
-        for acc in active_accounts:
-            phone = acc.get("phone")
-            if phone:
-                db.release_lock(normalize_phone(str(phone)))
-        logger.info("🔓 Adder locks released.")
 
 
 # ──────────────────────────────────────────────
@@ -2349,9 +2300,6 @@ async def continuous_session_auditor() -> None:
                 await asyncio.sleep(random.randint(600, 1200))
                 continue
 
-            # ── 🔥 DYNAMIC POOL ADJUSTMENT ──
-            await GLOBAL.adjust_pool_size(len(active_accounts))
-
             # ── 🔥 PRIORITIZATION: Least recently checked first ──
             # If no last_checked_time, treat as oldest priority (epoch = 0)
             active_accounts.sort(
@@ -2394,11 +2342,6 @@ async def continuous_session_auditor() -> None:
                 # Trigger GC more often to free objects
                 if random.random() < 0.5:
                     gc.collect()
-
-            # ── Pool cleanup ──
-            evicted = await GLOBAL.pool_cleanup_stale(max_idle=1800)
-            if evicted:
-                audit_logger.info(f"🧹 Cleaned {evicted} stale pooled connections.")
 
             stale_auth = await GLOBAL.cleanup_stale_auth_states()
             if stale_auth:
@@ -2492,10 +2435,10 @@ async def _audit_single_account(account_doc: dict) -> bool:
     if not clean_phone or not safe_session_str(account_doc):
         return False
 
-    # Skip locked accounts (busy in voice/adder/dm)
-    if db.is_locked(clean_phone):
-        audit_logger.debug(f"🔒 Account +{clean_phone} locked. Evicting from pool.")
-        await GLOBAL.pool_remove(clean_phone)
+    # Skip accounts that are currently leased/busy (voice/adder/dm).
+    # Ownership is tracked by AccountLeaseManager/SessionManager, not DB locks.
+    if await account_lease_manager.is_busy(clean_phone):
+        audit_logger.debug(f"🔒 Account +{clean_phone} busy (leased). Skipping audit.")
         return False
 
     # ── 🔥 LIGHT CACHING: Skip if recently checked successfully ──
@@ -2564,8 +2507,7 @@ async def _audit_single_account(account_doc: dict) -> bool:
             category=ErrorCategory.AUTH_KEY_DUPLICATED,
         )
         db.set_account_state(clean_phone, AccountStatus.AUTH_KEY_DUPLICATED)
-        await GLOBAL.pool_remove(clean_phone)
-    
+
     except (UserDeactivatedError, UserDeactivatedBanError) as e:
         reason_failed = f"Account Terminated: {e}"
     except (asyncio.TimeoutError, OSError, ConnectionError, ssl.SSLError):
@@ -2584,7 +2526,6 @@ async def _audit_single_account(account_doc: dict) -> bool:
         audit_logger.critical(f"❌ Session +{clean_phone} is dead: {reason_failed}")
         if not is_duplicate:
             db.mark_account_revoked(clean_phone, reason_failed)
-        await GLOBAL.pool_remove(clean_phone)
 
         ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
         now_str = ist_time.strftime("%d-%m-%Y | %H:%M:%S")
@@ -2648,6 +2589,9 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(auditor_task, recovery_task)
     except asyncio.CancelledError:
         pass
+
+    # Cancel tracked web-console background tasks (Phase 22)
+    shutdown_background_tasks()
 
     # Stop lease managers
     await proxy_lease_manager.stop()

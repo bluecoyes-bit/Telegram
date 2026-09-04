@@ -513,6 +513,7 @@ class ProxyLeaseManager:
 
     async def release_proxy(
         self,
+        *,
         proxy_url: str,
         phone: str,
         should_cooldown: bool = False,

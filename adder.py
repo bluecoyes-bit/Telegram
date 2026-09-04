@@ -272,7 +272,26 @@ class EnterpriseMemberAdder:
         is_private, resolved_token = self.scraper_helper.resolve_group_link(target_group_link)
         target_entity_identifier = resolved_token if is_private else target_group_link
 
-        MAX_WORKER_SESSIONS = min(len(active_accounts), CONFIG.get("ADDER_MAX_WORKER_SESSIONS", 10))
+        # 🔥 RESOURCE-AWARE SCHEDULING (Phase 15): the worker pool is not a
+        # hard-coded batch. Bounded by eligible accounts, the configured operation
+        # limit, and available proxy/network capacity — whichever is smallest
+        # (at least 1 so workers can wait for capacity instead of dropping work).
+        _adder_configured_limit = int(CONFIG.get("ADDER_MAX_WORKER_SESSIONS", 10))
+        _adder_available_proxies = 0
+        if self.proxy_lease_manager is not None:
+            try:
+                _adder_available_proxies = max(
+                    0, self.proxy_lease_manager.get_available_count()
+                )
+            except Exception:
+                _adder_available_proxies = 0
+        if _adder_available_proxies > 0:
+            MAX_WORKER_SESSIONS = max(
+                1,
+                min(len(active_accounts), _adder_configured_limit, _adder_available_proxies),
+            )
+        else:
+            MAX_WORKER_SESSIONS = max(1, min(len(active_accounts), _adder_configured_limit))
         HUMAN_ADD_INTERVAL = tuple(CONFIG.get("ADDER_HUMAN_ADD_INTERVAL", (8, 14)))
         BURST_ADD_LIMIT = int(CONFIG.get("ADDER_BURST_ADD_LIMIT", 6))
         BURST_COOLDOWN_TIME = tuple(CONFIG.get("ADDER_BURST_COOLDOWN_TIME", (30, 50)))
@@ -304,122 +323,31 @@ class EnterpriseMemberAdder:
         async def initialize_account(acc_doc: dict):
             phone = str(acc_doc.get("phone"))
             clean_phone = phone.replace("+", "")
-            self.db.acquire_lock(phone) # 🔒 Lock account instantly so auditor ignores it
-            
-            session_str = acc_doc.get("session_string") or acc_doc.get("session")
-            device = acc_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
-            
-            # 🔥 Use instance variable self.use_lease_manager instead of local variable
-            if self.use_lease_manager:
-                # Dynamic rolling batch mode - acquire proxy via lease manager
-                proxy_dict = await self.proxy_lease_manager.acquire_proxy(clean_phone)
-                if not proxy_dict:
-                    logger.warning(f"⚠️ Lease manager returned no proxy for {phone}")
-                    self.db.release_lock(phone)
-                    return None
-                
-                client = self.session_manager._create_client(
-                    session_str=session_str,
-                    api_id=int(acc_doc.get("api_id", CONFIG["API_ID"])),
-                    api_hash=str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-                    device=device,
-                    proxy=proxy_dict,
-                )
-                
-                try:
-                    await client.connect()
-                    if await client.is_user_authorized():
-                        return {
-                            "phone": phone,
-                            "clean_phone": clean_phone,
-                            "client": client,
-                            "proxy_url": proxy_dict.get("url", "") or f"{proxy_dict.get('addr')}:{proxy_dict.get('port')}",
-                            "burst_count": 0,
-                        }
-                    else:
-                        raise ValueError("Session Unauthorized/Dead")
-                except Exception as e:
-                    logger.debug(f"🔄 Connect failed for {phone}: {e}")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                    # Release proxy on failure
-                    proxy_url = proxy_dict.get("url", "") or f"{proxy_dict.get('addr')}:{proxy_dict.get('port')}"
-                    await self.proxy_lease_manager.release_proxy(
-                        proxy_url, clean_phone,
-                        should_cooldown=False, cooldown_reason="Connection failed"
-                    )
-                    self.db.release_lock(phone)
-                    return None
-            
-            # Legacy mode (fallback if lease manager not available)
-            # 🚀 PATCH: 5 Attempts with Strict Proxy Rotation (No Direct Connection)
-            max_attempts = 5
-            client = None
-            is_connected = False
-            
-            for attempt in range(1, max_attempts + 1):
-                proxy_node = None
-                # Fetch fresh proxy on EVERY attempt
-                if self.proxy_manager and self.proxy_manager.working_count > 0:
-                    raw_proxy = self.proxy_manager.get_proxy()
-                    if raw_proxy:
-                        proxy_node = {
-                            "proxy_type": raw_proxy.get("type", "socks5"),
-                            "addr": raw_proxy.get("host"),
-                            "port": raw_proxy.get("port"),
-                            "username": raw_proxy.get("username"),
-                            "password": raw_proxy.get("password"),
-                            "rdns": True
-                        }
-                
-                # Strict check: Agar proxy nahi mili, toh wait and retry. Direct connection NAHI karni.
-                if not proxy_node:
-                    logger.warning(f"⚠️ No active proxies available for {phone} (Attempt {attempt}). Waiting...")
-                    await asyncio.sleep(random.uniform(2.0, 4.0))
-                    continue
 
-                # Initialize client inside loop to apply new proxy dynamically
-                client = self.session_manager._create_client(
-                    session_str=session_str,
-                    api_id=int(acc_doc.get("api_id", CONFIG["API_ID"])),
-                    api_hash=str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-                    device=device,
-                    proxy=proxy_node,
-                )
+            lease = await self.session_manager.acquire(
+                clean_phone,
+                module="adder",
+                auto_release=False,
+            )
+            if not lease:
+                return None
 
-                try:
+            client = lease.client
+            try:
+                if not client.is_connected():
                     await client.connect()
-                    # Double check if session is still alive after connecting
-                    if await client.is_user_authorized():
-                        is_connected = True
-                        break # ✅ Success! Break the retry loop
-                    else:
-                        raise ValueError("Session Unauthorized/Dead")
-                        
-                except Exception as e:
-                    logger.debug(f"🔄 Proxy/Connect attempt {attempt} failed for {phone}: {e}")
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                    
-                    # Background delay before trying the next proxy
-                    if attempt < max_attempts:
-                        await asyncio.sleep(random.uniform(1.5, 3.5)) 
-            
-            # Agar 5 attempts ke baad bhi fail ho gaya, toh account ko safe mark karke drop karo
-            if not is_connected or not client:
-                self.db.release_lock(phone) # 🔓 Unlock safely
+                if not await client.is_user_authorized():
+                    raise ValueError("Session Unauthorized/Dead")
+            except Exception as e:
+                logger.debug(f"Connect failed for {phone}: {e}")
+                await self.session_manager.release_lease(lease)
                 return None
 
             try:
                 target_entity = None
-                
+
                 try:
                     if is_private:
-                        # Capture updates to resolve private entity accurately
                         updates = await client(ImportChatInviteRequest(resolved_token))
                         if getattr(updates, "chats", None):
                             target_entity = updates.chats[0]
@@ -430,24 +358,22 @@ class EnterpriseMemberAdder:
                 except Exception:
                     pass
 
-                # Fallback for standard entities if not caught via private routing
                 if not target_entity:
                     target_entity = await client.get_entity(resolved_token if is_private else target_entity_identifier)
 
                 target_peer = InputPeerChannel(target_entity.id, target_entity.access_hash)
-                
+
                 return {
                     "phone": phone,
+                    "clean_phone": clean_phone,
                     "client": client,
                     "target_peer": target_peer,
+                    "lease": lease,
+                    "proxy_url": lease.proxy_url or "",
                     "burst_count": 0,
                 }
             except Exception:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                self.db.release_lock(phone) # 🔓 Unlock immediately if entity resolution fails
+                await self.session_manager.release_lease(lease)
                 return None
 
         async def worker_loop():
@@ -538,19 +464,13 @@ class EnterpriseMemberAdder:
                         if self.adder_state:
                             self.adder_state.failures += 1
                             self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
-                        await members_queue.put(member) # 🔥 Repopulate queue on drop
-                        
-                        # 🔥 Release proxy with cooldown if using lease manager
-                        if self.use_lease_manager and worker_account.get("proxy_url"):
-                            await self.proxy_lease_manager.release_proxy(
-                                worker_account["proxy_url"], worker_account["clean_phone"],
-                                should_cooldown=True,
-                                cooldown_reason=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}"
-                            )
-                        
-                        # Cleanup client with robust method
-                        await self._force_cleanup_client(worker_account["client"])
-                        self.db.release_lock(worker_account["phone"]) # 🔓 Unlock dropped account
+                        await members_queue.put(member)
+                        lease = worker_account.get("lease")
+                        if lease:
+                            try:
+                                await self.session_manager.release_lease(lease)
+                            except Exception:
+                                pass
                         worker_account = None
                         continue
 
@@ -566,25 +486,18 @@ class EnterpriseMemberAdder:
                             if self.adder_state:
                                 self.adder_state.failures += 1
                                 self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
-                                
+
                             if hasattr(self.db, "mark_account_failed"):
                                 self.db.mark_account_failed(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
                             else:
                                 self.db.mark_account_revoked(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
-                            
-                            # 🔥 Release proxy with cooldown if using lease manager
-                            if self.use_lease_manager and worker_account.get("proxy_url"):
-                                await self.proxy_lease_manager.release_proxy(
-                                    worker_account["proxy_url"], worker_account["clean_phone"],
-                                    should_cooldown=True,
-                                    cooldown_reason=f"Banned/Deactivated: {err_msg[:40]}"
-                                )
-                            
-                            try:
-                                await worker_account["client"].disconnect()
-                            except Exception:
-                                pass
-                            self.db.release_lock(worker_account["phone"]) # 🔓 Unlock banned account
+
+                            lease = worker_account.get("lease")
+                            if lease:
+                                try:
+                                    await self.session_manager.release_lease(lease)
+                                except Exception:
+                                    pass
                             worker_account = None
                             continue
                             
@@ -593,22 +506,15 @@ class EnterpriseMemberAdder:
                         await asyncio.sleep(sleep_time)
                         
             finally:
-                # Loop khatam hone ke baad final cleanup
                 if worker_account is not None:
-                    # 🔥 Release proxy without cooldown on normal exit
-                    if self.use_lease_manager and worker_account.get("proxy_url"):
-                        await self.proxy_lease_manager.release_proxy(
-                            worker_account["proxy_url"], worker_account["clean_phone"],
-                            should_cooldown=False
-                        )
-                    
                     if self.adder_state:
                         self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
-                    try:
-                        await worker_account["client"].disconnect()
-                    except Exception:
-                        pass
-                    self.db.release_lock(worker_account["phone"]) # 🔓 Unlock safely at the end
+                    lease = worker_account.get("lease")
+                    if lease:
+                        try:
+                            await self.session_manager.release_lease(lease)
+                        except Exception:
+                            pass
 
         # 🔥 FIX: Launch workers concurrently and await execution
         self.active_workers = [asyncio.create_task(worker_loop()) for _ in range(MAX_WORKER_SESSIONS)]

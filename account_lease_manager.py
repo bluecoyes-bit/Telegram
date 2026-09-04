@@ -187,7 +187,7 @@ class AccountLeaseManager:
         Terminal states are never eligible.
         """
         clean_phone = self._key(phone)
-        record = self.db.get_session_by_phone(clean_phone)
+        record = await self.db.get_session_by_phone_async(clean_phone)
         if not record:
             return False
         status = str(record.get("status", "")).lower()
@@ -265,7 +265,7 @@ class AccountLeaseManager:
                     AccountState.TERMINAL,
                 ):
                     # Record session fingerprint
-                    record = self.db.get_session_by_phone(clean_phone)
+                    record = await self.db.get_session_by_phone_async(clean_phone)
                     if record:
                         sess_str = record.get("session_string") or record.get("session", "")
                         api_id = int(record.get("api_id", 0))

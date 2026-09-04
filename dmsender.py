@@ -33,6 +33,29 @@ logger = logging.getLogger("DMSenderEngine")
 ADMIN_ID = os.environ.get("ADMIN_ID")
 
 
+def compute_dm_worker_capacity(
+    num_accounts: int,
+    available_proxies: int,
+    session_capacity: int,
+    configured_limit: int,
+) -> int:
+    """Phase 13 resource-aware worker capacity.
+
+    effective_capacity = min(eligible_accounts, available_network_capacity,
+                             available_session_capacity, configured_limit).
+
+    At least 1 worker is returned when accounts exist so the engine blocks on
+    proxy/session acquisition (WAITING_FOR_PROXY / WAITING_FOR_ACCOUNT) instead
+    of silently dropping valid work. Returns 0 when no accounts are eligible.
+    """
+    if num_accounts <= 0:
+        return 0
+    return max(
+        1,
+        min(num_accounts, available_proxies, session_capacity, configured_limit),
+    )
+
+
 class EnterpriseDMSender:
     def __init__(self, db, proxy_lease_manager=None, session_manager=None, account_lease_manager=None):
         self.db = db
@@ -49,7 +72,85 @@ class EnterpriseDMSender:
             "accounts_down": 0,
             "total_targets": 0
         }
-        
+
+        # P0-CLOSEOUT: DM lifecycle instrumentation
+        self.lifecycle_events: list = []        # structured event log (capped)
+        self.max_lifecycle_events = 500
+        self.worker_states: Dict[int, str] = {}  # worker_id -> current waiting/state label
+        self._dm_stall_timeout = 60.0           # worker must never wait silently longer than this
+
+    def _emit(self, event: str, worker: Optional[int] = None,
+              phone: Optional[str] = None, detail: Optional[str] = None) -> None:
+        """Append a structured DM lifecycle event (capped)."""
+        self.lifecycle_events.append({
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "event": event,
+            "worker": worker,
+            "phone": phone,
+            "detail": detail,
+        })
+        if len(self.lifecycle_events) > self.max_lifecycle_events:
+            self.lifecycle_events = self.lifecycle_events[-self.max_lifecycle_events:]
+        logger.debug(f"DM_EVENT | {event} | worker={worker} | phone={phone} | {detail}")
+
+    def get_lifecycle_events(self) -> list:
+        """Return a copy of the structured event log for tests/status."""
+        return list(self.lifecycle_events)
+
+    async def _generate_live_status(self) -> str:
+        """LIVE STATUS generated for reporters/UI. Previously MISSING — root cause
+        of the 'DM Engine Started' then silent-stop bug."""
+        import time
+        elapsed = max(1, int(time.time() - getattr(self, '_campaign_start_time', time.time())))
+        elapsed_min = elapsed / 60
+        rate = round(self.stats['total_sent'] / elapsed_min, 1) if elapsed_min > 0.1 else 0
+
+        remaining = max(0, self.stats['total_targets'] - self.stats['total_sent'] - self.stats['failed'])
+        if rate > 0:
+            eta_min = round(remaining / rate)
+            eta_str = f"{eta_min // 60}h {(eta_min % 60)}m" if eta_min > 60 else f"{eta_min}m"
+        else:
+            eta_str = "Calculating..."
+
+        active_workers = sum(1 for t in getattr(self, '_active_workers', []) if not t.done())
+
+        proxy_stats = ""
+        if self.proxy_lease_manager:
+            try:
+                stats = self.proxy_lease_manager.get_stats()
+                proxy_stats = (
+                    f"🛡️ **PROXY POOL**\n"
+                    f"   🟢 Available: `{stats['available_proxies']}`\n"
+                    f"   🔒 Leased: `{stats['current_active_leases']}`\n"
+                    f"   🧊 In Cooldown: `{stats['proxies_in_cooldown']}`\n"
+                )
+            except Exception:
+                proxy_stats = "🛡️ **PROXY POOL** (unavailable)\n"
+
+        stalled = sum(1 for s in self.worker_states.values()
+                      if s in ("WAITING_FOR_PROXY", "WAITING_FOR_ACCOUNT", "SESSION_BUSY"))
+        state_line = ""
+        if self.worker_states:
+            grp = {}
+            for s in self.worker_states.values():
+                grp[s] = grp.get(s, 0) + 1
+            state_line = " | ".join(f"{k}={v}" for k, v in grp.items())
+
+        return (
+            f"📊 **LIVE DM CAMPAIGN DASHBOARD**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📨 Sent: `{self.stats['total_sent']}` | Failed: `{self.stats['failed']}`\n"
+            f"🎯 Targets: `{self.stats['total_targets']}`\n"
+            f"   Progress: `{round((self.stats['total_sent'] + self.stats['failed']) / max(1, self.stats['total_targets']) * 100, 1)}%`\n"
+            f"⚡ Rate: `{rate} msgs/min` | Runtime: `{elapsed // 60}m {elapsed % 60}s` | ETA: `{eta_str}`\n"
+            f"👷 Active Workers: `{active_workers}` | Stalled: `{stalled}`\n"
+            f"👥 Accounts: used=`{self.stats['accounts_used']}` down=`{self.stats['accounts_down']}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{proxy_stats}"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔄 Worker States: `{state_line or 'idle'}`\n"
+            f"🔄 *Auto-updates every 8s • `/dm_status` for manual check*"
+        )
         # PATCH FIX: Remove hardcoded DB names and directly use initialized DB layer references
         try:
             # self.db.scraped_members pehle hi database.py me single DB 1 par mapped hai
@@ -133,7 +234,10 @@ class EnterpriseDMSender:
         """
         self.is_running = True
         self.reset_stats()
-        
+        import time as _t
+        self._campaign_start_time = _t.time()
+        self._emit("campaign_start", detail=f"targets={len(target_list) if limit > 0 else len(target_list)}")
+
         # Clean safe text representation
         final_text = str(message_text).strip() if message_text else ""
         if final_text.lower() == "skip" or not final_text:
@@ -150,214 +254,10 @@ class EnterpriseDMSender:
             self.is_running = False
             return
 
-        # 🔥 NEW: Use dynamic rolling batch based on available proxies
-        use_lease_manager = self.proxy_lease_manager is not None and self.proxy_lease_manager._is_running
-        
-        if use_lease_manager:
-            # Dynamic rolling batch mode - let lease manager dictate concurrency
-            return await self._dynamic_rolling_worker(
-                target_list, final_text, media_path, limit, ui_callback, all_accounts
-            )
-        
-        # Legacy mode (fallback if lease manager not available)
-        account_pool = []
-        for acc in all_accounts:
-            phone = acc.get("phone")
-            if phone:
-                self.db.acquire_lock(phone)
-            
-            session_str = acc.get("session_string") or acc.get("session")
-            api_id = int(acc.get("api_id", CONFIG["API_ID"]))
-            api_hash = str(acc.get("api_hash", CONFIG["API_HASH"]))
-            device = acc.get("device_metadata") or random.choice(DEVICE_PROFILES)
-            
-            client = self.session_manager._create_client(
-                session_str=session_str,
-                api_id=api_id,
-                api_hash=api_hash,
-                device=device,
-            )
-            account_pool.append({
-                "client": client,
-                "phone": phone,
-                "consecutive_failures": 0,
-                "is_connected": False
-            })
 
-        self.stats["accounts_used"] = len(account_pool)
-        targets = target_list[:limit] if limit > 0 else target_list
-        self.stats["total_targets"] = len(targets)
-        
-        await ui_callback(f"🚀 **DM Engine Started!**\nConnecting `{len(account_pool)}` distributed worker accounts...")
-
-        pool_idx = 0
-        target_idx = 0
-        last_ui_update = datetime.now()
-
-        try:
-            while target_idx < len(targets) and self.is_running and len(account_pool) > 0:
-                target_data = targets[target_idx]
-                worker = account_pool[pool_idx]
-                client = worker["client"]
-                phone = worker["phone"]
-
-                if not worker["is_connected"]:
-                    try:
-                        await client.connect()
-                        is_auth = await client.is_user_authorized()
-                        if not is_auth:
-                            raise AuthKeyUnregisteredError(request=None)
-                        worker["is_connected"] = True
-                    except Exception as e:
-                        error_str = str(e).lower()
-                        if any(x in error_str for x in ["unregistered", "deactivated", "banned", "revoked"]):
-                            if hasattr(self.db, "mark_account_revoked"):
-                                self.db.mark_account_revoked(phone, f"Auth Failed: {error_str[:40]}")
-                            else:
-                                self.db.update_session_status(phone, "revoked")
-                            self.stats["accounts_down"] += 1
-                        try: await client.disconnect() 
-                        except: pass
-                        account_pool.pop(pool_idx)
-                        if not account_pool: break
-                        pool_idx = pool_idx % len(account_pool)
-                        continue
-
-                entity = None
-                try:
-                    if isinstance(target_data, dict):
-                        user_id = target_data.get("user_id")
-                        access_hash = target_data.get("access_hash")
-                        username = target_data.get("username")
-                        
-                        if username and str(username).strip() and str(username).lower() != "none":
-                            u_str = str(username).strip()
-                            entity = u_str if u_str.startswith("@") else f"@{u_str}"
-                        elif user_id and access_hash and str(access_hash) != "0":
-                            try:
-                                entity = InputPeerUser(int(user_id), int(access_hash))
-                            except Exception:
-                                entity = None
-                                
-                        if not entity and user_id:
-                            entity = int(user_id)
-                    else:
-                        target_str = str(target_data).strip()
-                        if target_str.isdigit():
-                            entity = int(target_str)
-                        else:
-                            entity = target_str if target_str.startswith("@") else f"@{target_str}"
-
-                    if not entity:
-                        raise ValueError("Could not construct entity tokens.")
-
-                    if media_path and os.path.exists(str(media_path)):
-                        is_voice = str(media_path).lower().endswith(('.ogg', '.mp3', '.m4a'))
-                        attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
-                        await client.send_file(
-                            entity, 
-                            str(media_path), 
-                            caption=final_text,
-                            voice_note=is_voice,
-                            attributes=attributes
-                        )
-                    else:
-                        await client.send_message(entity, final_text)
-
-                    self.stats["total_sent"] += 1
-                    worker["consecutive_failures"] = 0
-                    target_idx += 1
-                    
-                    dynamic_delay = max(0.5, 45.0 / max(1, len(account_pool)))
-                    await asyncio.sleep(random.uniform(dynamic_delay, dynamic_delay + 1.0))
-
-                except (PeerIdInvalidError, ValueError) as e:
-                    try:
-                        if isinstance(target_data, dict) and target_data.get("user_id"):
-                            resolved_peer = await client.get_input_entity(int(target_data.get("user_id")))
-                            if media_path and os.path.exists(str(media_path)):
-                                await client.send_file(resolved_peer, str(media_path), caption=final_text)
-                            else:
-                                await client.send_message(resolved_peer, final_text)
-                            self.stats["total_sent"] += 1
-                            worker["consecutive_failures"] = 0
-                            target_idx += 1
-                            continue
-                    except Exception:
-                        pass
-                    
-                    self.stats["failed"] += 1
-                    target_idx += 1
-
-                except (UserIsBlockedError, UserPrivacyRestrictedError):
-                    self.stats["failed"] += 1
-                    target_idx += 1
-
-                except FloodWaitError as e:
-                    worker["consecutive_failures"] += 1
-                    if e.seconds > 300 or worker["consecutive_failures"] >= 2:
-                        await client.disconnect()
-                        account_pool.pop(pool_idx)
-                        if not account_pool: break
-                        pool_idx = pool_idx % len(account_pool)
-                        continue
-                    else:
-                        await asyncio.sleep(e.seconds + 1)
-
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if any(x in error_str for x in ["banned", "deactivated", "unregistered", "revoked", "mute"]):
-                        if hasattr(self.db, "mark_account_revoked"):
-                            self.db.mark_account_revoked(phone, f"Runtime Drop: {error_str[:40]}")
-                        else:
-                            self.db.update_session_status(phone, "revoked")
-                            
-                        self.stats["accounts_down"] += 1
-                        account_pool.pop(pool_idx)
-                        if not account_pool: break
-                        pool_idx = pool_idx % len(account_pool)
-                        continue
-                    else:
-                        worker["consecutive_failures"] += 1
-                        if worker["consecutive_failures"] >= 2:
-                            try: await client.disconnect() 
-                            except: pass
-                            account_pool.pop(pool_idx)
-                            if not account_pool: break
-                            pool_idx = pool_idx % len(account_pool)
-                            continue
-                            
-                if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                    await ui_callback(self._generate_live_status())
-                    last_ui_update = datetime.now()
-
-                if len(account_pool) > 0:
-                    pool_idx = (pool_idx + 1) % len(account_pool)
-
-        except asyncio.CancelledError:
-            pass
-        finally:
-            # Cleanup allocated locks and connections
-            for acc in all_accounts:
-                try:
-                    phone_num = acc.get("phone")
-                    if phone_num:
-                        self.db.release_lock(phone_num)
-                except:
-                    pass
-
-            for worker in account_pool:
-                if worker.get("is_connected"):
-                    try: await worker["client"].disconnect()
-                    except: pass
-
-            self.is_running = False
-            final_msg = "✅ **DM CAMPAIGN COMPLETED** ✅\n" if target_idx >= len(targets) else "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
-            await ui_callback(final_msg + self._generate_live_status())
-
-            if media_path and os.path.exists(str(media_path)):
-                try: os.remove(str(media_path))
-                except: pass
+        return await self._dynamic_rolling_worker(
+            target_list, final_text, media_path, limit, ui_callback, all_accounts
+        )
 
     def _generate_detailed_status(self) -> str:
         """
@@ -451,6 +351,7 @@ class EnterpriseDMSender:
         targets = target_list[:limit] if limit > 0 else target_list
         self.stats["total_targets"] = len(targets)
         self.stats["accounts_used"] = len(all_accounts)
+        self._emit("target_queue_created", detail=f"targets={len(targets)}")
         
         await ui_callback(f"🚀 **DM Engine Started (Dynamic Rolling Batch)!**\n"
                          f"Targets: `{len(targets)}`, Accounts: `{len(all_accounts)}`\n"
@@ -462,6 +363,7 @@ class EnterpriseDMSender:
 
         last_ui_update = datetime.now()
         active_workers = []
+        self._active_workers = active_workers
         # 🔥 FIX: Round-robin account index prevents the stuck DM engine
         # Old code: account_queue drained to empty → workers re-queued targets with no accounts
         # New code: _account_rr_idx cycles through all_accounts indefinitely
@@ -473,20 +375,23 @@ class EnterpriseDMSender:
             while self.is_running and active_workers:
                 if any(not w.done() for w in active_workers):
                     try:
-                        await ui_callback(self._generate_live_status())
+                        await ui_callback(await self._generate_live_status())
                     except Exception:
                         pass
                 await asyncio.sleep(8)
     
         reporter_task = asyncio.create_task(_reporter())
-        
+        _campaign_start_loop = asyncio.get_event_loop().time()
+
         
         async def dm_worker(worker_id: int):
+            nonlocal last_ui_update
             current_client = None
             current_phone = None
             current_proxy_url = None
             consecutive_failures = 0
             stall_count = 0
+            self.worker_states[worker_id] = "STARTED"
             
             try:
                 while self.is_running and not target_queue.empty():
@@ -501,6 +406,8 @@ class EnterpriseDMSender:
                         nonlocal _account_rr_idx
                         if not all_accounts:
                             await target_queue.put(target_data)
+                            self.worker_states[worker_id] = "WAITING_FOR_ACCOUNT"
+                            self._emit("WAITING_FOR_ACCOUNT", worker=worker_id, detail="no accounts available")
                             break
                         account_doc = all_accounts[_account_rr_idx % len(all_accounts)]
                         _account_rr_idx = (_account_rr_idx + 1) % len(all_accounts)
@@ -510,39 +417,66 @@ class EnterpriseDMSender:
                         continue
 
                     clean_phone = str(phone).replace("+", "")
+                    self._emit("account_selected", worker=worker_id, phone=clean_phone)
+                    self.worker_states[worker_id] = "ACCOUNT_SELECTED"
 
                     # Step 3: Acquire session + proxy via SessionManager
                     # This ensures ONE SESSION → ONE CLIENT (prevents AuthKeyDuplicatedError)
                     # and handles proxy leasing automatically.
                     try:
-                        async with self.session_manager.acquire(
-                            clean_phone,
-                            module=f"dm_worker_{worker_id}",
-                            auto_release=True,
-                            timeout=10.0,
-                        ) as lease:
+                        self._emit("session_acquire_start", worker=worker_id, phone=clean_phone)
+                        self._emit("proxy_acquire_start", worker=worker_id, phone=clean_phone)
+                        self.worker_states[worker_id] = "WAITING_FOR_ACCOUNT"
+                        try:
+                            session_ctx = self.session_manager.acquire(
+                                clean_phone,
+                                module=f"dm_worker_{worker_id}",
+                                auto_release=True,
+                                timeout=10.0,
+                            )
+                        except AttributeError:
+                            # session_manager not wired (defensive)
+                            raise
+                        async with session_ctx as lease:
                             if not lease:
+                                self._emit("SESSION_BUSY", worker=worker_id, phone=clean_phone, detail="no lease")
+                                self.worker_states[worker_id] = "SESSION_BUSY"
                                 stall_count += 1
                                 if stall_count >= 3:
                                     self.stats["failed"] += 1
+                                    self._emit("send_failure", worker=worker_id, phone=clean_phone,
+                                               detail="no available sessions after 3 stalls")
                                     logger.warning(
                                         f"DM_WORKER_STALL | worker={worker_id} | "
                                         f"stall_count={stall_count} | dropping target (no available sessions)"
                                     )
                                     break
                                 # Session unavailable — re-queue target and retry
+                                self._emit("session_acquired", worker=worker_id, phone=clean_phone,
+                                           detail="lease=None (retry)")
                                 await target_queue.put(target_data)
                                 await asyncio.sleep(1.0)
                                 continue
                             stall_count = 0
+                            self._emit("session_acquired", worker=worker_id, phone=clean_phone)
+                            self._emit("proxy_acquired", worker=worker_id, phone=clean_phone,
+                                       detail=getattr(lease, "proxy_url", None))
+                            self._emit("client_created", worker=worker_id, phone=clean_phone)
+                            self.worker_states[worker_id] = "SESSION_ACQUIRED"
 
                             client = lease.client
 
                             # Step 4: Connect
+                            self._emit("connect_start", worker=worker_id, phone=clean_phone)
+                            self.worker_states[worker_id] = "CONNECTING"
                             if not client.is_connected():
                                 await client.connect()
+                            self._emit("connected", worker=worker_id, phone=clean_phone)
                             if not await client.is_user_authorized():
+                                self._emit("authorized", worker=worker_id, phone=clean_phone, detail="NOT authorized")
+                                self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
                                 raise AuthKeyUnregisteredError(request=None)
+                            self._emit("authorized", worker=worker_id, phone=clean_phone)
 
                             # Step 5: Execute DM action
                             entity = None
@@ -571,7 +505,9 @@ class EnterpriseDMSender:
 
                             if not entity:
                                 raise ValueError("Could not construct entity tokens.")
+                            self._emit("target_resolved", worker=worker_id, phone=clean_phone, detail=str(entity)[:40])
 
+                            self._emit("send_start", worker=worker_id, phone=clean_phone)
                             if media_path and os.path.exists(str(media_path)):
                                 is_voice = str(media_path).lower().endswith(('.ogg', '.mp3', '.m4a'))
                                 attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
@@ -586,48 +522,63 @@ class EnterpriseDMSender:
                             consecutive_failures = 0
                             current_client = client
                             current_phone = clean_phone
+                            self._emit("send_success", worker=worker_id, phone=clean_phone)
+                            self.worker_states[worker_id] = "SEND_SUCCESS"
 
                             # Human-like delay
                             dynamic_delay = max(0.5, 45.0 / max(1, self.proxy_lease_manager.get_available_count()))
                             await asyncio.sleep(random.uniform(dynamic_delay, dynamic_delay + 1.0))
 
                     except SessionAlreadyOwnedError:
-                        # Another worker is using this account — re-queue and try next
-                        await target_queue.put(target_data)
+                        stall_count += 1
+                        self._emit("SESSION_BUSY", worker=worker_id, phone=clean_phone, detail="SessionAlreadyOwnedError")
+                        self.worker_states[worker_id] = "SESSION_BUSY"
+                        if stall_count >= 3:
+                            self.stats["failed"] += 1
+                            self._emit("send_failure", worker=worker_id, phone=clean_phone,
+                                       detail="session busy after 3 retries")
+                            break
                         continue
                     except (PeerIdInvalidError, ValueError):
                         self.stats["failed"] += 1
                         consecutive_failures = 0
+                        self._emit("send_failure", worker=worker_id, phone=clean_phone, detail="PeerIdInvalid/ValueError")
 
                         if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(self._generate_live_status())
+                            await ui_callback(await self._generate_live_status())
                             last_ui_update = datetime.now()
 
                     except (UserIsBlockedError, UserPrivacyRestrictedError):
                         self.stats["failed"] += 1
                         consecutive_failures = 0
+                        self._emit("send_failure", worker=worker_id, phone=clean_phone, detail="Blocked/Privacy")
 
                         if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(self._generate_live_status())
+                            await ui_callback(await self._generate_live_status())
                             last_ui_update = datetime.now()
 
                     except (FloodWaitError, PeerFloodError) as e:
                         consecutive_failures += 1
                         self.stats["accounts_down"] += 1
+                        self.worker_states[worker_id] = "WAITING_FOR_PROXY"
+                        self._emit("send_failure", worker=worker_id, phone=clean_phone,
+                                   detail=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}")
                         # Cooldown the proxy if we have it
                         if lease.proxy_url and self.proxy_lease_manager:
                             await self.proxy_lease_manager.release_proxy(
-                                lease.proxy_url, clean_phone,
+                                proxy_url=lease.proxy_url, phone=clean_phone,
                                 should_cooldown=True,
                                 cooldown_reason=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}",
                             )
 
                         if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(self._generate_live_status())
+                            await ui_callback(await self._generate_live_status())
                             last_ui_update = datetime.now()
 
                     except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError):
                         self.stats["accounts_down"] += 1
+                        self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
+                        self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=clean_phone, detail="revoked/deactivated")
                         # Quarantine the session so no other worker uses it
                         if self.session_manager:
                             await self.session_manager.mark_quarantined(
@@ -639,11 +590,13 @@ class EnterpriseDMSender:
                             self.db.mark_account_revoked(clean_phone, "Session revoked/unauthorized")
 
                         if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(self._generate_live_status())
+                            await ui_callback(await self._generate_live_status())
                             last_ui_update = datetime.now()
 
                     except AuthKeyDuplicatedError:
                         self.stats["accounts_down"] += 1
+                        self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
+                        self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=clean_phone, detail="auth_key_duplicated")
                         if self.session_manager:
                             await self.session_manager.mark_quarantined(
                                 clean_phone,
@@ -652,13 +605,15 @@ class EnterpriseDMSender:
                             )
 
                         if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(self._generate_live_status())
+                            await ui_callback(await self._generate_live_status())
                             last_ui_update = datetime.now()
                             
                     except Exception as e:
                         error_str = str(e).lower()
                         if any(x in error_str for x in ["banned", "deactivated", "revoked", "unauthorized"]):
                             self.stats["accounts_down"] += 1
+                            self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
+                            self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=clean_phone, detail=error_str[:40])
                             if self.session_manager:
                                 await self.session_manager.mark_quarantined(
                                     clean_phone,
@@ -669,22 +624,63 @@ class EnterpriseDMSender:
                                 self.db.mark_account_revoked(clean_phone, f"Runtime drop: {error_str[:40]}")
                         else:
                             consecutive_failures += 1
+                            self._emit("send_failure", worker=worker_id, phone=clean_phone, detail=error_str[:40])
                             if consecutive_failures >= 2:
                                 pass  # Allow retry on transient errors
 
                         if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(self._generate_live_status())
+                            await ui_callback(await self._generate_live_status())
                             last_ui_update = datetime.now()
                 
             except asyncio.CancelledError:
                 pass
             finally:
-                # Final cleanup
-                if current_client:
-                    await self._force_cleanup_client(current_client)
+                self.worker_states.pop(worker_id, None)
+                if current_phone:
+                    self._emit("session_release", worker=worker_id, phone=current_phone)
+                    self._emit("proxy_release", worker=worker_id, phone=current_phone)
+                    self._emit("account_release", worker=worker_id, phone=current_phone)
+
         
-        # Launch workers concurrently
-        num_workers = min(len(all_accounts), 20)  # Cap at 20 concurrent workers
+        # 🔥 RESOURCE-AWARE SCHEDULING (Phase 13)
+        # Do NOT create N workers merely because N is the configured maximum.
+        # effective_capacity = min(eligible_accounts, available_network_capacity,
+        #                          available_session_capacity, configured_limit).
+        # At least 1 worker is kept when accounts exist so the engine blocks on
+        # proxy/session acquisition (WAITING_FOR_PROXY / WAITING_FOR_ACCOUNT)
+        # instead of silently dropping valid work.
+        _configured_limit = int(CONFIG.get("DM_MAX_WORKERS", 20))
+        _available_proxies = 0
+        try:
+            _available_proxies = self.proxy_lease_manager.get_available_count()
+        except Exception:
+            _available_proxies = 0
+        _session_capacity = int(CONFIG.get("DM_MAX_WORKERS", 20))
+        try:
+            if self.session_manager is not None:
+                _sm_stats = await self.session_manager.get_stats()
+                _session_capacity = max(
+                    1,
+                    self.session_manager._max_active_clients
+                    - int(_sm_stats.get("active_clients", 0)),
+                )
+        except Exception:
+            _session_capacity = int(CONFIG.get("DM_MAX_WORKERS", 20))
+
+        if all_accounts:
+            _eff = compute_dm_worker_capacity(
+                num_accounts=len(all_accounts),
+                available_proxies=_available_proxies,
+                session_capacity=_session_capacity,
+                configured_limit=_configured_limit,
+            )
+            num_workers = _eff
+        else:
+            num_workers = 0
+        self._emit("worker_started",
+                   detail=f"effective_capacity={num_workers} "
+                          f"(accounts={len(all_accounts)}, proxies={_available_proxies}, "
+                          f"session_cap={_session_capacity}, limit={_configured_limit})")
         for i in range(num_workers):
             task = asyncio.create_task(dm_worker(i))
             active_workers.append(task)
@@ -703,7 +699,7 @@ class EnterpriseDMSender:
         
         self.is_running = False
         final_msg = "✅ **DM CAMPAIGN COMPLETED** ✅\n" if target_queue.empty() else "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
-        await ui_callback(final_msg + self._generate_live_status())
+        await ui_callback(final_msg + await self._generate_live_status())
         
         if media_path and os.path.exists(str(media_path)):
             try:
