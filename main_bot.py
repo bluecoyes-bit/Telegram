@@ -620,9 +620,9 @@ async def managed_client(record: dict, use_pool: bool = True):
             yield client
         finally:
             # Release proxy lease if one was acquired
-            if lease.proxy_url and session_manager.proxy_lease_manager:
+            if lease and lease.proxy_url and session_manager.proxy_lease_manager:
                 await session_manager.proxy_lease_manager.release_proxy(
-                    phone, lease.proxy_url
+                    lease.proxy_url, phone
                 )
             # Release session lease
             await session_manager._release_lease(

@@ -486,6 +486,7 @@ class EnterpriseDMSender:
             current_phone = None
             current_proxy_url = None
             consecutive_failures = 0
+            stall_count = 0
             
             try:
                 while self.is_running and not target_queue.empty():
@@ -521,10 +522,19 @@ class EnterpriseDMSender:
                             timeout=10.0,
                         ) as lease:
                             if not lease:
-                                # Proxy unavailable or session terminal — re-queue target
+                                stall_count += 1
+                                if stall_count >= 3:
+                                    self.stats["failed"] += 1
+                                    logger.warning(
+                                        f"DM_WORKER_STALL | worker={worker_id} | "
+                                        f"stall_count={stall_count} | dropping target (no available sessions)"
+                                    )
+                                    break
+                                # Session unavailable — re-queue target and retry
                                 await target_queue.put(target_data)
                                 await asyncio.sleep(1.0)
                                 continue
+                            stall_count = 0
 
                             client = lease.client
 
@@ -607,7 +617,7 @@ class EnterpriseDMSender:
                         # Cooldown the proxy if we have it
                         if lease.proxy_url and self.proxy_lease_manager:
                             await self.proxy_lease_manager.release_proxy(
-                                clean_phone, lease.proxy_url,
+                                lease.proxy_url, clean_phone,
                                 should_cooldown=True,
                                 cooldown_reason=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}",
                             )
@@ -623,7 +633,7 @@ class EnterpriseDMSender:
                             await self.session_manager.mark_quarantined(
                                 clean_phone,
                                 reason="Session revoked/unauthorized in dm_worker",
-                                category=ErrorCategory.AUTH_ERROR,
+                                category=ErrorCategory.UNAUTHORIZED,
                             )
                         if hasattr(self.db, "mark_account_revoked"):
                             self.db.mark_account_revoked(clean_phone, "Session revoked/unauthorized")
@@ -653,7 +663,7 @@ class EnterpriseDMSender:
                                 await self.session_manager.mark_quarantined(
                                     clean_phone,
                                     reason=f"Runtime drop: {error_str[:40]}",
-                                    category=ErrorCategory.AUTH_ERROR,
+                                    category=ErrorCategory.UNAUTHORIZED,
                                 )
                             if hasattr(self.db, "mark_account_revoked"):
                                 self.db.mark_account_revoked(clean_phone, f"Runtime drop: {error_str[:40]}")

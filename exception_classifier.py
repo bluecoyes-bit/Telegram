@@ -9,6 +9,7 @@ and specifically isolates AuthKeyDuplicatedError from ordinary failures.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
 from dataclasses import dataclass
@@ -372,6 +373,3 @@ def classify_connection_error(exc: BaseException) -> Tuple[bool, str]:
         return True, "authorized"
     return False, "unknown"
 
-
-# Ensure asyncio.TimeoutError is available
-import asyncio  # noqa: E402  (imported late to avoid circular import risk)
