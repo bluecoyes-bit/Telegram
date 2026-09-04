@@ -132,22 +132,23 @@ class SuiteDatabase:
     """
     
     def __init__(self):
-        # ── In-memory lock registry (thread-safe, TTL-expiring) ──
+        # ── In-memory lock registry (TTL-expiring, async-safe) ──
         self._active_task_locks: Dict[str, float] = {}  # phone -> expiry timestamp
+        self._async_lock = asyncio.Lock()
         self._lock_cleanup_interval: float = 60.0
         self._last_lock_cleanup: float = time.time()
-        
-        # ── In-memory caches ──
+
+        # ── In-memory caches (bounded, TTL) ──
         self._stats_cache = TTLCache(maxsize=32, ttl=CONFIG.get("STATUS_BAR_CACHE_TTL", 30))
         self._session_cache = TTLCache(maxsize=512, ttl=60)  # Active sessions cache
-        
+
         # ── Connection failure backoff ──
         self._connection_retry_count: int = 0
         self._max_retries: int = 3
-        
+
         # ── Initialize MongoDB connection ──
         self._init_mongo()
-        
+
         logger.info(
             f"✅ SuiteDatabase initialized. "
             f"Pool: {MONGO_CFG.max_pool_size} connections, "
@@ -215,14 +216,19 @@ class SuiteDatabase:
             self._init_mongo()  # Retry
     
     def _ensure_connection(self) -> None:
-        """Verify connection is alive before critical operations."""
+        """Verify connection is alive before critical operations (sync)."""
         try:
             self.client.admin.command('ping')
             self._connection_retry_count = 0
         except (AutoReconnect, ConnectionFailure, NetworkTimeout) as e:
             logger.warning(f"⚠️ MongoDB reconnecting: {e}")
             self._init_mongo()
-    
+
+    async def ensure_connection_async(self) -> None:
+        """Async-safe connection check. Offloaded to executor to avoid blocking loop."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._ensure_connection)
+
     @property
     def active_task_locks(self) -> Dict[str, float]:
         """Backward-compatible property wrapper for lock dict."""
@@ -268,6 +274,22 @@ class SuiteDatabase:
                 ("status", ASCENDING),
                 ("last_updated", DESCENDING),
             ], name="idx_status_updated")
+
+            # Index for account_sequence_index (batch sequencing)
+            self._create_index_if_missing(self.src_accounts, [
+                ("account_sequence_index", ASCENDING),
+            ], name="idx_account_sequence")
+
+            # Index for session fingerprint lookups
+            self._create_index_if_missing(self.src_accounts, [
+                ("session_fingerprint", ASCENDING),
+            ], name="idx_session_fingerprint")
+
+            # Index for status + last_checked_time (auditor scheduling)
+            self._create_index_if_missing(self.src_accounts, [
+                ("status", ASCENDING),
+                ("last_checked_time", ASCENDING),
+            ], name="idx_status_last_checked")
             
             # OTP logs: phone + timestamp
             self._create_index_if_missing(self.otp_logs, [
@@ -343,12 +365,26 @@ class SuiteDatabase:
         clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
         self._active_task_locks[clean_phone] = time.time() + LOCK_TTL_SECONDS
         self._cleanup_expired_locks()
-    
+
+    async def acquire_lock_async(self, phone: str) -> bool:
+        """Async-safe lock acquisition with proper locking."""
+        clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
+        async with self._async_lock:
+            self._active_task_locks[clean_phone] = time.time() + LOCK_TTL_SECONDS
+            self._cleanup_expired_locks()
+            return True
+
     def release_lock(self, phone: str) -> None:
         """Release global lock for account."""
         clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
         self._active_task_locks.pop(clean_phone, None)
-    
+
+    async def release_lock_async(self, phone: str) -> None:
+        """Async-safe lock release."""
+        clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
+        async with self._async_lock:
+            self._active_task_locks.pop(clean_phone, None)
+
     def is_locked(self, phone: str) -> bool:
         """Check if account is locked (auto-handles expired locks)."""
         clean_phone = str(phone).strip().replace(" ", "").replace("+", "")
@@ -359,12 +395,72 @@ class SuiteDatabase:
             self._active_task_locks.pop(clean_phone, None)
             return False
         return True
-    
+
     def release_all_locks(self) -> None:
         """Brute-force purge all locks. Emergency use only."""
         count = len(self._active_task_locks)
         self._active_task_locks.clear()
         logger.info(f"🔓 Released {count} locks (emergency purge).")
+
+    # ────────────────────────────────────────────────────────────
+    # STATUS TRANSITION API (single authoritative path)
+    # ────────────────────────────────────────────────────────────
+
+    def set_account_state(
+        self,
+        phone: str,
+        new_state: str,
+        *,
+        reason: str = "",
+        source: str = "",
+        module: str = "",
+        worker: str = "",
+    ) -> bool:
+        """
+        Authoritative status transition API.
+
+        All modules MUST use this method instead of directly writing status
+        strings.  Logs previous_state -> new_state for audit trail.
+        """
+        clean_phone = self._normalize(phone)
+        if not clean_phone:
+            return False
+
+        new_state_val = new_state.value if hasattr(new_state, 'value') else str(new_state).lower()
+
+        try:
+            # Atomically fetch current status, then update
+            existing = self.src_accounts.find_one(
+                {"phone": clean_phone},
+                {"status": 1, "revocation_reason": 1}
+            )
+            prev_state = existing.get("status", "unknown") if existing else "unknown"
+
+            update_data = {
+                "status": new_state_val,
+                "last_updated": datetime.now(timezone.utc),
+                "last_checked_time": datetime.now(timezone.utc),
+            }
+            if reason:
+                update_data["revocation_reason"] = str(reason)[:500]
+
+            self.src_accounts.update_one(
+                {"phone": clean_phone},
+                {"$set": update_data},
+                upsert=False,
+            )
+
+            self._session_cache.invalidate(f"session:{clean_phone}")
+            self._stats_cache.invalidate("status_bar")
+
+            logger.info(
+                f"STATUS_TRANSITION | phone={clean_phone} | {prev_state} -> {new_state_val} | "
+                f"source={source} | module={module} | worker={worker} | reason={reason[:80]}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"set_account_state failed for {clean_phone}: {e}")
+            return False
     
     # ────────────────────────────────────────────────────────────
     # 4. CORE ACCOUNT CRUD (optimized bulk paths)
@@ -415,13 +511,12 @@ class SuiteDatabase:
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return None
-        
-        # Check cache first
+
         cache_key = f"session:{clean_phone}"
         cached = self._session_cache.get(cache_key)
         if cached is not None:
             return cached
-        
+
         try:
             doc = self.src_accounts.find_one(
                 {"phone": clean_phone},
@@ -432,15 +527,19 @@ class SuiteDatabase:
             return doc
         except Exception:
             return None
+
+    async def get_session_by_phone_async(self, phone: str) -> Optional[Dict[str, Any]]:
+        """Async-safe session fetch (offloads blocking I/O to executor)."""
+        return await self._run_sync(self.get_session_by_phone, phone)
     
     
     async def get_all_suite_sessions(self) -> List[Dict[str, Any]]:
         """Return ALL documents from source_accounts (async thread-safe)."""
-        self._ensure_connection()
-        
+        await self.ensure_connection_async()
+
         def fetch():
             return list(self.src_accounts.find({}, {k: 1 for k in MAX_PROJECTION_FIELDS}))
-            
+
         try:
             return await self._run_sync(fetch)
         except Exception:
@@ -820,6 +919,10 @@ class SuiteDatabase:
             return None
         except Exception:
             return None
+
+    async def get_latest_otp_async(self, phone: str) -> Optional[Dict[str, Any]]:
+        """Async-safe OTP retrieval."""
+        return await self._run_sync(self.get_latest_otp, phone)
     
     # ────────────────────────────────────────────────────────────
     # 9. SCRAPED MEMBERS MANAGEMENT (bulk operations)
@@ -1201,17 +1304,20 @@ class SuiteDatabase:
         Fetch a page of unprocessed scraped members using $skip/$limit.
         This avoids loading the entire result set into memory.
         """
-        self._ensure_connection()
         pipeline = [
             {"$lookup": {"from": MONGODB_SETTINGS["PROCESSED_MEMBERS_COLLECTION"],
                          "localField": "user_id", "foreignField": "user_identifier", "as": "processed_match"}},
             {"$match": {"processed_match": {"$size": 0}}},
             {"$project": {"processed_match": 0}},
             {"$skip": skip},
-            {"$limit": limit}
+            {"$limit": limit},
         ]
-        # Use aggregation with allowDiskUse to handle large datasets
-        return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))
+
+        def run_agg():
+            self._ensure_connection()
+            return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))
+
+        return await self._run_sync(run_agg)
 
     def close(self):
         """Close MongoDB connection gracefully on shutdown."""

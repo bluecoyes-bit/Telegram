@@ -11,6 +11,9 @@ import re
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass, field, asdict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger("SuiteConfig")
 
@@ -127,12 +130,12 @@ class MongoConfig:
 # Hardcoded fallbacks are provided ONLY for local dev; set env vars in production.
 CONFIG: Dict[str, Any] = {
     # ── Core API Credentials (NO HARDCODED DEFAULTS - Must set env vars) ──
-    "API_ID": _env_int("API_ID", 38223087, min_val=1),
-    "API_HASH": _env_str("API_HASH", "f3448783d23ace67fecdef3f392d2e47"),
-    "BOT_TOKEN": _env_str("BOT_TOKEN", "8932487693:AAEhRuyQc0V8G0g4cLtAXzrfHLneiB5gVVk"),
+    "API_ID": _env_int("API_ID", 0, min_val=0),
+    "API_HASH": _env_str("API_HASH", ""),
+    "BOT_TOKEN": _env_str("BOT_TOKEN", ""),
 
-    # ── Admin (NO HARDCODED DEFAULT) ──
-    "ADMIN_ID": _env_str("ADMIN_ID", "5599766250"),
+    # ── Admin ──
+    "ADMIN_ID": _env_str("ADMIN_ID", ""),
 
     # ── Worker Identity ──
     "WORKER_NODE_ID": _env_str("WORKER_NODE_ID", "worker_01"),
@@ -200,12 +203,14 @@ CONFIG: Dict[str, Any] = {
 }
 
 # ── Runtime validation of critical values ──
-if not CONFIG["BOT_TOKEN"] or len(CONFIG["BOT_TOKEN"]) < 10:
-    logger.warning("⚠️ BOT_TOKEN is missing or too short. Bot will not start without a valid token.")
-if CONFIG["API_ID"] == 12345 or not CONFIG["API_HASH"]:
-    logger.warning("⚠️ API_ID / API_HASH appear to be default/empty. Set env API_ID and API_HASH.")
+if not CONFIG["API_ID"]:
+    logger.warning("⚠️ CRITICAL: API_ID is not set. Set environment variable API_ID.")
+if not CONFIG["API_HASH"]:
+    logger.warning("⚠️ CRITICAL: API_HASH is not set. Set environment variable API_HASH.")
+if not CONFIG["BOT_TOKEN"]:
+    logger.warning("⚠️ CRITICAL: BOT_TOKEN is not set. Bot will not start without a valid token.")
 if not CONFIG["ADMIN_ID"]:
-    logger.warning("⚠️ ADMIN_ID is not set. All users will be treated as admin (insecure for production).")
+    logger.warning("⚠️ CRITICAL: ADMIN_ID is not set. All users will be treated as admin (insecure for production).")
 
 
 # ────────────────────────────────────────────────────────────────
@@ -223,15 +228,13 @@ MONGO_CFG = MongoConfig()
 # ────────────────────────────────────────────────────────────────
 
 # Build Mongo URI from env with secure fallback (NO HARDCODED CREDENTIALS)
-_MONGO_USER = _env_str("MONGO_USER", "sandeeptrip90_db_user")
-_MONGO_PASS = _env_str("MONGO_PASS", "1234568h")
-_MONGO_HOST = _env_str("MONGO_HOST", "cluster0.vcdatid.mongodb.net")
+# Check both standard names and .env-compatible names
+_MONGO_USER = os.environ.get("MONGO_USER") or os.environ.get("_MONGO_USER", "")
+_MONGO_PASS = os.environ.get("MONGO_PASS") or os.environ.get("_MONGO_PASS", "")
+_MONGO_HOST = os.environ.get("MONGO_HOST") or os.environ.get("_MONGO_HOST", "")
 _MONGO_OPTIONS = _env_str("MONGO_OPTIONS", "retryWrites=true&w=majority&appName=Cluster0")
 
-_MONGO_URI_BUILT = _env_str(
-    "MONGO_URI", 
-    "mongodb+srv://sandeeptrip90_db_user:dcLrMpsxWQn4pCuh@cluster0.vcdatid.mongodb.net/?appName=Cluster0"
-)
+_MONGO_URI_BUILT = os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URI", "")
 
 MONGODB_SETTINGS = {
     "MONGO_URI": _MONGO_URI_BUILT,

@@ -16,8 +16,7 @@ from collections import OrderedDict
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import UserAlreadyParticipantError
+from telethon.errors import UserAlreadyParticipantError, AuthKeyDuplicatedError
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.contacts import SearchRequest, GetContactsRequest
 from telethon.tl.functions.messages import GetFullChatRequest, ImportChatInviteRequest, CheckChatInviteRequest
@@ -37,6 +36,7 @@ import io, base64
 from telethon.utils import get_peer_id
 
 from config import CONFIG
+from exception_classifier import ErrorCategory, classify_exception
 
 # =====================================================================
 # 📦 PYDANTIC MODELS
@@ -79,6 +79,8 @@ class DeleteMessageRequest(BaseModel):
 logger = logging.getLogger("WebConsoleModule")
 console_router = APIRouter()
 _db = None
+_session_manager = None
+
 
 def init_console_db(db_instance):
     """Initializes the database reference link for backend APIs."""
@@ -86,6 +88,12 @@ def init_console_db(db_instance):
     _db = db_instance
     logger.info("🌐 Pure Backend Data Transfer API Hub Engine initialized.")
     return console_router
+
+
+def init_console_session_manager(session_manager_instance):
+    """Initializes the SessionManager reference for centralized client creation."""
+    global _session_manager
+    _session_manager = session_manager_instance
 
 def setup_console_routes(db_instance):
     """Alias placeholder to satisfy pre-existing system loop bindings."""
@@ -153,17 +161,12 @@ async def get_buffered_active_client(phone: str, record: dict) -> TelegramClient
         proxy_dict = record.get("proxy")
         
         logger.info(f"🔌 Spawning collision-safe persistent MTProto node link for +{clean_phone}")
-        client = TelegramClient(
-            StringSession(session_token),
+        client = _session_manager._create_client(
+            session_str=session_token,
             api_id=int(record.get("api_id", CONFIG["API_ID"])),
             api_hash=str(record.get("api_hash", CONFIG["API_HASH"])),
-            device_model=device["device_model"],
-            system_version=device["system_version"],
-            app_version=device["app_version"],
+            device=device,
             proxy=proxy_dict if (proxy_dict and isinstance(proxy_dict, dict)) else None,
-            entity_cache_limit=50,           # Limit entity cache size
-            sequential_updates=False,        # Disable sequential updates
-            receive_updates=False,           # No need for live updates
         )
         await client.connect()
         

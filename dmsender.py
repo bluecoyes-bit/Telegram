@@ -14,16 +14,18 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeAudio, InputPeerUser
 from telethon.errors import (
     PeerIdInvalidError, FloodWaitError, UserBannedInChannelError,
     UserDeactivatedError, AuthKeyUnregisteredError, SessionRevokedError,
-    UserIsBlockedError, UserPrivacyRestrictedError, PeerFloodError
+    UserIsBlockedError, UserPrivacyRestrictedError, PeerFloodError,
+    AuthKeyDuplicatedError,
 )
 from pymongo import MongoClient
 
 from config import CONFIG, DEVICE_PROFILES
+from exception_classifier import ErrorCategory, classify_exception
+from session_manager import SessionAlreadyOwnedError
 
 logger = logging.getLogger("DMSenderEngine")
 
@@ -32,9 +34,11 @@ ADMIN_ID = os.environ.get("ADMIN_ID")
 
 
 class EnterpriseDMSender:
-    def __init__(self, db, proxy_lease_manager=None):
+    def __init__(self, db, proxy_lease_manager=None, session_manager=None, account_lease_manager=None):
         self.db = db
         self.proxy_lease_manager = proxy_lease_manager  # 🔥 NEW: Lease manager integration
+        self.session_manager = session_manager
+        self.account_lease_manager = account_lease_manager
         self.is_running = False
         self.active_task = None
         self.wizard_state: Dict[int, Dict[str, Any]] = {}
@@ -167,11 +171,11 @@ class EnterpriseDMSender:
             api_hash = str(acc.get("api_hash", CONFIG["API_HASH"]))
             device = acc.get("device_metadata") or random.choice(DEVICE_PROFILES)
             
-            client = TelegramClient(
-                StringSession(session_str), api_id, api_hash,
-                device_model=device.get("device_model", "PC 64bit"),
-                system_version=device.get("system_version", "Windows 11"),
-                app_version=device.get("app_version", "4.8.4")
+            client = self.session_manager._create_client(
+                session_str=session_str,
+                api_id=api_id,
+                api_hash=api_hash,
+                device=device,
             )
             account_pool.append({
                 "client": client,
@@ -451,17 +455,18 @@ class EnterpriseDMSender:
         await ui_callback(f"🚀 **DM Engine Started (Dynamic Rolling Batch)!**\n"
                          f"Targets: `{len(targets)}`, Accounts: `{len(all_accounts)}`\n"
                          f"Concurrency dictated by available proxies.")
-        
+
         target_queue = asyncio.Queue()
         for t in targets:
             await target_queue.put(t)
-        
-        account_queue = asyncio.Queue()
-        for acc in all_accounts:
-            await account_queue.put(acc)
-        
+
         last_ui_update = datetime.now()
         active_workers = []
+        # 🔥 FIX: Round-robin account index prevents the stuck DM engine
+        # Old code: account_queue drained to empty → workers re-queued targets with no accounts
+        # New code: _account_rr_idx cycles through all_accounts indefinitely
+        _account_rr_lock = asyncio.Lock()
+        _account_rr_idx = 0
     
         # 🔥 NEW: Independent Reporter Task for Live UI Updates
         async def _reporter():
@@ -489,150 +494,174 @@ class EnterpriseDMSender:
                         target_data = target_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
-                    
-                    # Step 2: Get next account
-                    try:
-                        account_doc = account_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        # No more accounts available, re-queue target
-                        await target_queue.put(target_data)
-                        break
-                    
+
+                    # Step 2: Get next account via round-robin (cycles indefinitely)
+                    async with _account_rr_lock:
+                        nonlocal _account_rr_idx
+                        if not all_accounts:
+                            await target_queue.put(target_data)
+                            break
+                        account_doc = all_accounts[_account_rr_idx % len(all_accounts)]
+                        _account_rr_idx = (_account_rr_idx + 1) % len(all_accounts)
+
                     phone = account_doc.get("phone")
                     if not phone:
                         continue
-                    
+
                     clean_phone = str(phone).replace("+", "")
-                    
-                    # Step 3: Acquire proxy lease (blocks efficiently if none available)
-                    proxy_dict = await self.proxy_lease_manager.acquire_proxy(clean_phone)
-                    if not proxy_dict:
-                        # Lease manager stopped, re-queue and exit
-                        await target_queue.put(target_data)
-                        break
-                    
-                    current_proxy_url = proxy_dict.get("url", "") or f"{proxy_dict.get('addr')}:{proxy_dict.get('port')}"
-                    
-                    # Step 4: Connect with proxy
-                    session_str = account_doc.get("session_string") or account_doc.get("session")
-                    api_id = int(account_doc.get("api_id", CONFIG["API_ID"]))
-                    api_hash = str(account_doc.get("api_hash", CONFIG["API_HASH"]))
-                    device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
-                    
-                    client = TelegramClient(
-                        StringSession(session_str), api_id, api_hash,
-                        device_model=device.get("device_model", "PC 64bit"),
-                        system_version=device.get("system_version", "Windows 11"),
-                        app_version=device.get("app_version", "4.8.4"),
-                        proxy=proxy_dict
-                    )
-                    
-                    current_client = client
-                    current_phone = clean_phone
-                    
+
+                    # Step 3: Acquire session + proxy via SessionManager
+                    # This ensures ONE SESSION → ONE CLIENT (prevents AuthKeyDuplicatedError)
+                    # and handles proxy leasing automatically.
                     try:
-                        await client.connect()
-                        if not await client.is_user_authorized():
-                            raise AuthKeyUnregisteredError(request=None)
-                        
-                        # Step 5: Execute DM action
-                        entity = None
-                        if isinstance(target_data, dict):
-                            user_id = target_data.get("user_id")
-                            access_hash = target_data.get("access_hash")
-                            username = target_data.get("username")
-                            
-                            if username and str(username).strip() and str(username).lower() != "none":
-                                u_str = str(username).strip()
-                                entity = u_str if u_str.startswith("@") else f"@{u_str}"
-                            elif user_id and access_hash and str(access_hash) != "0":
-                                try:
-                                    entity = InputPeerUser(int(user_id), int(access_hash))
-                                except Exception:
-                                    entity = None
-                                    
-                            if not entity and user_id:
-                                entity = int(user_id)
-                        else:
-                            target_str = str(target_data).strip()
-                            if target_str.isdigit():
-                                entity = int(target_str)
+                        async with self.session_manager.acquire(
+                            clean_phone,
+                            module=f"dm_worker_{worker_id}",
+                            auto_release=True,
+                            timeout=10.0,
+                        ) as lease:
+                            if not lease:
+                                # Proxy unavailable or session terminal — re-queue target
+                                await target_queue.put(target_data)
+                                await asyncio.sleep(1.0)
+                                continue
+
+                            client = lease.client
+
+                            # Step 4: Connect
+                            if not client.is_connected():
+                                await client.connect()
+                            if not await client.is_user_authorized():
+                                raise AuthKeyUnregisteredError(request=None)
+
+                            # Step 5: Execute DM action
+                            entity = None
+                            if isinstance(target_data, dict):
+                                user_id = target_data.get("user_id")
+                                access_hash = target_data.get("access_hash")
+                                username = target_data.get("username")
+                                
+                                if username and str(username).strip() and str(username).lower() != "none":
+                                    u_str = str(username).strip()
+                                    entity = u_str if u_str.startswith("@") else f"@{u_str}"
+                                elif user_id and access_hash and str(access_hash) != "0":
+                                    try:
+                                        entity = InputPeerUser(int(user_id), int(access_hash))
+                                    except Exception:
+                                        entity = None
+                                        
+                                if not entity and user_id:
+                                    entity = int(user_id)
                             else:
-                                entity = target_str if target_str.startswith("@") else f"@{target_str}"
-                        
-                        if not entity:
-                            raise ValueError("Could not construct entity tokens.")
-                        
-                        should_cooldown = False
-                        cooldown_reason = ""
-                        
-                        if media_path and os.path.exists(str(media_path)):
-                            is_voice = str(media_path).lower().endswith(('.ogg', '.mp3', '.m4a'))
-                            attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
-                            await client.send_file(
-                                entity, str(media_path), caption=final_text,
-                                voice_note=is_voice, attributes=attributes
-                            )
-                        else:
-                            await client.send_message(entity, final_text)
-                        
-                        self.stats["total_sent"] += 1
-                        consecutive_failures = 0
-                        
-                        # Human-like delay
-                        dynamic_delay = max(0.5, 45.0 / max(1, self.proxy_lease_manager.get_available_count()))
-                        await asyncio.sleep(random.uniform(dynamic_delay, dynamic_delay + 1.0))
-                        
-                    except (PeerIdInvalidError, ValueError) as e:
+                                target_str = str(target_data).strip()
+                                if target_str.isdigit():
+                                    entity = int(target_str)
+                                else:
+                                    entity = target_str if target_str.startswith("@") else f"@{target_str}"
+
+                            if not entity:
+                                raise ValueError("Could not construct entity tokens.")
+
+                            if media_path and os.path.exists(str(media_path)):
+                                is_voice = str(media_path).lower().endswith(('.ogg', '.mp3', '.m4a'))
+                                attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
+                                await client.send_file(
+                                    entity, str(media_path), caption=final_text,
+                                    voice_note=is_voice, attributes=attributes
+                                )
+                            else:
+                                await client.send_message(entity, final_text)
+
+                            self.stats["total_sent"] += 1
+                            consecutive_failures = 0
+                            current_client = client
+                            current_phone = clean_phone
+
+                            # Human-like delay
+                            dynamic_delay = max(0.5, 45.0 / max(1, self.proxy_lease_manager.get_available_count()))
+                            await asyncio.sleep(random.uniform(dynamic_delay, dynamic_delay + 1.0))
+
+                    except SessionAlreadyOwnedError:
+                        # Another worker is using this account — re-queue and try next
+                        await target_queue.put(target_data)
+                        continue
+                    except (PeerIdInvalidError, ValueError):
                         self.stats["failed"] += 1
                         consecutive_failures = 0
-                        
+
+                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
+                            await ui_callback(self._generate_live_status())
+                            last_ui_update = datetime.now()
+
                     except (UserIsBlockedError, UserPrivacyRestrictedError):
                         self.stats["failed"] += 1
                         consecutive_failures = 0
-                        
+
+                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
+                            await ui_callback(self._generate_live_status())
+                            last_ui_update = datetime.now()
+
                     except (FloodWaitError, PeerFloodError) as e:
                         consecutive_failures += 1
-                        should_cooldown = True
-                        cooldown_reason = f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}"
                         self.stats["accounts_down"] += 1
-                        
+                        # Cooldown the proxy if we have it
+                        if lease.proxy_url and self.proxy_lease_manager:
+                            await self.proxy_lease_manager.release_proxy(
+                                clean_phone, lease.proxy_url,
+                                should_cooldown=True,
+                                cooldown_reason=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}",
+                            )
+
+                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
+                            await ui_callback(self._generate_live_status())
+                            last_ui_update = datetime.now()
+
                     except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError):
-                        should_cooldown = True
-                        cooldown_reason = "Session revoked/unauthorized"
                         self.stats["accounts_down"] += 1
+                        # Quarantine the session so no other worker uses it
+                        if self.session_manager:
+                            await self.session_manager.mark_quarantined(
+                                clean_phone,
+                                reason="Session revoked/unauthorized in dm_worker",
+                                category=ErrorCategory.AUTH_ERROR,
+                            )
                         if hasattr(self.db, "mark_account_revoked"):
-                            self.db.mark_account_revoked(current_phone, cooldown_reason)
+                            self.db.mark_account_revoked(clean_phone, "Session revoked/unauthorized")
+
+                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
+                            await ui_callback(self._generate_live_status())
+                            last_ui_update = datetime.now()
+
+                    except AuthKeyDuplicatedError:
+                        self.stats["accounts_down"] += 1
+                        if self.session_manager:
+                            await self.session_manager.mark_quarantined(
+                                clean_phone,
+                                reason="AuthKeyDuplicatedError in dm_worker",
+                                category=ErrorCategory.AUTH_KEY_DUPLICATED,
+                            )
+
+                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
+                            await ui_callback(self._generate_live_status())
+                            last_ui_update = datetime.now()
                             
                     except Exception as e:
                         error_str = str(e).lower()
                         if any(x in error_str for x in ["banned", "deactivated", "revoked", "unauthorized"]):
-                            should_cooldown = True
-                            cooldown_reason = f"Runtime drop: {error_str[:40]}"
                             self.stats["accounts_down"] += 1
+                            if self.session_manager:
+                                await self.session_manager.mark_quarantined(
+                                    clean_phone,
+                                    reason=f"Runtime drop: {error_str[:40]}",
+                                    category=ErrorCategory.AUTH_ERROR,
+                                )
                             if hasattr(self.db, "mark_account_revoked"):
-                                self.db.mark_account_revoked(current_phone, cooldown_reason)
+                                self.db.mark_account_revoked(clean_phone, f"Runtime drop: {error_str[:40]}")
                         else:
                             consecutive_failures += 1
                             if consecutive_failures >= 2:
-                                should_cooldown = True
-                                cooldown_reason = f"Multiple failures: {consecutive_failures}"
-                    
-                    finally:
-                        # Step 6: Release proxy (with cooldown if needed)
-                        if current_proxy_url:
-                            await self.proxy_lease_manager.release_proxy(
-                                current_proxy_url, current_phone,
-                                should_cooldown=should_cooldown,
-                                cooldown_reason=cooldown_reason
-                            )
-                        
-                        # Cleanup client with robust method
-                        if current_client:
-                            await self._force_cleanup_client(current_client)
-                            current_client = None
-                        
-                        # UI update
+                                pass  # Allow retry on transient errors
+
                         if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
                             await ui_callback(self._generate_live_status())
                             last_ui_update = datetime.now()
@@ -673,8 +702,10 @@ class EnterpriseDMSender:
                 pass
 
 
-def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None, proxy_lease_manager=None):
-    sender_engine = EnterpriseDMSender(db, proxy_lease_manager)
+def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
+                           proxy_lease_manager=None, session_manager=None,
+                           account_lease_manager=None):
+    sender_engine = EnterpriseDMSender(db, proxy_lease_manager, session_manager, account_lease_manager)
 
     def is_admin(sender_id):
         if ADMIN_ID:

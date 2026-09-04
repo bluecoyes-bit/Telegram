@@ -16,7 +16,6 @@ from weakref import WeakSet  # 🔥 NEW: Weak references for task tracking
 
 from datetime import datetime, timezone
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, DeleteHistoryRequest
 from telethon.errors import (
@@ -88,6 +87,7 @@ except (ModuleNotFoundError, ImportError):
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
+from exception_classifier import ErrorCategory, classify_exception
 from scraper import MemberScraper
 
 logger = logging.getLogger("SuiteVoiceChat")
@@ -107,13 +107,16 @@ def get_channel_peer_id(entity) -> int:
 class CloudVoiceChatEngine:
     """Manages secure WebRTC streaming loops, session cross-logins, and official service OTP wipes."""
     
-    def __init__(self, db: SuiteDatabase, proxy_manager=None, proxy_lease_manager=None):
+    def __init__(self, db: SuiteDatabase, proxy_manager=None, proxy_lease_manager=None,
+                 session_manager=None, account_lease_manager=None):
 
         self.db = db
         self.proxy_manager = proxy_manager
         self.proxy_lease_manager = proxy_lease_manager
-        self.scraper_helper = MemberScraper(db)
-        self.scraper_helper = MemberScraper(db)
+        self.session_manager = session_manager
+        self.account_lease_manager = account_lease_manager
+        self.scraper_helper = MemberScraper(db, session_manager=session_manager, account_lease_manager=account_lease_manager)
+        self.scraper_helper = MemberScraper(db, session_manager=session_manager, account_lease_manager=account_lease_manager)
         self.is_running = False
         # 🔥 FIX 1: WeakSet instead of List for task tracking - avoids memory leaks
         self._active_tasks: WeakSet = WeakSet()
@@ -204,15 +207,13 @@ class CloudVoiceChatEngine:
                 # Remove stale cache entry
                 del self._client_cache[cache_key]
             
-                client = TelegramClient(
-                StringSession(session_str), api_id, api_hash,
-                device_model=device.get("device_model", "PC 64bit"),
-                system_version=device.get("system_version", "Windows 11"),
-                app_version=device.get("app_version", "4.8.4"),
-                entity_cache_limit=50,
-                sequential_updates=False,
-                receive_updates=False,
-            )
+                client = self.session_manager._create_client(
+                    session_str=session_str,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    device=device,
+                    proxy=acc.get("proxy"),
+                )
             
             try:
                 await client.connect()
@@ -388,15 +389,11 @@ class CloudVoiceChatEngine:
                     error_logs.append({"phone": phone, "error": "Manual OTP only: DB1 missing session_string. Use /login <phone>."})
                     return
 
-                server_client = TelegramClient(
-                    StringSession(session_str),
-                    api_id,
-                    api_hash,
-                    device_model=device_metadata.get("device_model", "PC 64bit") if isinstance(device_metadata, dict) else "PC 64bit",
-                    system_version=device_metadata.get("system_version", "Windows 11") if isinstance(device_metadata, dict) else "Windows 11",
-                    app_version=device_metadata.get("app_version", "4.8.4") if isinstance(device_metadata, dict) else "4.8.4",
-                    # 🔥 CRITICAL: Entity cache limit to prevent RAM blowup
-                    entity_cache_limit=30,
+                server_client = self.session_manager._create_client(
+                    session_str=session_str,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    device=device_metadata if isinstance(device_metadata, dict) else random.choice(list(DEVICE_PROFILES)),
                 )
 
                 try:
@@ -508,16 +505,11 @@ class CloudVoiceChatEngine:
         device = acc_doc.get("device_metadata") or acc_doc.get("device_fingerprint") or random.choice(DEVICE_PROFILES)
         
         # 🔥 CRITICAL OPTIMIZATION: entity_cache_limit + receive_updates=False
-        client = TelegramClient(
-            StringSession(acc_doc.get("session_string")), 
-            int(acc_doc.get("api_id", CONFIG["API_ID"])), 
-            str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-            device_model=device.get("device_model", "PC 64bit"),
-            system_version=device.get("system_version", "Windows 11"),
-            app_version=device.get("app_version", "4.8.4"),
-            entity_cache_limit=30,
-            sequential_updates=False,
-            receive_updates=False,
+        client = self.session_manager._create_client(
+            session_str=acc_doc.get("session_string", ""),
+            api_id=int(acc_doc.get("api_id", CONFIG["API_ID"])),
+            api_hash=str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
+            device=device,
         )
         
         # 🔥 NEW: Disable entity saving - we don't need persistent entity cache

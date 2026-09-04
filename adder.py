@@ -14,7 +14,6 @@ from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import InputPeerChannel, InputPeerUser
@@ -26,6 +25,7 @@ from telethon.errors import (
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
 from proxy_manager import ProxyManager
+from exception_classifier import ErrorCategory, classify_exception
 from scraper import MemberScraper
 
 logger = logging.getLogger("SuiteAdder")
@@ -179,15 +179,17 @@ async def status_updater_loop(client, chat_id, message_id, state: AdderState):
 class EnterpriseMemberAdder:
     """Manages multi-account smart rotation loops, safe bursts padding, and anti-ban tracking matrix."""
     
-    def __init__(self, db: SuiteDatabase, proxy_manager: Optional[ProxyManager] = None, 
-                 proxy_lease_manager=None):
+    def __init__(self, db: SuiteDatabase, proxy_manager: Optional[ProxyManager] = None,
+                 proxy_lease_manager=None, session_manager=None, account_lease_manager=None):
         self.db = db
         self.proxy_manager = proxy_manager
         self.proxy_lease_manager = proxy_lease_manager  # 🔥 NEW: Lease manager integration
-        self.use_lease_manager = (proxy_lease_manager is not None and 
-                                  hasattr(proxy_lease_manager, '_is_running') and 
+        self.session_manager = session_manager
+        self.account_lease_manager = account_lease_manager
+        self.use_lease_manager = (proxy_lease_manager is not None and
+                                  hasattr(proxy_lease_manager, '_is_running') and
                                   proxy_lease_manager._is_running)
-        self.scraper_helper = MemberScraper(db)
+        self.scraper_helper = MemberScraper(db, session_manager=session_manager, account_lease_manager=account_lease_manager)
         self.is_running = False
         self.adder_state: Optional[AdderState] = None # Added for state tracking
         
@@ -316,14 +318,12 @@ class EnterpriseMemberAdder:
                     self.db.release_lock(phone)
                     return None
                 
-                client = TelegramClient(
-                    StringSession(session_str),
-                    int(acc_doc.get("api_id", CONFIG["API_ID"])),
-                    str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-                    device_model=device.get("device_model", "PC 64bit"),
-                    system_version=device.get("system_version", "Windows 11"),
-                    app_version=device.get("app_version", "4.8.4"),
-                    proxy=proxy_dict
+                client = self.session_manager._create_client(
+                    session_str=session_str,
+                    api_id=int(acc_doc.get("api_id", CONFIG["API_ID"])),
+                    api_hash=str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
+                    device=device,
+                    proxy=proxy_dict,
                 )
                 
                 try:
@@ -381,14 +381,12 @@ class EnterpriseMemberAdder:
                     continue
 
                 # Initialize client inside loop to apply new proxy dynamically
-                client = TelegramClient(
-                    StringSession(session_str),
-                    int(acc_doc.get("api_id", CONFIG["API_ID"])),
-                    str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
-                    device_model=device.get("device_model", "PC 64bit"),
-                    system_version=device.get("system_version", "Windows 11"),
-                    app_version=device.get("app_version", "4.8.4"),
-                    proxy=proxy_node # 🔥 Strict proxy integration
+                client = self.session_manager._create_client(
+                    session_str=session_str,
+                    api_id=int(acc_doc.get("api_id", CONFIG["API_ID"])),
+                    api_hash=str(acc_doc.get("api_hash", CONFIG["API_HASH"])),
+                    device=device,
+                    proxy=proxy_node,
                 )
 
                 try:

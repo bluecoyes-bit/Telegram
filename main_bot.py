@@ -8,6 +8,7 @@ import os, sys, asyncio, logging, random, time, pathlib, ssl, re, gc, socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable, Set
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -28,11 +29,58 @@ import httpx
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
 from proxy_manager import ProxyManager, ProxyLeaseManager
+from session_manager import SessionManager, SessionAlreadyOwnedError
+from account_lease_manager import AccountLeaseManager, AccountState, TERMINAL_DB_STATUSES, ELIGIBLE_DB_STATUSES
+from exception_classifier import (
+    ErrorCategory,
+    classify_exception,
+    classify_connection_error,
+)
+
+from collections import OrderedDict
+
+
+# ── 🔥 TTL-BOUNDED CACHE for session authorization checks ──
+class TTLCache(OrderedDict):
+    """Simple TTL-bounded OrderedDict replacing unbounded dict."""
+    def __init__(self, maxsize: int = 512, ttl: float = 300.0):
+        super().__init__()
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._timestamps: Dict[str, float] = {}
+
+    def __contains__(self, key):
+        if key not in self._timestamps:
+            return False
+        if time.time() - self._timestamps[key] > self.ttl:
+            self._timestamps.pop(key, None)
+            super().pop(key, None)
+            return False
+        return super().__contains__(key)
+
+    def __getitem__(self, key):
+        if key not in self._timestamps:
+            raise KeyError(key)
+        if time.time() - self._timestamps[key] > self.ttl:
+            self._timestamps.pop(key, None)
+            super().pop(key, None)
+            raise KeyError(key)
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value):
+        if len(self) >= self.maxsize:
+            oldest = next(iter(self))
+            super().pop(oldest, None)
+            self._timestamps.pop(oldest, None)
+        super().__setitem__(key, value)
+        self._timestamps[key] = time.time()
 from scraper import MemberScraper
 from videochat import CloudVoiceChatEngine
 from adder import EnterpriseMemberAdder, AdderState, status_updater_loop
 from dmsender import setup_dmsender_handlers
-from web_console import console_router, init_console_db, setup_console_routes
+from web_console import console_router, init_console_db, setup_console_routes, init_console_session_manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MasterSuiteBot")
@@ -66,6 +114,10 @@ class AccountStatus(str, Enum):
     BANNED = "banned"
     RESTRICTED = "restricted"
     REVOKED = "revoked"
+    AUTH_KEY_DUPLICATED = "auth_key_duplicated"
+    PROXY_ERROR = "proxy_error"
+    NETWORK_ERROR = "network_error"
+    QUARANTINED = "quarantined"
 
 
 class ExplorerFilter(str, Enum):
@@ -337,9 +389,18 @@ db = SuiteDatabase()
 proxy_manager = ProxyManager()
 proxy_lease_manager = ProxyLeaseManager(proxy_manager)
 
-scraper_engine = MemberScraper(db, proxy_manager, proxy_lease_manager)
-voice_engine = CloudVoiceChatEngine(db, proxy_manager, proxy_lease_manager)
-adder_engine = EnterpriseMemberAdder(db, proxy_manager, proxy_lease_manager)
+# 🔥 Centralized managers — the SINGLE source of truth for sessions & accounts
+session_manager = SessionManager(
+    db=db,
+    proxy_manager=proxy_manager,
+    proxy_lease_manager=proxy_lease_manager,
+    max_active_clients=CONFIG.get("MAX_POOL_ABSOLUTE", 200),
+)
+account_lease_manager = AccountLeaseManager(db=db)
+
+scraper_engine = MemberScraper(db, proxy_manager, proxy_lease_manager, session_manager, account_lease_manager)
+voice_engine = CloudVoiceChatEngine(db, proxy_manager, proxy_lease_manager, session_manager, account_lease_manager)
+adder_engine = EnterpriseMemberAdder(db, proxy_manager, proxy_lease_manager, session_manager, account_lease_manager)
 
 # ──────────────────────────────────────────────
 # TELETHON BOT PROXY (Solves Event Loop Mismatch in Uvicorn)
@@ -377,7 +438,9 @@ class BotProxy:
         return getattr(self._bot, name)
 
 bot = BotProxy()
-dm_engine = setup_dmsender_handlers(bot, db, proxy_manager, proxy_lease_manager)
+dm_engine = setup_dmsender_handlers(bot, db, proxy_manager, proxy_lease_manager,
+                                    session_manager=session_manager,
+                                    account_lease_manager=account_lease_manager)
 
 # ──────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -478,30 +541,30 @@ async def build_premium_status_bar(all_sessions: list) -> str:
     return await GLOBAL.get_status_bar(all_sessions)
 
 # ──────────────────────────────────────────────
-# CLIENT FACTORY (with device fingerprint preservation)
+# CLIENT FACTORY (delegates to SessionManager)
 # ──────────────────────────────────────────────
+# All TelegramClient creation now routes through SessionManager.acquire().
+# The functions below are thin backward-compatible wrappers.
 
-async def create_authenticated_client(record: dict) -> Optional[TelegramClient]:
-    """Create a Telethon client from a DB record, preserving device fingerprint."""
+def create_authenticated_client(record: dict) -> TelegramClient:
+    """
+    DEPRECATED — all client creation now goes through SessionManager.
+    This function is kept for API compatibility but delegates to SessionManager's
+    internal factory.  Do NOT create TelegramClient here.
+    """
     session_str = safe_session_str(record)
     if not session_str:
         return None
     device = get_device_profile(record)
     api_id = int(record.get("api_id", CONFIG["API_ID"]))
     api_hash = str(record.get("api_hash", CONFIG["API_HASH"]))
-    client = TelegramClient(
-        StringSession(session_str),
+    return session_manager._create_client(
+        session_str=session_str,
         api_id=api_id,
         api_hash=api_hash,
-        device_model=device["device_model"],
-        system_version=device["system_version"],
-        app_version=device["app_version"],
-        timeout=10,
-        entity_cache_limit=100,
-        sequential_updates=False,
-        receive_updates=False,
+        device=device,
+        proxy=record.get("proxy"),
     )
-    return client
 
 
 async def connect_client(client: TelegramClient, retries: int = 1) -> bool:
@@ -512,9 +575,7 @@ async def connect_client(client: TelegramClient, retries: int = 1) -> bool:
                 await asyncio.wait_for(client.connect(), timeout=10.0)
             return True
         except Exception as e:
-            # Catching broad Exception ensures Telethon-specific connection errors 
-            # are caught, allowing proper cleanup to prevent "Future exception" warnings.
-            try: 
+            try:
                 await client.disconnect()
             except Exception:
                 pass
@@ -528,76 +589,51 @@ async def connect_client(client: TelegramClient, retries: int = 1) -> bool:
 async def managed_client(record: dict, use_pool: bool = True):
     """
     Context manager for Telethon client lifecycle.
-    Uses pool for reuse, ensures cleanup.
+
+    DELEGATES to SessionManager.acquire() — the single source of truth
+    for all TelegramClient creation.  No direct TelegramClient(...) calls
+    are made here or anywhere else.
     """
     phone = normalize_phone(str(record.get("phone", "")))
-    pool = GLOBAL.client_pool if use_pool else None
-    entry = await GLOBAL.pool_get(phone) if pool else None
-    proxy_dict = record.get("proxy")
+    module = "managed_client" if use_pool else "managed_client_nopool"
 
-    if entry and entry.client:
-        client = entry.client
-        # Quick liveness check
+    # 🔥 For non-pool (auditor/cleanup) clients: skip proxy leasing entirely.
+    # The auditor connects directly — leasing proxies for audits wastes
+    # the entire pool and causes timeouts for actual workers.
+    _no_proxy = (lambda p: None) if not use_pool else None
+
+    async with session_manager.acquire(
+        phone,
+        module=module,
+        proxy_provider=_no_proxy,
+        auto_release=False,
+    ) as lease:
+        if not lease:
+            raise ConnectionError(f"No eligible session for {phone}")
+
+        client = lease.client
         try:
             if not client.is_connected():
                 if not await connect_client(client):
-                    raise ConnectionError("Reconnect failed")
+                    raise ConnectionError("Connect failed")
+
             yield client
-            entry.last_used = time.time()
-            return
-        except Exception:
-            # Pooled client is dead, evict and fall through
-            await GLOBAL.pool_remove(phone)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-    # Create fresh client
-    device = get_device_profile(record)
-    api_id = int(record.get("api_id", CONFIG["API_ID"]))
-    api_hash = str(record.get("api_hash", CONFIG["API_HASH"]))
-    session_str = safe_session_str(record)
-
-    client = TelegramClient(
-        StringSession(session_str),
-        api_id=api_id,
-        api_hash=api_hash,
-        device_model=device["device_model"],
-        system_version=device["system_version"],
-        app_version=device["app_version"],
-        timeout=5.0,
-        connection_retries=1,
-        proxy=proxy_dict,
-        entity_cache_limit=100,          # limit entity cache to reduce RAM
-        sequential_updates=False,        # avoid processing updates sequentially
-        receive_updates=False,           # we don't need live updates in most operations
-    )
-
-    try:
-        if not await connect_client(client):
-            raise ConnectionError("Initial connect failed")
-        if not await client.is_user_authorized():
-            raise SessionRevokedError(request=None)
-
-        # Add to pool
-        if pool:
-            await GLOBAL.pool_set(phone, ClientPoolEntry(
-                client=client,
-                phone=phone,
-                created_at=time.time(),
-                last_used=time.time(),
-                device_fingerprint=f"{device['device_model']}|{device['system_version']}",
-            ))
-
-        yield client
-    finally:
-        # If NOT using pool, disconnect immediately
-        if not pool:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+        finally:
+            # Release proxy lease if one was acquired
+            if lease.proxy_url and session_manager.proxy_lease_manager:
+                await session_manager.proxy_lease_manager.release_proxy(
+                    phone, lease.proxy_url
+                )
+            # Release session lease
+            await session_manager._release_lease(
+                session_manager._session_key(phone), lease.owner
+            )
+            # Disconnect if not pooling
+            if not use_pool:
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=3.0)
+                except Exception:
+                    pass
 
 
 # ──────────────────────────────────────────────
@@ -675,16 +711,11 @@ async def shared_login_process(phone: str) -> dict:
                 "rdns": True
             }
 
-        client = TelegramClient(
-            string_session,
+        client = session_manager._create_client(
+            session_str=string_session.save(),
             api_id=CONFIG["API_ID"],
             api_hash=CONFIG["API_HASH"],
-            device_model=device.get("device_model", "PC 64bit"),
-            system_version=device.get("system_version", "Windows 11"),
-            app_version=device.get("app_version", "4.8.4"),
-            timeout=10.0,           
-            connection_retries=1,   
-            request_retries=1,      
+            device=device,
             proxy=proxy_node,
         )
 
@@ -1430,13 +1461,12 @@ async def verify_handler(event) -> None:
             await event.reply("❌ **Error:** No active login state found for this phone. Run `/login` first.")
             return
         device = get_device_profile(record)
-        client = TelegramClient(
-            StringSession(safe_session_str(record)),
+        client = session_manager._create_client(
+            session_str=safe_session_str(record),
             api_id=CONFIG["API_ID"],
             api_hash=CONFIG["API_HASH"],
-            device_model=device["device_model"],
-            system_version=device["system_version"],
-            app_version=device["app_version"],
+            device=device,
+            proxy=record.get("proxy"),
         )
         await client.connect()
         phone_code_hash = record.get("phone_code_hash")
@@ -1500,13 +1530,12 @@ async def verify_2fa_handler(event) -> None:
             await event.reply("❌ **Error:** No session data located for this index.")
             return
         device = get_device_profile(record)
-        client = TelegramClient(
-            StringSession(safe_session_str(record)),
+        client = session_manager._create_client(
+            session_str=safe_session_str(record),
             api_id=CONFIG["API_ID"],
             api_hash=CONFIG["API_HASH"],
-            device_model=device["device_model"],
-            system_version=device["system_version"],
-            app_version=device["app_version"],
+            device=device,
+            proxy=record.get("proxy"),
         )
         await client.connect()
 
@@ -2396,8 +2425,8 @@ async def continuous_session_auditor() -> None:
 # ──────────────────────────────────────────────
 
 # ── 🔥 SESSION AUTHORIZATION CACHE (lightweight optimization) ──
-_last_auth_check: Dict[str, float] = {}
-AUTH_CHECK_CACHE_SECONDS = 3600  # Skip duplicate checks within 5 minutes
+_last_auth_check: TTLCache = TTLCache(maxsize=512, ttl=3600)
+AUTH_CHECK_CACHE_SECONDS = 3600  # Skip duplicate checks within 1 hour
 
 
 async def check_session_authorization(client, phone_display: str = "") -> tuple:
@@ -2522,11 +2551,20 @@ async def _audit_single_account(account_doc: dict) -> bool:
                     reason_failed = f"Deep verification failed: {str(e)[:120]}"
 
     except AuthKeyDuplicatedError as e:
-        audit_logger.warning(
-            f"⚠️ AuthKeyDuplicated for +{clean_phone}. "
-            f"Account is likely active on a personal device. Skipping audit to prevent session invalidation."
+        audit_logger.critical(
+            f"🔥 AuthKeyDuplicatedError for +{clean_phone}. "
+            f"Session key collision — quarantining account."
         )
-        return True
+        reason_failed = "AuthKeyDuplicatedError: Session key already in use"
+        is_duplicate = True
+        # Quarantine via SessionManager and DB
+        await session_manager.mark_quarantined(
+            clean_phone,
+            reason="AuthKeyDuplicatedError",
+            category=ErrorCategory.AUTH_KEY_DUPLICATED,
+        )
+        db.set_account_state(clean_phone, AccountStatus.AUTH_KEY_DUPLICATED)
+        await GLOBAL.pool_remove(clean_phone)
     
     except (UserDeactivatedError, UserDeactivatedBanError) as e:
         reason_failed = f"Account Terminated: {e}"
@@ -2544,7 +2582,8 @@ async def _audit_single_account(account_doc: dict) -> bool:
 
     if reason_failed:
         audit_logger.critical(f"❌ Session +{clean_phone} is dead: {reason_failed}")
-        db.mark_account_revoked(clean_phone, reason_failed)
+        if not is_duplicate:
+            db.mark_account_revoked(clean_phone, reason_failed)
         await GLOBAL.pool_remove(clean_phone)
 
         ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
@@ -2582,23 +2621,25 @@ async def lifespan(app: FastAPI):
     real_bot = bot.initialize(StringSession(), CONFIG["API_ID"], CONFIG["API_HASH"])
     await real_bot.start(bot_token=CONFIG["BOT_TOKEN"])
     
-    # 2. Start Proxy Lease Manager (Auto-Reaper)
+    # 2. Start Proxy Lease Manager and Account Lease Manager
     logger.info("🚀 Starting ProxyLeaseManager (Auto-Reaper active)...")
-    # Proxies are loaded in ProxyManager.__init__ via _load_proxies()
     await proxy_lease_manager.start()
-    proxy_manager.start_background_testing()  
+    proxy_manager.start_background_testing()
+
+    logger.info("🚀 Starting AccountLeaseManager (Lease Expiration Reaper active)...")
+    await account_lease_manager.start()
 
     # 3. Register background auditor task
     auditor_task = asyncio.create_task(continuous_session_auditor())
     GLOBAL.register_task(auditor_task)
-    
+
     # 4. Register auto-recovery loop task
     recovery_task = asyncio.create_task(auto_health_recovery_loop())
     GLOBAL.register_task(recovery_task)
-    
+
     logger.info("🌐 Service, Telegram Bot, Auditor, Recovery Loops, and ProxyLeaseManager are online!")
     yield
-    
+
     # Cleanup on server stop
     logger.info("🛑 Gracefully shutting down Telethon Bot, Background Tasks, and ProxyLeaseManager...")
     auditor_task.cancel()
@@ -2607,17 +2648,25 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(auditor_task, recovery_task)
     except asyncio.CancelledError:
         pass
-    
-    # Stop lease manager
+
+    # Stop lease managers
     await proxy_lease_manager.stop()
-    
+    await account_lease_manager.stop()
+
+    # Disconnect all session-managed clients
+    await session_manager.disconnect_all()
+
     # Close database connection
     db.close()
-    
+
     await real_bot.disconnect()
 
 app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
 app.include_router(console_router, prefix="/console")
+
+# Initialize web_console with db and session_manager references
+init_console_db(db)
+init_console_session_manager(session_manager)
 
 @app.get("/")
 async def root_health_check():

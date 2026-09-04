@@ -15,7 +15,6 @@ from typing import Dict, Any, Optional
 import random
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 from telethon.tl.types import (
     UserStatusOnline, UserStatusRecently, UserStatusLastWeek,
     UserStatusLastMonth, PeerChannel, ChannelParticipantsSearch
@@ -35,10 +34,13 @@ if hasattr(sys.stdout, "reconfigure"):
 class MemberScraper:
     """Handles universal group link decoding, filtering, and hidden participant crawling."""
     
-    def __init__(self, db, proxy_manager=None, proxy_lease_manager=None):
+    def __init__(self, db, proxy_manager=None, proxy_lease_manager=None,
+                 session_manager=None, account_lease_manager=None):
         self.db = db
         self.proxy_manager = proxy_manager
         self.proxy_lease_manager = proxy_lease_manager
+        self.session_manager = session_manager
+        self.account_lease_manager = account_lease_manager
 
     def resolve_group_link(self, link_str: str) -> tuple[bool, str]:
         """
@@ -137,68 +139,65 @@ class MemberScraper:
 
         session_str = account_doc.get("session_string") or account_doc.get("session")
         device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
-        
-        client = TelegramClient(
-            StringSession(session_str), 
-            int(account_doc.get("api_id", CONFIG["API_ID"])),
-            str(account_doc.get("api_hash", CONFIG["API_HASH"])),
-            device_model=device.get("device_model", "PC 64bit"),
-            system_version=device.get("system_version", "Windows 11"),
-            app_version=device.get("app_version", "4.8.4"),
-            entity_cache_limit=100,     # limit entity cache
-            sequential_updates=False,   # disable sequential updates
-            receive_updates=False,      # no need for live updates
-        )
-        
-        try:
-            await client.connect()
-            entity = await self._bind_and_join(client, group_link)
-            group_title = getattr(entity, 'title', 'Scraped Group')
-            
-            offset = 0
-            limit = 200
-            scraped_data = []
-            print(f"  ⏳ Downloading parameters mapping list using strategy filter mode: [{mode}]...")
-            
-            while True:
-                participants = await client(GetParticipantsRequest(
-                    entity, ChannelParticipantsSearch(''), offset, limit, hash=0
-                ))
-                if not participants.users:
-                    break
-                    
-                for user in participants.users:
-                    if getattr(user, 'bot', False) or not user.id:
-                        continue
-                        
-                    activity = self._determine_activity_status(user)
-                    
-                    if mode == '24h' and activity not in ['Online', 'Recently']:
-                        continue
-                    if mode == 'weekly' and activity not in ['Online', 'Recently', 'LastWeek']:
-                        continue
-                        
-                    payload = self._convert_user_to_dict(user, activity, group_title)
-                    scraped_data.append(payload)
-                    
-                offset += len(participants.users)
-                if len(participants.users) < limit:
-                    break
-                await asyncio.sleep(0.2)
-                
-            upserted = await self.db.save_scraped_members(scraped_data, group_title)
-            print(f"  ✅ Operations Complete. Saved/Updated {upserted} records inside DB structure.")
-            return upserted
-            
-        except FloodWaitError as e:
-            print(f"  ⏱️ Rate limiting triggered. Cooldown forced: {e.seconds}s.")
-            return 0
-        except ChatAdminRequiredError:
-            print("  ❌ Administrative security clearance required to parse member lists here.")
-            return 0
-        finally:
-            await client.disconnect()
-            self.db.release_lock(phone)  # 🔓 Safe release when done
+
+        async with self.session_manager.acquire(
+            phone,
+            module="scraper_standard",
+            auto_release=True,
+        ) as lease:
+            if not lease:
+                self.db.release_lock(phone)
+                return 0
+            client = lease.client
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                entity = await self._bind_and_join(client, group_link)
+                group_title = getattr(entity, 'title', 'Scraped Group')
+
+                offset = 0
+                limit = 200
+                scraped_data = []
+                print(f"  ⏳ Downloading parameters mapping list using strategy filter mode: [{mode}]...")
+
+                while True:
+                    participants = await client(GetParticipantsRequest(
+                        entity, ChannelParticipantsSearch(''), offset, limit, hash=0
+                    ))
+                    if not participants.users:
+                        break
+
+                    for user in participants.users:
+                        if getattr(user, 'bot', False) or not user.id:
+                            continue
+
+                        activity = self._determine_activity_status(user)
+
+                        if mode == '24h' and activity not in ['Online', 'Recently']:
+                            continue
+                        if mode == 'weekly' and activity not in ['Online', 'Recently', 'LastWeek']:
+                            continue
+
+                        payload = self._convert_user_to_dict(user, activity, group_title)
+                        scraped_data.append(payload)
+
+                    offset += len(participants.users)
+                    if len(participants.users) < limit:
+                        break
+                    await asyncio.sleep(0.2)
+
+                upserted = await self.db.save_scraped_members(scraped_data, group_title)
+                print(f"  ✅ Operations Complete. Saved/Updated {upserted} records inside DB structure.")
+                return upserted
+
+            except FloodWaitError as e:
+                print(f"  ⏱️ Rate limiting triggered. Cooldown forced: {e.seconds}s.")
+                return 0
+            except ChatAdminRequiredError:
+                print("  ❌ Administrative security clearance required to parse member lists here.")
+                return 0
+            finally:
+                self.db.release_lock(phone)  # 🔓 Safe release when done
 
     async def scrape_hidden_matrix(self, account_doc: Dict, group_link: str) -> int:
         """Scans historical channels history and active live tracking streams to gather hidden participants data logs."""
@@ -207,118 +206,116 @@ class MemberScraper:
 
         session_str = account_doc.get("session_string") or account_doc.get("session")
         device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
-        
-        client = TelegramClient(
-            StringSession(session_str), 
-            int(account_doc.get("api_id", CONFIG["API_ID"])), 
-            str(account_doc.get("api_hash", CONFIG["API_HASH"])),
-            device_model=device.get("device_model", "PC 64bit"),
-            system_version=device.get("system_version", "Windows 11"),
-            app_version=device.get("app_version", "4.8.4")
-        )
-        
-        try:
-            await client.connect()
-            entity = await self._bind_and_join(client, group_link)
-            group_title = getattr(entity, 'title', 'Hidden Scraped Group')
-            
-            users_map: Dict[int, Any] = {}
-            offset_id = 0
-            limit = 100
-            max_messages = 3000  
-            messages_crawled = 0
-            
-            print("  📜 Initiating comprehensive historical scan layers for hidden entities tracking...")
-            
-            while messages_crawled < max_messages:
-                history = await client(GetHistoryRequest(
-                    peer=entity, offset_id=offset_id, offset_date=None,
-                    add_offset=0, limit=limit, max_id=0, min_id=0, hash=0
-                ))
-                
-                if not history.messages:
-                    break
-                    
-                for msg in history.messages:
-                    if msg.from_id and not isinstance(msg.from_id, PeerChannel):
-                        try:
-                            sender_id = msg.from_id.user_id
-                            if sender_id not in users_map:
-                                user_entity = await client.get_entity(sender_id)
-                                if not getattr(user_entity, 'bot', False):
-                                    users_map[sender_id] = user_entity
-                        except Exception:
-                            pass
-                            
-                    if getattr(msg, 'action', None):
-                        action_users = []
-                        if hasattr(msg.action, 'users'):
-                            action_users = msg.action.users
-                        elif hasattr(msg.action, 'user_id'):
-                            action_users = [msg.action.user_id]
-                            
-                        for u_id in action_users:
-                            if u_id not in users_map:
-                                try:
-                                    u_ent = await client.get_entity(u_id)
-                                    if not getattr(u_ent, 'bot', False):
-                                        users_map[u_id] = u_ent
-                                except Exception:
-                                    pass
-                                    
-                offset_id = history.messages[-1].id
-                messages_crawled += len(history.messages)
-                await asyncio.sleep(0.1)
-                
-            # Parse active live call arrays
-            # Parse active live call arrays
-            try:
-                # Dynamically evaluate if entity is a Megagroup/Channel or standard Chat
-                if type(entity).__name__ == 'Channel':
-                    full_chat_context = await client(GetFullChannelRequest(entity))
-                else:
-                    full_chat_context = await client(GetFullChatRequest(entity.id))
-                    
-                if full_chat_context.full_chat.call and hasattr(full_chat_context.full_chat.call, 'participants'):
-                    print(f"  🎥 Live Voicechat stream framework matching active instances...")
-                    for participant in full_chat_context.full_chat.call.participants:
-                        if hasattr(participant, 'peer') and hasattr(participant.peer, 'user_id'):
-                            u_id = participant.peer.user_id
-                            if u_id not in users_map:
-                                try:
-                                    u_ent = await client.get_entity(u_id)
-                                    if not getattr(u_ent, 'bot', False):
-                                        users_map[u_id] = u_ent
-                                except Exception:
-                                    pass
-            except Exception:
-                pass
 
-            # Scan group admins list safely
+        async with self.session_manager.acquire(
+            phone,
+            module="scraper_hidden",
+            auto_release=True,
+        ) as lease:
+            if not lease:
+                self.db.release_lock(phone)
+                return 0
+            client = lease.client
             try:
-                admins = await client.get_participants(entity, aggressive=True)
-                for admin in admins:
-                    if hasattr(admin, 'id') and not getattr(admin, 'bot', False):
-                        if admin.id not in users_map:
-                            users_map[admin.id] = admin
-            except Exception:
-                pass
+                if not client.is_connected():
+                    await client.connect()
+                entity = await self._bind_and_join(client, group_link)
+                group_title = getattr(entity, 'title', 'Hidden Scraped Group')
 
-            hidden_payloads = []
-            for usr in users_map.values():
-                act = self._determine_activity_status(usr)
-                hidden_payloads.append(self._convert_user_to_dict(usr, act, group_title))
-                
-            upsert_count = await self.db.save_scraped_members(hidden_payloads, group_title)
-            print(f"  ✅ Extraction Matrix Complete. Processed {upsert_count} fields inside database logs.")
-            return upsert_count
-            
-        except Exception as e:
-            logger.error(f"Hidden compiler structural failure occurred: {e}")
-            return 0
-        finally:
-            await client.disconnect()
-            self.db.release_lock(phone)  # 🔓 Safe release when done
+                users_map: Dict[int, Any] = {}
+                offset_id = 0
+                limit = 100
+                max_messages = 3000
+                messages_crawled = 0
+
+                print("  📜 Initiating comprehensive historical scan layers for hidden entities tracking...")
+
+                while messages_crawled < max_messages:
+                    history = await client(GetHistoryRequest(
+                        peer=entity, offset_id=offset_id, offset_date=None,
+                        add_offset=0, limit=limit, max_id=0, min_id=0, hash=0
+                    ))
+
+                    if not history.messages:
+                        break
+
+                    for msg in history.messages:
+                        if msg.from_id and not isinstance(msg.from_id, PeerChannel):
+                            try:
+                                sender_id = msg.from_id.user_id
+                                if sender_id not in users_map:
+                                    user_entity = await client.get_entity(sender_id)
+                                    if not getattr(user_entity, 'bot', False):
+                                        users_map[sender_id] = user_entity
+                            except Exception:
+                                pass
+
+                        if getattr(msg, 'action', None):
+                            action_users = []
+                            if hasattr(msg.action, 'users'):
+                                action_users = msg.action.users
+                            elif hasattr(msg.action, 'user_id'):
+                                action_users = [msg.action.user_id]
+
+                            for u_id in action_users:
+                                if u_id not in users_map:
+                                    try:
+                                        u_ent = await client.get_entity(u_id)
+                                        if not getattr(u_ent, 'bot', False):
+                                            users_map[u_id] = u_ent
+                                    except Exception:
+                                        pass
+
+                    offset_id = history.messages[-1].id
+                    messages_crawled += len(history.messages)
+                    await asyncio.sleep(0.1)
+
+                # Parse active live call arrays
+                try:
+                    if type(entity).__name__ == 'Channel':
+                        full_chat_context = await client(GetFullChannelRequest(entity))
+                    else:
+                        full_chat_context = await client(GetFullChatRequest(entity.id))
+
+                    if full_chat_context.full_chat.call and hasattr(full_chat_context.full_chat.call, 'participants'):
+                        print(f"  🎥 Live Voicechat stream framework matching active instances...")
+                        for participant in full_chat_context.full_chat.call.participants:
+                            if hasattr(participant, 'peer') and hasattr(participant.peer, 'user_id'):
+                                u_id = participant.peer.user_id
+                                if u_id not in users_map:
+                                    try:
+                                        u_ent = await client.get_entity(u_id)
+                                        if not getattr(u_ent, 'bot', False):
+                                                    users_map[u_id] = u_ent
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
+
+                # Scan group admins list safely
+                try:
+                    admins = await client.get_participants(entity, aggressive=True)
+                    for admin in admins:
+                        if hasattr(admin, 'id') and not getattr(admin, 'bot', False):
+                            if admin.id not in users_map:
+                                users_map[admin.id] = admin
+                except Exception:
+                    pass
+
+                hidden_payloads = []
+                for usr in users_map.values():
+                    act = self._determine_activity_status(usr)
+                    hidden_payloads.append(self._convert_user_to_dict(usr, act, group_title))
+
+                upsert_count = await self.db.save_scraped_members(hidden_payloads, group_title)
+                print(f"  ✅ Extraction Matrix Complete. Processed {upsert_count} fields inside database logs.")
+                return upsert_count
+
+            except Exception as e:
+                logger.error(f"Hidden compiler structural failure occurred: {e}")
+                return 0
+            finally:
+                self.db.release_lock(phone)  # 🔓 Safe release when done
             
     async def scrape_voicechat_matrix(self, account_doc: Dict, group_link: str) -> int:
         """Scans the active live Voice Chat (Group Call) to extract all currently connected members."""
@@ -327,84 +324,84 @@ class MemberScraper:
 
         session_str = account_doc.get("session_string") or account_doc.get("session")
         device = account_doc.get("device_metadata") or random.choice(DEVICE_PROFILES)
-        
-        client = TelegramClient(
-            StringSession(session_str), 
-            int(account_doc.get("api_id", CONFIG["API_ID"])), 
-            str(account_doc.get("api_hash", CONFIG["API_HASH"])),
-            device_model=device.get("device_model", "PC 64bit"),
-            system_version=device.get("system_version", "Windows 11"),
-            app_version=device.get("app_version", "4.8.4")
-        )
-        
-        try:
-            await client.connect()
-            entity = await self._bind_and_join(client, group_link)
-            group_title = getattr(entity, 'title', 'VC Scraped Group')
-            
-            print("  🎙️ Checking for an active Voice Chat in the target group...")
-            
-            # 🔥 FIX: Safely fetch the full chat context using native Telethon APIs to avoid AttributeError
-            from telethon.tl.functions.channels import GetFullChannelRequest
-            from telethon.tl.functions.messages import GetFullChatRequest
 
-            if type(entity).__name__ == 'Channel':
-                full_chat_context = await client(GetFullChannelRequest(entity))
-            else:
-                full_chat_context = await client(GetFullChatRequest(entity.id))
-                
-            call_obj = full_chat_context.full_chat.call
-            
-            if not call_obj:
-                print("  ❌ No active Voice Chat found in this group.")
+        async with self.session_manager.acquire(
+            phone,
+            module="scraper_voicechat",
+            auto_release=True,
+        ) as lease:
+            if not lease:
+                self.db.release_lock(phone)
                 return 0
-                
-            print("  🎧 Active Voice Chat detected! Extracting live participants...")
-            
-            users_map: Dict[int, Any] = {}
-            offset = ""
-            
-            while True:
-                try:
-                    # Fetch participants from the active group call
-                    from telethon.tl.functions.phone import GetGroupParticipantsRequest
-                    result = await client(GetGroupParticipantsRequest(
-                        call=call_obj,
-                        ids=[],
-                        sources=[],
-                        offset=offset,
-                        limit=100
-                    ))
-                    
-                    for user in result.users:
-                        if not getattr(user, 'bot', False) and user.id:
-                            users_map[user.id] = user
-                            
-                    if not result.next_offset:
+            client = lease.client
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                entity = await self._bind_and_join(client, group_link)
+                group_title = getattr(entity, 'title', 'VC Scraped Group')
+
+                print("  🎙️ Checking for an active Voice Chat in the target group...")
+
+                # 🔥 FIX: Safely fetch the full chat context using native Telethon APIs to avoid AttributeError
+                from telethon.tl.functions.channels import GetFullChannelRequest
+                from telethon.tl.functions.messages import GetFullChatRequest
+
+                if type(entity).__name__ == 'Channel':
+                    full_chat_context = await client(GetFullChannelRequest(entity))
+                else:
+                    full_chat_context = await client(GetFullChatRequest(entity.id))
+
+                call_obj = full_chat_context.full_chat.call
+
+                if not call_obj:
+                    print("  ❌ No active Voice Chat found in this group.")
+                    return 0
+
+                print("  🎧 Active Voice Chat detected! Extracting live participants...")
+
+                users_map: Dict[int, Any] = {}
+                offset = ""
+
+                while True:
+                    try:
+                        # Fetch participants from the active group call
+                        from telethon.tl.functions.phone import GetGroupParticipantsRequest
+                        result = await client(GetGroupParticipantsRequest(
+                            call=call_obj,
+                            ids=[],
+                            sources=[],
+                            offset=offset,
+                            limit=100
+                        ))
+
+                        for user in result.users:
+                            if not getattr(user, 'bot', False) and user.id:
+                                users_map[user.id] = user
+
+                        if not result.next_offset:
+                            break
+                        offset = result.next_offset
+                        await asyncio.sleep(0.5)  # Safe delay to prevent rate limits
+
+                    except Exception as api_err:
+                        print(f"  ⚠️ Voice chat extraction pagination error: {api_err}")
                         break
-                    offset = result.next_offset
-                    await asyncio.sleep(0.5)  # Safe delay to prevent rate limits
-                    
-                except Exception as api_err:
-                    print(f"  ⚠️ Voice chat extraction pagination error: {api_err}")
-                    break
 
-            hidden_payloads = []
-            for usr in users_map.values():
-                act = self._determine_activity_status(usr)
-                hidden_payloads.append(self._convert_user_to_dict(usr, act, group_title))
-                
-            if hidden_payloads:
-                upsert_count = await self.db.save_scraped_members(hidden_payloads, group_title)
-                print(f"  ✅ VoiceChat Matrix Complete. Processed {upsert_count} live participants.")
-                return upsert_count
-            else:
-                print("  📭 Voice chat is active, but no visible participants found.")
+                hidden_payloads = []
+                for usr in users_map.values():
+                    act = self._determine_activity_status(usr)
+                    hidden_payloads.append(self._convert_user_to_dict(usr, act, group_title))
+
+                if hidden_payloads:
+                    upsert_count = await self.db.save_scraped_members(hidden_payloads, group_title)
+                    print(f"  ✅ VoiceChat Matrix Complete. Processed {upsert_count} live participants.")
+                    return upsert_count
+                else:
+                    print("  📭 Voice chat is active, but no visible participants found.")
+                    return 0
+
+            except Exception as e:
+                logger.error(f"VoiceChat extraction structural failure occurred: {e}")
                 return 0
-            
-        except Exception as e:
-            logger.error(f"VoiceChat extraction structural failure occurred: {e}")
-            return 0
-        finally:
-            await client.disconnect()
-            self.db.release_lock(phone)  # 🔓 Safe release when done
+            finally:
+                self.db.release_lock(phone)  # 🔓 Safe release when done
