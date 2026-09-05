@@ -10,13 +10,16 @@ import os
 import re
 import logging
 import asyncio
-from typing import Optional
+import uuid
+import hmac
+from typing import Optional, List, Dict, Any
 import datetime
 import time
 from contextlib import asynccontextmanager
 from collections import OrderedDict
-from fastapi import APIRouter, Depends, HTTPException, Header, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, Query, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
 from telethon import TelegramClient
 from telethon.errors import UserAlreadyParticipantError, AuthKeyDuplicatedError
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
@@ -34,45 +37,124 @@ from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeVideo
 )
-import io, base64
 from telethon.utils import get_peer_id
 
 from config import CONFIG
-from exception_classifier import ErrorCategory, classify_exception
+from exception_classifier import ErrorCategory, classify_exception, ConnectionResult
 
 # =====================================================================
-# 📦 PYDANTIC MODELS
+# 🔒 SECURITY CONSTANTS & CONFIGURATION
+# =====================================================================
+# Pagination defaults
+DEFAULT_PAGE_LIMIT = 50
+MAX_PAGE_LIMIT = 500
+
+# Request size limits
+MAX_MESSAGE_LENGTH = 4096
+MAX_TARGETS_PER_REQUEST = 100
+
+# Rate limiting (already defined below, constants here for clarity)
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 60
+RATE_LIMIT_MAX_BUCKETS = 4096
+
+# Background task tracking
+_background_tasks: set = set()
+_operations: Dict[str, Dict[str, Any]] = {}  # operation_id -> metadata
+
+# Phone validation regex (E.164 format without +)
+PHONE_REGEX = re.compile(r'^\d{10,15}$')
+
+def validate_phone(phone: str) -> str:
+    """Validate and normalize phone number. Returns cleaned phone or raises HTTPException."""
+    clean = phone.replace("+", "").replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    if not PHONE_REGEX.match(clean):
+        raise HTTPException(status_code=400, detail="Invalid phone number format")
+    return clean
+
+def validate_chat_id(chat_id: str) -> str:
+    """Validate chat_id - can be numeric ID or username."""
+    if not chat_id or not chat_id.strip():
+        raise HTTPException(status_code=400, detail="chat_id is required")
+    return chat_id.strip()
+
+def validate_limit(limit: int, default: int = DEFAULT_PAGE_LIMIT, maximum: int = MAX_PAGE_LIMIT) -> int:
+    """Validate pagination limit."""
+    if limit <= 0:
+        return default
+    return min(limit, maximum)
+
+def validate_offset(offset: int) -> int:
+    """Validate pagination offset."""
+    return max(0, offset)
+
+def sanitize_error_message(e: Exception) -> str:
+    """Return a safe error message without internal details."""
+    return "Operation failed"
+
+# =====================================================================
+# 📦 PYDANTIC MODELS (with validation)
 # =====================================================================
 class SendMessageRequest(BaseModel):
-    phone: str
-    chat_id: str
+    phone: str = Field(..., min_length=10, max_length=15)
+    chat_id: str = Field(..., min_length=1)
     message: str = ""
     text: str = ""
     reply_to: Optional[int] = None
     edit_id: Optional[int] = None
+    
+    @validator('phone')
+    def validate_phone_format(cls, v):
+        return validate_phone(v)
+    
+    @validator('message', 'text')
+    def validate_message_length(cls, v):
+        if v and len(v) > MAX_MESSAGE_LENGTH:
+            raise ValueError(f"Message exceeds maximum length of {MAX_MESSAGE_LENGTH}")
+        return v
 
 class MassActionRequest(BaseModel):
-    target_channel: str
+    target_channel: str = Field(..., min_length=1, max_length=256)
 
 class JoinActionRequest(BaseModel):
-    phone: str
-    chat_id: str
+    phone: str = Field(..., min_length=10, max_length=15)
+    chat_id: str = Field(..., min_length=1)
+    
+    @validator('phone')
+    def validate_phone_format(cls, v):
+        return validate_phone(v)
 
 class SmartRouteRequest(BaseModel):
-    phone: str
-    target: str
+    phone: str = Field(..., min_length=10, max_length=15)
+    target: str = Field(..., min_length=1, max_length=256)
+    
+    @validator('phone')
+    def validate_phone_format(cls, v):
+        return validate_phone(v)
 
 class ForwardMessageRequest(BaseModel):
-    phone: str
-    from_chat_id: str
-    to_chat_id: str
-    msg_id: int
+    phone: str = Field(..., min_length=10, max_length=15)
+    from_chat_id: str = Field(..., min_length=1)
+    to_chat_id: str = Field(..., min_length=1)
+    msg_id: int = Field(..., gt=0)
+    
+    @validator('phone')
+    def validate_phone_format(cls, v):
+        return validate_phone(v)
 
 class DeleteMessageRequest(BaseModel):
-    phone: str
-    chat_id: str
-    msg_id: int
-    delete_for_everyone: bool
+    phone: str = Field(..., min_length=10, max_length=15)
+    chat_id: str = Field(..., min_length=1)
+    msg_id: int = Field(..., gt=0)
+    delete_for_everyone: bool = False
+    
+    @validator('phone')
+    def validate_phone_format(cls, v):
+        return validate_phone(v)
+
+class PaginationParams(BaseModel):
+    limit: int = Field(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT)
+    offset: int = Field(default=0, ge=0)
         
 
 # =====================================================================
@@ -83,13 +165,14 @@ console_router = APIRouter()
 _db = None
 _session_manager = None
 
-# ── Web API security (Phase 18) ──
-# Tracked background tasks so fire-and-forget work is cancellable on shutdown
-# (Phase 22) instead of leaking as orphans.
+# ── Web API security ──
+# Tracked background tasks so fire‑and‑forget work is cancellable on shutdown
 _background_tasks: set = set()
 
-# Lightweight per-IP sliding-window rate limiter for console endpoints.
-# Matches the (client_ip, window_start, window_count) pattern, kept small.
+# Operation tracking for long-running operations
+_operations: Dict[str, Dict[str, Any]] = {}
+
+# Lightweight per-IP sliding-window rate limiter for console endpoints
 _RATE_LIMIT_WINDOW = 60          # seconds
 _RATE_LIMIT_MAX = 60             # requests per window per IP
 _rate_buckets: dict = {}
@@ -114,16 +197,32 @@ def _rate_limited(client_ip: str) -> None:
         raise HTTPException(status_code=429, detail="Too many requests")
 
 
+def verify_api_token(supplied: str, configured: str) -> bool:
+    """Constant‑time comparison of API tokens.
+
+    Returns ``True`` if both strings are non‑empty and match exactly.
+    """
+    if not supplied or not configured:
+        return False
+    return hmac.compare_digest(
+        supplied.encode("utf-8"),
+        configured.encode("utf-8"),
+    )
+
+
 def ensure_api_token(
     request: Request,
     authorization: Optional[str] = Header(default=None),
     x_api_token: Optional[str] = Header(default=None),
 ) -> None:
-    """Require a valid WEB_API_TOKEN on every console route.
+    """Require a valid ``WEB_API_TOKEN`` on every console route.
 
-    Secure by default: if no token is configured the route is refused with a
-    503 instructing the operator to set WEB_API_TOKEN, rather than exposing the
-    REST console unauthenticated on a 0.0.0.0-bound server.
+    The function is fail‑closed: if the token is missing, empty or does not match
+    the configured value an HTTP 401/403 is raised. If no token is set in the
+    configuration a 503 is returned to avoid accidental exposure of the API.
+
+    Authorization model: single-admin token. All authenticated requests have
+    full administrative access. No multi-user RBAC is implemented.
     """
     client_ip = request.client.host if request.client else "unknown"
     _rate_limited(client_ip)
@@ -138,7 +237,7 @@ def ensure_api_token(
         provided = authorization[7:].strip()
     elif x_api_token:
         provided = x_api_token.strip()
-    if not provided or provided != token:
+    if not verify_api_token(provided, token):
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
 
@@ -147,8 +246,13 @@ console_router.dependencies = [Depends(ensure_api_token)]
 
 
 def shutdown_background_tasks() -> None:
-    """Cancel and await tracked console background tasks (Phase 22)."""
+    """Cancel and await tracked console background tasks.
+    
+    Idempotent: safe to call multiple times.
+    """
+    global _background_tasks
     pending = list(_background_tasks)
+    _background_tasks.clear()
     for t in pending:
         t.cancel()
     if pending:
@@ -172,11 +276,41 @@ async def _wait_background_tasks(tasks) -> None:
             pass
 
 
+def _register_task(task: asyncio.Task, operation_id: str, meta: Dict[str, Any]) -> None:
+    """Register a background task with operation metadata."""
+    _background_tasks.add(task)
+    _operations[operation_id] = {
+        **meta,
+        "started_at": time.time(),
+        "state": "running",
+    }
+    
+    def _done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        op_meta = _operations.get(operation_id, {})
+        if not t.cancelled():
+            exc = t.exception()
+            if exc:
+                logger.exception("WEB_BACKGROUND_TASK_FAILED", exc_info=exc)
+                _operations[operation_id] = {**op_meta, "state": "failed", "error": sanitize_error_message(exc)}
+            else:
+                _operations[operation_id] = {**op_meta, "state": "completed"}
+        else:
+            _operations[operation_id] = {**op_meta, "state": "cancelled"}
+
+    task.add_done_callback(_done)
+
+
+def get_operation_status(operation_id: str) -> Optional[Dict[str, Any]]:
+    """Get status of a background operation."""
+    return _operations.get(operation_id)
+
+
 def init_console_db(db_instance):
     """Initializes the database reference link for backend APIs."""
     global _db
     _db = db_instance
-    logger.info("🌐 Pure Backend Data Transfer API Hub Engine initialized.")
+    logger.info("Web console database initialized.")
     return console_router
 
 
@@ -184,6 +318,7 @@ def init_console_session_manager(session_manager_instance):
     """Initializes the SessionManager reference for centralized client creation."""
     global _session_manager
     _session_manager = session_manager_instance
+
 
 def setup_console_routes(db_instance):
     """Alias placeholder to satisfy pre-existing system loop bindings."""
@@ -205,48 +340,81 @@ async def managed_web_session(phone: str):
     """
     if not _session_manager:
         raise RuntimeError("SessionManager not initialized for web console")
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    clean_phone = validate_phone(phone)
     async with _session_manager.acquire(
         clean_phone,
         module="web_console",
-        auto_release=False,
+        auto_release=True,
     ) as lease:
         if not lease:
-            raise PermissionError(f"Session unavailable for +{clean_phone}")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Session unavailable for +{clean_phone} (busy or terminal)"
+            )
         try:
             yield lease.client, lease
         finally:
-            await _session_manager.release_lease(lease)
+            pass  # auto_release=True handles cleanup
 
 # Helper to safely parse chat IDs (handles negative IDs for groups/channels)
 def parse_chat_id(chat_id_str: str):
     return int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
 
+
+def _audit_log(endpoint: str, operation_id: str, action: str, target: str, result: str, duration: float, error_category: Optional[str] = None) -> None:
+    """Structured audit log for sensitive administrative actions."""
+    logger.info(
+        "WEB_AUDIT | endpoint=%s | operation_id=%s | action=%s | target=%s | result=%s | duration_ms=%.2f | error_category=%s",
+        endpoint, operation_id, action, target, result, duration * 1000, error_category or "none"
+    )
+
 # =====================================================================
 # 📒 CORE ENDPOINTS
 # =====================================================================
 @console_router.get("/api/console/accounts")
-async def api_console_accounts():
+async def api_console_accounts(
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return []
-    accounts = await _db.get_all_suite_sessions()
-    catalog = []
-    for acc in accounts:
-        catalog.append({
-            "phone": acc.get("phone"),
-            "first_name": acc.get("first_name", acc.get("device_model", "Identity Node")),
-            "status": acc.get("status", "pending"),
-            "is_restricted": acc.get("is_restricted", False),
-            "dc_id": acc.get("dc_id", None)
-        })
-    return catalog
+    if not _db:
+        _audit_log("/api/console/accounts", operation_id, "list_accounts", "all", "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    try:
+        accounts = await _db.get_all_suite_sessions()
+        total = len(accounts)
+        paginated = accounts[offset:offset + limit]
+        catalog = []
+        for acc in paginated:
+            catalog.append({
+                "phone": acc.get("phone"),
+                "first_name": acc.get("first_name", acc.get("device_model", "Identity Node")),
+                "status": acc.get("status", "pending"),
+                "is_restricted": acc.get("is_restricted", False),
+                "dc_id": acc.get("dc_id", None)
+            })
+        _audit_log("/api/console/accounts", operation_id, "list_accounts", f"{len(catalog)}/{total}", "success", time.time() - start)
+        return {"accounts": catalog, "total": total, "limit": limit, "offset": offset}
+    except Exception as e:
+        _audit_log("/api/console/accounts", operation_id, "list_accounts", "all", "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Failed to list accounts")
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 @console_router.get("/api/console/contacts/{phone}")
-async def api_console_contacts(phone: str):
+async def api_console_contacts(
+    phone: str,
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
-    
+    if not _db:
+        _audit_log("/api/console/contacts", operation_id, "get_contacts", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
     try:
         async with managed_web_session(clean_phone) as (client, _):
             result = await client(GetContactsRequest(hash=0))
@@ -261,32 +429,53 @@ async def api_console_contacts(phone: str):
                     "mutual": getattr(user, 'mutual_contact', False)
                 })
             contacts_data.sort(key=lambda x: (x['first_name'] or x['username'] or '').lower())
-            return {"status": "success", "contacts": contacts_data}
+            total = len(contacts_data)
+            paginated = contacts_data[offset:offset + limit]
+            _audit_log("/api/console/contacts", operation_id, "get_contacts", clean_phone, "success", time.time() - start)
+            return {"status": "success", "contacts": paginated, "total": total, "limit": limit, "offset": offset}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/contacts", operation_id, "get_contacts", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Contacts fetch engine fault: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/contacts", operation_id, "get_contacts", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Failed to fetch contacts for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 @console_router.post("/api/console/send")
 async def api_console_send_message(req: SendMessageRequest):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: raise HTTPException(status_code=500, detail="Database uninitialized.")
-    clean_phone = req.phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/send", operation_id, "send_message", req.phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = req.phone  # Already validated by Pydantic
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
             target_id = parse_chat_id(req.chat_id)
             content = (req.message or req.text or "").strip()
             if not content:
-                return {"status": "error", "reason": "Message text is empty."}
+                _audit_log("/api/console/send", operation_id, "send_message", clean_phone, "error_empty_message", time.time() - start, "VALIDATION_ERROR")
+                raise HTTPException(status_code=400, detail="Message text is empty")
             if req.edit_id and str(req.edit_id).strip():
                 await client.edit_message(target_id, int(req.edit_id), content)
             else:
                 reply_to_id = int(req.reply_to) if req.reply_to and str(req.reply_to).strip() else None
                 await client.send_message(target_id, content, reply_to=reply_to_id)
+            _audit_log("/api/console/send", operation_id, "send_message", clean_phone, "success", time.time() - start)
             return {"status": "success"}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/send", operation_id, "send_message", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Outbound message delivery error: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/send", operation_id, "send_message", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Failed to send message from %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 # =====================================================================
 # 🤖 MASS AUTOMATION & LIVE BACKGROUND TELEMETRY HUB
@@ -295,16 +484,27 @@ from collections import deque
 automation_logs_stream = deque(maxlen=100)
 
 def append_system_log(message: str):
-    # 🔥 FIX: Convert Backend Automation Logs to IST Time
+    # Convert Backend Automation Logs to IST Time
     ist_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
     timestamp = ist_time.strftime("%Y-%m-%d %H:%M:%S")
-    automation_logs_stream.append(f"[{timestamp}] ⚙️ {message}")
+    automation_logs_stream.append(f"[{timestamp}] {message}")
+
 
 @console_router.get("/api/console/automation-logs")
-async def get_live_automation_logs():
-    return {"status": "success", "logs": automation_logs_stream}
+async def get_live_automation_logs(
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
+    logs = list(automation_logs_stream)
+    total = len(logs)
+    paginated = logs[offset:offset + limit]
+    _audit_log("/api/console/automation-logs", operation_id, "get_logs", "all", "success", time.time() - start)
+    return {"status": "success", "logs": paginated, "total": total, "limit": limit, "offset": offset}
 
-async def async_mass_join_worker(accounts, target_channel):
+
+async def async_mass_join_worker(accounts, target_channel, operation_id):
     append_system_log(f"INITIATING MASS OPERATIONS: Target resolved to '{target_channel}'")
     success_count = 0
     fail_count = 0
@@ -315,43 +515,71 @@ async def async_mass_join_worker(accounts, target_channel):
                 append_system_log(f"Processing Account #{idx+1}/{len(accounts)} (+{phone})...")
                 clean_target = target_channel.strip().replace("https://t.me/", "").replace("@", "")
                 await client(JoinChannelRequest(clean_target))
-                append_system_log(f"✅ Node #{idx+1} (+{phone}) successfully joined group/channel.")
+                append_system_log(f"Node #{idx+1} (+{phone}) successfully joined group/channel.")
                 success_count += 1
         except Exception as err:
-            append_system_log(f"❌ Node #{idx+1} (+{phone}) join failure: {str(err)}")
+            append_system_log(f"Node #{idx+1} (+{phone}) join failure: {sanitize_error_message(err)}")
             fail_count += 1
         await asyncio.sleep(5)
-    append_system_log(f"🏁 BATCH OPERATIONS FINISHED: Success: {success_count} | Crashed/Failed: {fail_count}")
+    append_system_log(f"BATCH OPERATIONS FINISHED: Success: {success_count} | Crashed/Failed: {fail_count}")
+    _operations[operation_id] = {
+        **_operations.get(operation_id, {}),
+        "state": "completed",
+        "success_count": success_count,
+        "fail_count": fail_count,
+    }
+
 
 @console_router.post("/api/console/mass-execute")
 async def trigger_mass_operation(req: MassActionRequest):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "DB reference dropped."}
+    if not _db:
+        _audit_log("/api/console/mass-execute", operation_id, "mass_join", req.target_channel, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
     accounts = await _db.get_all_suite_sessions()
     if not accounts:
-        return {"status": "error", "reason": "No active identity sessions found inside the database pool container."}
-    task = asyncio.create_task(async_mass_join_worker(accounts, req.target_channel))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return {"status": "success", "message": "Mass task pipeline injected successfully into background engine."}
+        _audit_log("/api/console/mass-execute", operation_id, "mass_join", req.target_channel, "error_no_accounts", time.time() - start)
+        raise HTTPException(status_code=400, detail="No active sessions available")
+    if len(accounts) > MAX_TARGETS_PER_REQUEST:
+        accounts = accounts[:MAX_TARGETS_PER_REQUEST]
+    
+    task = asyncio.create_task(async_mass_join_worker(accounts, req.target_channel, operation_id))
+    _register_task(task, operation_id, {
+        "type": "mass_join",
+        "target": req.target_channel,
+        "account_count": len(accounts),
+        "owner": "web_console",
+    })
+    _audit_log("/api/console/mass-execute", operation_id, "mass_join", req.target_channel, "started", time.time() - start)
+    return {"status": "success", "operation_id": operation_id, "message": "Mass operation started in background"}
 
 # =====================================================================
 # 💬 DIALOGS & MESSAGES ENGINE
 # =====================================================================
 @console_router.get("/api/console/dialogs/{phone}")
-async def api_console_dialogs(phone: str):
+async def api_console_dialogs(
+    phone: str,
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database reference pointer uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/dialogs", operation_id, "get_dialogs", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
             me = await client.get_me()
             my_id = me.id
-            dialogs = await client.get_dialogs(limit=None)
+            dialogs = await client.get_dialogs(limit=limit + offset)
         dialogs_payload = []
         
-        for chat in dialogs:
+        for chat in dialogs[offset:offset + limit]:
             title = chat.name or "Private Chat Space"
             last_msg = str(chat.message.message or "").strip() if chat.message else ""
             
@@ -390,37 +618,52 @@ async def api_console_dialogs(phone: str):
                 "is_saved": is_saved_messages,
                 "is_service": is_telegram_service
             })
-        return {"status": "success", "phone": clean_phone, "dialogs": dialogs_payload}
+        _audit_log("/api/console/dialogs", operation_id, "get_dialogs", clean_phone, "success", time.time() - start)
+        return {"status": "success", "phone": clean_phone, "dialogs": dialogs_payload, "limit": limit, "offset": offset}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/dialogs", operation_id, "get_dialogs", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Failed to fetch dialogs: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/dialogs", operation_id, "get_dialogs", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Failed to fetch dialogs for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 @console_router.get("/api/console/messages/{phone}/{chat_id}")
 @console_router.get("/api/console/chat-history/{phone}/{chat_id}")
-async def api_console_messages(phone: str, chat_id: str):
+async def api_console_messages(
+    phone: str, 
+    chat_id: str,
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
     if not _db:
-        return {"status": "error", "reason": "Database reference uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+        _audit_log("/api/console/messages", operation_id, "get_messages", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
+    chat_id = validate_chat_id(chat_id)
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
             target_entity = parse_chat_id(chat_id)
             resolved_peer = await client.get_entity(target_entity)
-            messages = await client.get_messages(resolved_peer, limit=45)
+            messages = await client.get_messages(resolved_peer, limit=limit + offset)
             messages_payload = []
             
-            for msg in reversed(messages):
+            for msg in reversed(messages[offset:offset + limit]):
                 if not msg.message and not msg.media:
                     continue
                 text = str(msg.message or "").strip()
-                # 🔥 FIX: Convert Telethon UTC msg.date to IST
+                # Convert Telethon UTC msg.date to IST
                 ist_date = msg.date + datetime.timedelta(hours=5, minutes=30)
                 time_node = ist_date.strftime("%H:%M")
                 media_type = "text"
-                media_data = None  # 🔥 Will hold rich media object
+                media_data = None
 
-                # 🔥 Extract media details
                 if msg.media:
                     # --- PHOTO ---
                     if isinstance(msg.media, MessageMediaPhoto):
@@ -435,7 +678,7 @@ async def api_console_messages(phone: str, chat_id: str):
                                     "url": f"data:image/jpeg;base64,{b64_data}",
                                     "caption": text or ""
                                 }
-                                text = ""  # Avoid duplicate caption
+                                text = ""
                             else:
                                 media_data = {"type": "photo", "url": None}
                         except Exception as e:
@@ -515,26 +758,39 @@ async def api_console_messages(phone: str, chat_id: str):
                     "is_self": msg.out,
                     "outgoing": msg.out,
                     "media_type": media_type,
-                    "media": media_data,          # 🔥 Rich media object
+                    "media": media_data,
                     "sender_name": sender_name.strip()
                 })
 
-            return {"status": "success", "messages": messages_payload}
+            _audit_log("/api/console/messages", operation_id, "get_messages", clean_phone, "success", time.time() - start)
+            return {"status": "success", "messages": messages_payload, "limit": limit, "offset": offset}
 
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/messages", operation_id, "get_messages", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Messages trace error: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/messages", operation_id, "get_messages", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Failed to fetch messages for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 # =====================================================================
 # 👤 PROFILE & GLOBAL SEARCH
 # =====================================================================
 @console_router.get("/api/console/profile/{phone}")
 async def api_console_get_profile(phone: str):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database reference uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/profile", operation_id, "get_profile", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
     record = _db.get_session_by_phone(clean_phone)
-    if not record: return {"status": "error", "reason": "Session missing."}
+    if not record:
+        _audit_log("/api/console/profile", operation_id, "get_profile", clean_phone, "error_session_missing", time.time() - start)
+        raise HTTPException(status_code=404, detail="Session not found")
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
@@ -547,19 +803,31 @@ async def api_console_get_profile(phone: str):
                     await client.download_profile_photo(me, file=photo_buffer)
                     if photo_buffer.getvalue():
                         photo_uri = f"data:image/jpeg;base64,{base64.b64encode(photo_buffer.getvalue()).decode('utf-8')}"
-                except Exception: pass
+                except Exception:
+                    pass
                 
                 server_dc = getattr(client.session, 'dc_id', 'Unknown')
                 is_restricted = getattr(me, 'restricted', False)
                 restriction_reason = getattr(me, 'restriction_reason', 'None')
                 
-                raw_proxy = record.get("proxy") or CONFIG.get("PROXY")
-                proxy_string = "Direct Connection"
+                # Proxy info - safe metadata only (no credentials)
+                raw_proxy = record.get("proxy")
+                proxy_info = None
                 if raw_proxy:
                     if isinstance(raw_proxy, dict):
-                        proxy_string = f"{raw_proxy.get('proxy_type', 'HTTP')}://{raw_proxy.get('addr')}:{raw_proxy.get('port')}"
+                        proxy_info = {
+                            "provider": raw_proxy.get("provider", "unknown"),
+                            "host": raw_proxy.get("host", raw_proxy.get("addr", "unknown")),
+                            "port": raw_proxy.get("port", "unknown"),
+                            "scheme": raw_proxy.get("scheme", raw_proxy.get("proxy_type", "unknown")),
+                        }
                     elif isinstance(raw_proxy, (list, tuple)) and len(raw_proxy) >= 2:
-                        proxy_string = f"SOCKS5://{raw_proxy[0]}:{raw_proxy[1]}"
+                        proxy_info = {
+                            "provider": "unknown",
+                            "host": raw_proxy[0],
+                            "port": raw_proxy[1],
+                            "scheme": "socks5",
+                        }
                         
                 if hasattr(_db, "source_accounts") and _db.source_accounts:
                     _db.source_accounts.update_one(
@@ -571,6 +839,7 @@ async def api_console_get_profile(phone: str):
                         }}
                     )
                     
+                _audit_log("/api/console/profile", operation_id, "get_profile", clean_phone, "success", time.time() - start)
                 return {
                     "status": "success",
                     "full_name": full_name,
@@ -578,13 +847,21 @@ async def api_console_get_profile(phone: str):
                     "phone": me.phone or clean_phone,
                     "profile_pic": photo_uri,
                     "dc_id": f"DC {server_dc}",
-                    "proxy": proxy_string,
-                    "restricted": "Restricted (SpamBlock Alert)" if is_restricted else "Good Health (Clear)",
+                    "proxy": proxy_info,
+                    "restricted": "Restricted" if is_restricted else "Good Health",
                     "restriction_details": str(restriction_reason) if is_restricted else "No active violations found."
                 }
-            return {"status": "error", "reason": "User block mismatch."}
+            _audit_log("/api/console/profile", operation_id, "get_profile", clean_phone, "error_user_mismatch", time.time() - start)
+            raise HTTPException(status_code=400, detail="User block mismatch")
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/profile", operation_id, "get_profile", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/profile", operation_id, "get_profile", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Failed to get profile for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 
 # =====================================================================
@@ -592,14 +869,19 @@ async def api_console_get_profile(phone: str):
 # =====================================================================
 @console_router.get("/api/console/health/{phone}")
 async def api_console_health_metrics(phone: str):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database uninitialized."}
+    if not _db:
+        _audit_log("/api/console/health", operation_id, "health_check", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
     
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    clean_phone = validate_phone(phone)
     record = _db.get_session_by_phone(clean_phone)
-    if not record: return {"status": "error", "reason": "Session missing."}
-
-    # Extract dynamic health variables mapped from adder.py & dmsender.py interactions
+    if not record:
+        _audit_log("/api/console/health", operation_id, "health_check", clean_phone, "error_session_missing", time.time() - start)
+        raise HTTPException(status_code=404, detail="Session not found")
+    
     status = record.get("status", "unknown")
     err_log = record.get("revocation_reason") or record.get("last_error") or "No active violations found."
     
@@ -607,6 +889,7 @@ async def api_console_health_metrics(phone: str):
     if status in ["failed", "restricted", "banned"]:
         health_details = f"Account restricted: {err_log}"
     
+    _audit_log("/api/console/health", operation_id, "health_check", clean_phone, "success", time.time() - start)
     return {
         "status": "success",
         "health_score": 100 if status == "active" else (0 if status == "revoked" else 50),
@@ -617,14 +900,23 @@ async def api_console_health_metrics(phone: str):
     
     
 @console_router.get("/api/console/global-search/{phone}")
-async def api_console_global_search(phone: str, q: str):
+async def api_console_global_search(
+    phone: str, 
+    q: str = Query(..., min_length=1, max_length=256),
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/global-search", operation_id, "global_search", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            result = await client(SearchRequest(q=q, limit=10))
+            result = await client(SearchRequest(q=q, limit=limit + offset))
             search_results = []
             
             for user in result.users:
@@ -645,19 +937,41 @@ async def api_console_global_search(phone: str, q: str):
                     "type": chat_type,
                     "description": f"{getattr(chat, 'participants_count', 0)} Members" if hasattr(chat, 'participants_count') else "Global Channel"
                 })
-            return {"status": "success", "results": search_results}
+            
+            paginated = search_results[offset:offset + limit]
+            _audit_log("/api/console/global-search", operation_id, "global_search", clean_phone, "success", time.time() - start)
+            return {"status": "success", "results": paginated, "total": len(search_results), "limit": limit, "offset": offset}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/global-search", operation_id, "global_search", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Global search engine fault: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/global-search", operation_id, "global_search", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Global search failed for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 # =====================================================================
 # 🏢 CHAT INFO & MEDIA EXPLORER
 # =====================================================================
+# =====================================================================
+# 🏢 CHAT INFO & MEDIA EXPLORER
+# =====================================================================
 @console_router.get("/api/console/chat-info/{phone}/{chat_id}")
-async def api_console_chat_info(phone: str, chat_id: str):
+async def api_console_chat_info(
+    phone: str, 
+    chat_id: str,
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/chat-info", operation_id, "chat_info", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
+    chat_id = validate_chat_id(chat_id)
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
@@ -669,14 +983,15 @@ async def api_console_chat_info(phone: str, chat_id: str):
             invite_link = f"t.me/{entity.username}" if getattr(entity, 'username', None) else "Private Link Space"
             member_count = 0
             photo_b64 = None
-            stats = {} # 🔥 FIX: Initialized to prevent UnboundLocalError
+            stats = {}
             
             try:
                 p_buffer = io.BytesIO()
                 await client.download_profile_photo(entity, file=p_buffer)
                 if p_buffer.getvalue():
                     photo_b64 = f"data:image/jpeg;base64,{base64.b64encode(p_buffer.getvalue()).decode('utf-8')}"
-            except Exception: pass
+            except Exception:
+                pass
             
             if not is_user:
                 if isinstance(entity, Channel):
@@ -703,8 +1018,7 @@ async def api_console_chat_info(phone: str, chat_id: str):
             members_list = []
             if not is_user:
                 try:
-                    # 🔥 FIX: Forced limit to prevent 502 Proxy Timeout
-                    async for p in client.iter_participants(entity, limit=100):
+                    async for p in client.iter_participants(entity, limit=limit + offset):
                         role = "member"
                         if isinstance(p.participant, ChannelParticipantCreator): role = "owner"
                         elif isinstance(p.participant, ChannelParticipantAdmin): role = "admin"
@@ -722,7 +1036,10 @@ async def api_console_chat_info(phone: str, chat_id: str):
                         })
                 except Exception as e:
                     logger.debug(f"Iter participants safe-catch: {e}")
-                    
+            
+            paginated_members = members_list[offset:offset + limit]
+            
+            _audit_log("/api/console/chat-info", operation_id, "chat_info", clean_phone, "success", time.time() - start)
             return {
                 "status": "success",
                 "info": {
@@ -740,79 +1057,182 @@ async def api_console_chat_info(phone: str, chat_id: str):
                 "link": invite_link,
                 "photo": photo_b64,
                 "stats": stats,
-                "members": members_list
+                "members": paginated_members,
+                "total_members": len(members_list),
+                "limit": limit,
+                "offset": offset,
             }
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/chat-info", operation_id, "chat_info", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Chat info engine exception: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/chat-info", operation_id, "chat_info", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Chat info failed for %s/%s", clean_phone, chat_id)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
+
 
 @console_router.get("/api/console/chat-members/{phone}/{chat_id}")
-async def api_console_chat_members(phone: str, chat_id: str):
-    info = await api_console_chat_info(phone, chat_id)
-    if info.get("status") != "success":
-        return info
-    members = []
-    for member in info.get("members", []):
-        members.append({
-            "id": member.get("id"),
-            "first_name": member.get("name", "User"),
-            "last_name": "",
-            "username": member.get("username", ""),
-            "role": member.get("role", "member"),
-            "status": member.get("status", "")
-        })
-    return {"status": "success", "members": members}
+async def api_console_chat_members(
+    phone: str, 
+    chat_id: str,
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
+    global _db
+    if not _db:
+        _audit_log("/api/console/chat-members", operation_id, "chat_members", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
+    chat_id = validate_chat_id(chat_id)
+    
+    try:
+        async with managed_web_session(clean_phone) as (client, _):
+            target_entity = parse_chat_id(chat_id)
+            entity = await client.get_entity(target_entity)
+            is_user = hasattr(entity, 'first_name')
+            
+            members_list = []
+            if not is_user:
+                try:
+                    async for p in client.iter_participants(entity, limit=limit + offset):
+                        role = "member"
+                        if isinstance(p.participant, ChannelParticipantCreator): role = "owner"
+                        elif isinstance(p.participant, ChannelParticipantAdmin): role = "admin"
+                        
+                        status_str = "last seen recently"
+                        if p.status and "UserStatusOnline" in type(p.status).__name__:
+                            status_str = "online"
+                            
+                        members_list.append({
+                            "id": str(p.id),
+                            "name": f"{getattr(p, 'first_name', '')} {getattr(p, 'last_name', '')}".strip() or 'Telegram User',
+                            "username": p.username or "",
+                            "role": role,
+                            "status": status_str
+                        })
+                except Exception as e:
+                    logger.debug(f"Iter participants safe-catch: {e}")
+            
+            paginated = members_list[offset:offset + limit]
+            _audit_log("/api/console/chat-members", operation_id, "chat_members", clean_phone, "success", time.time() - start)
+            return {"status": "success", "members": paginated, "total": len(members_list), "limit": limit, "offset": offset}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/chat-members", operation_id, "chat_members", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        _audit_log("/api/console/chat-members", operation_id, "chat_members", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Chat members failed for %s/%s", clean_phone, chat_id)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 
 @console_router.get("/api/console/ping/{phone}")
 async def api_console_ping(phone: str):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
     if not _db:
-        return {"status": "error", "reason": "Database uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+        _audit_log("/api/console/ping", operation_id, "ping", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
     try:
         async with managed_web_session(clean_phone) as (client, _):
             if client.is_connected() and await client.is_user_authorized():
+                _audit_log("/api/console/ping", operation_id, "ping", clean_phone, "success", time.time() - start)
                 return {"status": "success", "connected": True}
+            _audit_log("/api/console/ping", operation_id, "ping", clean_phone, "error_not_connected", time.time() - start)
             return {"status": "error", "reason": "Not connected"}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/ping", operation_id, "ping", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/ping", operation_id, "ping", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Ping failed for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 
 @console_router.get("/api/console/analytics/{phone}")
 async def api_console_analytics(phone: str):
-    profile = await api_console_get_profile(phone)
-    health = await api_console_health_metrics(phone)
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
+    if not _db:
+        _audit_log("/api/console/analytics", operation_id, "analytics", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
     
-    # Fetch all sessions (await the async method)
+    clean_phone = validate_phone(phone)
+    record = _db.get_session_by_phone(clean_phone)
+    if not record:
+        _audit_log("/api/console/analytics", operation_id, "analytics", clean_phone, "error_session_missing", time.time() - start)
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Fetch all sessions
     all_sessions = await _db.get_all_suite_sessions() if _db else []
     total_sessions = len(all_sessions)
     active_sessions = len([a for a in all_sessions if a.get("status") == "active"])
     
+    status = record.get("status", "unknown")
+    err_log = record.get("revocation_reason") or record.get("last_error") or "No active violations found."
+    health_details = "All systems operational"
+    if status in ["failed", "restricted", "banned"]:
+        health_details = f"Account restricted: {err_log}"
+    
+    profile_data = {
+        "full_name": record.get("first_name", "Unknown"),
+        "username": record.get("username", "No Username"),
+        "phone": clean_phone,
+        "dc_id": record.get("dc_id", "Unknown"),
+        "restricted": "Restricted" if status in ["failed", "restricted", "banned"] else "Good Health",
+    }
+    
+    _audit_log("/api/console/analytics", operation_id, "analytics", clean_phone, "success", time.time() - start)
     return {
         "status": "success",
         "total_sessions": total_sessions,
         "active_sessions": active_sessions,
-        "profile": profile if profile.get("status") == "success" else {},
-        "health": health if health.get("status") == "success" else {}
+        "profile": profile_data,
+        "health": {
+            "status": "success",
+            "health_score": 100 if status == "active" else (0 if status == "revoked" else 50),
+            "details": health_details,
+            "flood_history": 0,
+            "total_added": record.get("account_sequence_index", 0)
+        }
     }
 
 
 @console_router.get("/api/console/chat-media/{phone}/{chat_id}")
-async def api_console_chat_media(phone: str, chat_id: str, media_type: str):
+async def api_console_chat_media(
+    phone: str, 
+    chat_id: str, 
+    media_type: str = Query(..., pattern="^(photos|files|voices|links)$"),
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/chat-media", operation_id, "chat_media", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
+    chat_id = validate_chat_id(chat_id)
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
             target_entity = parse_chat_id(chat_id)
             resolved_peer = await client.get_entity(target_entity)
-            messages = await client.get_messages(resolved_peer, limit=80)
+            messages = await client.get_messages(resolved_peer, limit=limit + offset)
             extracted_items = []
             
-            for msg in messages:
+            for msg in messages[offset:offset + limit]:
                 if media_type == "links" and msg.message:
                     urls = re.findall(r'(https?://[^\s]+)', msg.message)
                     for url in urls:
@@ -857,36 +1277,60 @@ async def api_console_chat_media(phone: str, chat_id: str, media_type: str):
                         ist_date = msg.date + datetime.timedelta(hours=5, minutes=30)
                         extracted_items.append({
                             "id": msg.id,
-                            "date": ist_date.strftime("%d %b %H:%M"),  # 🔥 FIX: Converted to IST
+                            "date": ist_date.strftime("%d %b %H:%M"),
                             "duration": "Voice Note Clip"
                         })
-            return {"status": "success", "media_type": media_type, "items": extracted_items}
+            _audit_log("/api/console/chat-media", operation_id, "chat_media", clean_phone, "success", time.time() - start)
+            return {"status": "success", "media_type": media_type, "items": extracted_items, "limit": limit, "offset": offset}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/chat-media", operation_id, "chat_media", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Shared media lookup processing dropout: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/chat-media", operation_id, "chat_media", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Chat media failed for %s/%s", clean_phone, chat_id)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
 
 # =====================================================================
 # 🛠️ ACTIONS (Join, Route, Forward, Delete)
 # =====================================================================
 @console_router.post("/api/console/join-chat")
 async def api_console_join_chat(req: JoinActionRequest):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error"}
-    clean_phone = req.phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/join-chat", operation_id, "join_chat", req.phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = req.phone  # Already validated by Pydantic
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
             target = parse_chat_id(req.chat_id)
             await client(JoinChannelRequest(target))
-            return {"status": "success", "message": "Successfully joined the network node!"}
+            _audit_log("/api/console/join-chat", operation_id, "join_chat", clean_phone, "success", time.time() - start)
+            return {"status": "success", "message": "Successfully joined the chat"}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/join-chat", operation_id, "join_chat", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/join-chat", operation_id, "join_chat", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Join chat failed for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
+
 
 @console_router.post("/api/console/smart-route")
 async def api_console_smart_route(req: SmartRouteRequest):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database reference pointer uninitialized."}
-    clean_phone = req.phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/smart-route", operation_id, "smart_route", req.phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = req.phone  # Already validated by Pydantic
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
@@ -943,23 +1387,37 @@ async def api_console_smart_route(req: SmartRouteRequest):
                         logger.error(f"Smart route fallback failed: {e}")
                         
             if chat_id:
+                _audit_log("/api/console/smart-route", operation_id, "smart_route", clean_phone, "success", time.time() - start)
                 return {
                     "status": "success",
                     "chat_id": chat_id,
                     "title": title,
-                    "message": "Successfully routed to target destination node."
+                    "message": "Successfully routed to target destination."
                 }
             else:
-                return {"status": "error", "reason": "Could not resolve structural identity path."}
+                _audit_log("/api/console/smart-route", operation_id, "smart_route", clean_phone, "error_not_resolved", time.time() - start, "VALIDATION_ERROR")
+                raise HTTPException(status_code=400, detail="Could not resolve target chat")
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/smart-route", operation_id, "smart_route", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Smart Routing Bridge Error: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/smart-route", operation_id, "smart_route", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Smart route failed for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
+
 
 @console_router.get("/api/console/chat-photo/{phone}/{chat_id}")
 async def api_console_chat_photo(phone: str, chat_id: str):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: return {"status": "error", "reason": "Database uninitialized."}
-    clean_phone = phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/chat-photo", operation_id, "chat_photo", phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = validate_phone(phone)
+    chat_id = validate_chat_id(chat_id)
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
@@ -969,37 +1427,105 @@ async def api_console_chat_photo(phone: str, chat_id: str):
             await client.download_profile_photo(entity, file=photo_buffer, download_big=False)
             if photo_buffer.getvalue():
                 photo_b64 = base64.b64encode(photo_buffer.getvalue()).decode('utf-8')
+                _audit_log("/api/console/chat-photo", operation_id, "chat_photo", clean_phone, "success", time.time() - start)
                 return {"status": "success", "photo": f"data:image/jpeg;base64,{photo_b64}"}
+            _audit_log("/api/console/chat-photo", operation_id, "chat_photo", clean_phone, "success_no_photo", time.time() - start)
             return {"status": "success", "photo": None}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/chat-photo", operation_id, "chat_photo", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.debug(f"Silent avatar fetch bypass for {chat_id}: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/chat-photo", operation_id, "chat_photo", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Chat photo failed for %s/%s", clean_phone, chat_id)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
+
 
 @console_router.post("/api/console/forward")
 async def api_console_forward_message(req: ForwardMessageRequest):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: raise HTTPException(status_code=500, detail="Database uninitialized.")
-    clean_phone = req.phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/forward", operation_id, "forward_message", req.phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = req.phone  # Already validated by Pydantic
     try:
         async with managed_web_session(clean_phone) as (client, _):
             from_peer = parse_chat_id(req.from_chat_id)
             to_peer = parse_chat_id(req.to_chat_id)
             await client.forward_messages(to_peer, req.msg_id, from_peer)
-            return {"status": "success", "message": "Message routed successfully to target destination node."}
+            _audit_log("/api/console/forward", operation_id, "forward_message", clean_phone, "success", time.time() - start)
+            return {"status": "success", "message": "Message forwarded successfully"}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/forward", operation_id, "forward_message", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Outbound message forward failure exception: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/forward", operation_id, "forward_message", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Forward message failed for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
+
 
 @console_router.post("/api/console/delete-message")
 async def api_console_delete_message(req: DeleteMessageRequest):
+    operation_id = uuid.uuid4().hex
+    start = time.time()
     global _db
-    if not _db: raise HTTPException(status_code=500, detail="Database uninitialized.")
-    clean_phone = req.phone.replace("+", "").replace(" ", "")
+    if not _db:
+        _audit_log("/api/console/delete-message", operation_id, "delete_message", req.phone, "error_db_uninitialized", time.time() - start)
+        raise HTTPException(status_code=503, detail="Database uninitialized")
+    clean_phone = req.phone  # Already validated by Pydantic
     try:
         async with managed_web_session(clean_phone) as (client, _):
             target_peer = parse_chat_id(req.chat_id)
             await client.delete_messages(target_peer, [req.msg_id], revoke=req.delete_for_everyone)
-            return {"status": "success", "message": "Message successfully erased from Telegram matrix coordinates."}
+            _audit_log("/api/console/delete-message", operation_id, "delete_message", clean_phone, "success", time.time() - start)
+            return {"status": "success", "message": "Message deleted successfully"}
+    except HTTPException:
+        raise
+    except PermissionError as e:
+        _audit_log("/api/console/delete-message", operation_id, "delete_message", clean_phone, "error_session_unavailable", time.time() - start, "SESSION_UNAVAILABLE")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
-        logger.error(f"Message erasing protocol breakdown: {e}")
-        return {"status": "error", "reason": str(e)}
+        _audit_log("/api/console/delete-message", operation_id, "delete_message", clean_phone, "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
+        logger.exception("Delete message failed for %s", clean_phone)
+        raise HTTPException(status_code=500, detail=sanitize_error_message(e))
+
+
+# =====================================================================
+# 📊 OPERATION STATUS ENDPOINT
+# =====================================================================
+@console_router.get("/api/console/operations/{operation_id}")
+async def api_console_operation_status(operation_id: str):
+    """Get status of a background operation."""
+    op = get_operation_status(operation_id)
+    if not op:
+        raise HTTPException(status_code=404, detail="Operation not found")
+    return op
+
+
+# =====================================================================
+# 🛡️ SECURITY HEADERS MIDDLEWARE
+# =====================================================================
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses."""
+    
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+
+# Export for app initialization
+def get_console_router():
+    """Return the console router with security middleware applied."""
+    return console_router

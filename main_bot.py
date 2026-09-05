@@ -141,23 +141,6 @@ class AuthState:
 
 
 @dataclass
-class ClientPoolEntry:
-    """Wraps a Telethon client with metadata for pool management."""
-    client: TelegramClient
-    phone: str
-    created_at: float
-    last_used: float
-    device_fingerprint: str
-
-    @property
-    def age_seconds(self) -> float:
-        return time.time() - self.created_at
-
-    @property
-    def idle_seconds(self) -> float:
-        return time.time() - self.last_used
-
-
 # ──────────────────────────────────────────────
 # MODIFICATION in GlobalState.initialize()
 # ──────────────────────────────────────────────
@@ -174,7 +157,6 @@ class GlobalState:
         if self._initialized:
             return
         self._lock = asyncio.Lock()
-        self._pool_lock = asyncio.Lock()
         self._auth_lock = asyncio.Lock()
         self._nav_lock = asyncio.Lock()
 
@@ -265,14 +247,11 @@ class GlobalState:
             return state
 
     async def set_auth_state(self, phone_key: str, state: AuthState) -> None:
+        # Auth states hold a NON-OWNING reference to a login client: the
+        # SessionManager owns the client and its proxy lease. GlobalState never
+        # disconnects clients directly — SessionManager's release_login()/release
+        # paths do that, keeping counts and leases coherent.
         async with self._auth_lock:
-            # Disconnect any old client before overwriting
-            old = self.auth_states.get(phone_key)
-            if old and old.client is not state.client:
-                try:
-                    await old.client.disconnect()
-                except Exception:
-                    pass
             self.auth_states[phone_key] = state
 
     async def pop_auth_state(self, phone_key: str) -> Optional[AuthState]:
@@ -280,15 +259,21 @@ class GlobalState:
             return self.auth_states.pop(phone_key, None)
 
     async def cleanup_stale_auth_states(self) -> int:
+        # Remove expired login states. A stale entry means the login was never
+        # completed, so the login reservation (and its client + proxy lease) is
+        # still owned by SessionManager under the "login:<phone>" owner key.
+        # Release it through the public API so cleanup stays coherent; the
+        # client is never disconnected directly from here.
         async with self._auth_lock:
             stale = [k for k, v in self.auth_states.items() if v.is_expired()]
             for k in stale:
-                state = self.auth_states.pop(k)
-                try:
-                    await state.client.disconnect()
-                except Exception:
-                    pass
-            return len(stale)
+                self.auth_states.pop(k, None)
+        for key in stale:
+            try:
+                await session_manager.release_login(key, f"login:{key}")
+            except Exception:
+                pass
+        return len(stale)
 
     # ── Health Check ──
     async def is_health_check_active(self) -> bool:
@@ -472,94 +457,37 @@ async def build_premium_status_bar(all_sessions: list) -> str:
 # CLIENT FACTORY (delegates to SessionManager)
 # ──────────────────────────────────────────────
 # All TelegramClient creation now routes through SessionManager.acquire().
-# The functions below are thin backward-compatible wrappers.
-
-def create_authenticated_client(record: dict) -> TelegramClient:
-    """
-    DEPRECATED — all client creation now goes through SessionManager.
-    This function is kept for API compatibility but delegates to SessionManager's
-    internal factory.  Do NOT create TelegramClient here.
-    """
-    session_str = safe_session_str(record)
-    if not session_str:
-        return None
-    device = get_device_profile(record)
-    api_id = int(record.get("api_id", CONFIG["API_ID"]))
-    api_hash = str(record.get("api_hash", CONFIG["API_HASH"]))
-    return session_manager._create_client(
-        session_str=session_str,
-        api_id=api_id,
-        api_hash=api_hash,
-        device=device,
-        proxy=record.get("proxy"),
-    )
-
-
-async def connect_client(client: TelegramClient, retries: int = 1) -> bool:
-    """Connect a client with retries. BLAZING FAST FAIL."""
-    for attempt in range(retries):
-        try:
-            if not client.is_connected():
-                await asyncio.wait_for(client.connect(), timeout=10.0)
-            return True
-        except Exception as e:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            if attempt == retries - 1:
-                logger.warning(f"Failed to connect client after {retries} attempts: {e}")
-                return False
-            await asyncio.sleep(0.5)
-
+# The function below is the ONLY route to a runtime user-session client.
 
 @asynccontextmanager
-async def managed_client(record: dict, use_pool: bool = True):
+async def managed_client(record: dict):
     """
     Context manager for Telethon client lifecycle.
 
-    DELEGATES to SessionManager.acquire() — the single source of truth
-    for all TelegramClient creation.  No direct TelegramClient(...) calls
-    are made here or anywhere else.
+    DELEGATES to SessionManager.acquire() — the single source of truth for all
+    TelegramClient creation, ownership, proxy lease and release. No direct
+    TelegramClient(...) calls are made here or anywhere else.
+
+    Every managed client, including auditor/recovery health checks, uses the
+    controlled network route: a proxy lease is acquired and released through
+    SessionManager's ProxyLeaseManager, and runtime ownership is enforced by
+    acquire(). A health check NEVER connects a direct-IP user session that
+    could overlap an actively owned account. If the proxy pool is exhausted the
+    lease is not obtained and the operation is skipped (never a direct
+    fallback). Use auto_release=True so SessionManager performs the single,
+    canonical release/disconnect on exit.
     """
     phone = normalize_phone(str(record.get("phone", "")))
-    module = "managed_client" if use_pool else "managed_client_nopool"
-
-    # 🔥 For non-pool (auditor/cleanup) clients: skip proxy leasing entirely.
-    # The auditor connects directly — leasing proxies for audits wastes
-    # the entire pool and causes timeouts for actual workers.
-    _no_proxy = (lambda p: None) if not use_pool else None
 
     async with session_manager.acquire(
         phone,
-        module=module,
-        proxy_provider=_no_proxy,
-        auto_release=False,
+        module="managed_client",
+        worker_id="managed_client",
+        auto_release=True,
     ) as lease:
         if not lease:
             raise ConnectionError(f"No eligible session for {phone}")
-
-        client = lease.client
-        try:
-            if not client.is_connected():
-                if not await connect_client(client):
-                    raise ConnectionError("Connect failed")
-
-            yield client
-        finally:
-            # Release proxy lease if one was acquired
-            if lease and lease.proxy_url and session_manager.proxy_lease_manager:
-                await session_manager.proxy_lease_manager.release_proxy(
-                    proxy_url=lease.proxy_url, phone=phone
-                )
-            # Release session lease through the public interface
-            await session_manager.release_lease(lease)
-            # Disconnect if not pooling
-            if not use_pool:
-                try:
-                    await asyncio.wait_for(client.disconnect(), timeout=3.0)
-                except Exception:
-                    pass
+        yield lease.client
 
 
 # ──────────────────────────────────────────────
@@ -595,14 +523,30 @@ async def fetch_past_otps(client: TelegramClient, phone_key: str) -> None:
 
 
 # ──────────────────────────────────────────────
-# SHARED LOGIN PROCESS (STRICT PROXY ROTATION)
+# SHARED LOGIN PROCESS (LEASE-OWNED PROXY ROTATION)
 # ──────────────────────────────────────────────
 
-async def shared_login_process(phone: str) -> dict:
+def _login_proxy_label(client: TelegramClient) -> str:
+    """Human label for the proxy lease currently used by a login client."""
+    try:
+        conn = getattr(client, "_connection", None)
+        proxy = getattr(conn, "_proxy", None)
+        if not proxy:
+            return "Lease-managed (resolved)"
+        host = proxy.get("addr") or proxy.get("host") or getattr(proxy, "addr", None)
+        port = proxy.get("port") or getattr(proxy, "port", None)
+        return f"{host}:{port}" if host else "Lease-managed (resolved)"
+    except Exception:
+        return "Lease-managed (resolved)"
+
+
+async def shared_login_process(phone: str, login_owner: str) -> dict:
     """
-    Send login code request strictly through proxy.
-    Rotates through multiple healthy proxies if one fails.
-    No direct internet fallback to protect IP.
+    Send the login code request strictly through a SessionManager-owned proxy
+    lease (ProxyLeaseManager). Rotates through multiple healthy proxy leases if
+    one fails. Never falls back to a direct-IP connection, and never constructs
+    or owns a client outside SessionManager: each attempt is a public
+    build_login_client() under the caller's existing login reservation.
     """
     clean_phone = normalize_phone(phone)
     existing = db.get_session_by_phone(clean_phone)
@@ -611,52 +555,46 @@ async def shared_login_process(phone: str) -> dict:
         random.choice(DEVICE_PROFILES) if DEVICE_PROFILES else {}
     )
 
-    string_session = StringSession()
-    
-    max_attempts = 4  # 🔥 System 4 alag-alag proxies try karega
+    max_attempts = 4
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
-        proxy_node = None
-        raw_proxy = None
-        
-        # 1. Naye ProxyManager se properly proxy fetch karein
-        raw_proxy = proxy_manager.get_proxy()
-                
-        # 2. Fallback: Agar working proxy na ho toh list se random proxy uthayein
-        if not raw_proxy and proxy_manager.proxies:
-            raw_proxy = random.choice(proxy_manager.proxies)
-            
-        if raw_proxy:
-            proxy_node = {
-                "proxy_type": raw_proxy.get("type", "socks5"),
-                "addr": raw_proxy.get("host"),
-                "port": raw_proxy.get("port"),
-                "username": raw_proxy.get("username") or None,
-                "password": raw_proxy.get("password") or None,
-                "rdns": True
-            }
-
-        client = session_manager._create_client(
-            session_str=string_session.save(),
+        # build_login_client acquires a ProxyLeaseManager lease when proxy=None
+        # and registers the client under the login reservation.
+        client = await session_manager.build_login_client(
+            clean_phone,
+            login_owner,
+            session_str=StringSession().save(),
             api_id=CONFIG["API_ID"],
             api_hash=CONFIG["API_HASH"],
             device=device,
-            proxy=proxy_node,
+            proxy=None,
         )
+
+        if client is None:
+            last_error = RuntimeError("No proxy lease available / login client build failed")
+            await session_manager.release_login(clean_phone, login_owner)
+            if not await session_manager.reserve_login(clean_phone, login_owner):
+                raise Exception("Login reservation lost — phone is owned by another module. Try again later.")
+            continue
 
         try:
             async def _proxy_req():
-                await client.connect()
-                return await client.send_code_request(phone)
-                
-            send_code_result = await asyncio.wait_for(_proxy_req(), timeout=20.0)
+                if not client.is_connected():
+                    await asyncio.wait_for(client.connect(), timeout=20.0)
+                return await asyncio.wait_for(client.send_code_request(phone), timeout=20.0)
+
+            send_code_result = await _proxy_req()
             code_hash = send_code_result.phone_code_hash
 
-            db.save_pending_session(clean_phone, string_session.save(), AccountStatus.PENDING, code_hash, device)
-            
-            proxy_label = f"{raw_proxy.get('host') or raw_proxy.get('addr')}:{raw_proxy.get('port')}" if raw_proxy else "Direct / None"
-            
+            db.save_pending_session(
+                clean_phone,
+                client.session.save(),
+                AccountStatus.PENDING,
+                code_hash,
+                device,
+            )
+
             return {
                 "status": "code_sent",
                 "phone": phone,
@@ -664,21 +602,17 @@ async def shared_login_process(phone: str) -> dict:
                 "code_hash": code_hash,
                 "device": device,
                 "client": client,
-                "proxy_used": proxy_label,
+                "proxy_used": _login_proxy_label(client),
             }
         except Exception as e:
             last_error = e
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            
-            # 🔥 PUNISH DEAD PROXY: Naye architecture ke method ko call karein
-            if raw_proxy:
-                proxy_manager.mark_failed(raw_proxy)
-                
-            logger.warning(f"Proxy attempt {attempt}/{max_attempts} failed ({proxy_node.get('addr') if proxy_node else 'None'}). Rotating to next proxy...")
-            continue  
+            # Release the failed lease so the next attempt can pull a fresh proxy.
+            await session_manager.release_login(clean_phone, login_owner)
+            if attempt < max_attempts:
+                if not await session_manager.reserve_login(clean_phone, login_owner):
+                    raise Exception("Login reservation lost during proxy rotation — phone is owned by another module. Try again later.")
+            logger.warning(f"Login proxy attempt {attempt}/{max_attempts} failed. Rotating to next proxy lease...")
+            continue
 
     logger.error(f"Strict Proxy Policy: Exhausted all {max_attempts} attempts. Last error: {str(last_error)}")
     raise Exception(f"Proxy Connection Failed! 🛑 System ne {max_attempts} alag-alag proxies try kiye par sabne connection drop kar diya. Real IP secure rakha gaya hai.")
@@ -1129,7 +1063,7 @@ async def centralized_ui_router(event) -> None:
                     still_restricted += 1
                     return
                 try:
-                    async with managed_client(acc, use_pool=False) as client:
+                    async with managed_client(acc) as client:
                         if await client.is_user_authorized():
                             await client.get_me()
                             await client.send_message("SpamBot", "/start")
@@ -1328,23 +1262,21 @@ async def login_handler(event) -> None:
         return
 
     try:
-        login_result = await shared_login_process(phone)
+        # shared_login_process routes through build_login_client(), so the
+        # client is already registered on the reservation by SessionManager.
+        login_result = await shared_login_process(phone, login_owner)
         client = login_result["client"]
         device = login_result["device"]
         code_hash = login_result["code_hash"]
-        proxy_used = login_result.get("proxy_used", "Direct / None")  # 🔥 Extract proxy info
+        proxy_used = login_result.get("proxy_used", "Lease-managed (resolved)")
 
-        # Attach the login client to the reservation (same client reused across OTP/2FA)
+        # Move the reservation to OTP_WAITING (same client reused across OTP/2FA)
         await session_manager.set_login_stage(
             db_clean_phone, login_owner, SessionLifecycleState.OTP_WAITING
         )
-        async with session_manager._lock:
-            info = session_manager._sessions.get(db_clean_phone)
-            if info and info.owner == login_owner:
-                info.client = client
-                info.last_error = None
 
-        # Store auth state with TTL
+        # Store auth state with TTL (NON-OWNING reference; SessionManager owns
+        # the client, its proxy lease and its counts.)
         await GLOBAL.set_auth_state(db_clean_phone, AuthState(
             client=client,
             phone_code_hash=code_hash,
@@ -1411,18 +1343,20 @@ async def verify_handler(event) -> None:
             await event.reply("❌ **Error:** No active login state found for this phone. Run `/login` first.")
             return
         device = get_device_profile(record)
-        client = session_manager._create_client(
+        client = await session_manager.build_login_client(
+            db_clean_phone,
+            login_owner,
             session_str=safe_session_str(record),
             api_id=CONFIG["API_ID"],
             api_hash=CONFIG["API_HASH"],
             device=device,
             proxy=record.get("proxy"),
         )
-        async with session_manager._lock:
-            info = session_manager._sessions.get(db_clean_phone)
-            if info and info.owner == login_owner:
-                info.client = client
-        await client.connect()
+        if client is None:
+            await session_manager.release_login(db_clean_phone, login_owner)
+            await event.reply("❌ **Error:** Phone is no longer reserved for login. Run `/login` fresh.")
+            return
+        await asyncio.wait_for(client.connect(), timeout=20.0)
         phone_code_hash = record.get("phone_code_hash")
 
     try:
@@ -1490,30 +1424,33 @@ async def verify_2fa_handler(event) -> None:
             await event.reply("❌ **Error:** No session data located for this index.")
             return
         device = get_device_profile(record)
-        client = session_manager._create_client(
+        client = await session_manager.build_login_client(
+            db_clean_phone,
+            login_owner,
             session_str=safe_session_str(record),
             api_id=CONFIG["API_ID"],
             api_hash=CONFIG["API_HASH"],
             device=device,
             proxy=record.get("proxy"),
         )
-        async with session_manager._lock:
-            info = session_manager._sessions.get(db_clean_phone)
-            if info and info.owner == login_owner:
-                info.client = client
-        await client.connect()
+        if client is None:
+            await session_manager.release_login(db_clean_phone, login_owner)
+            await event.reply("❌ **Error:** Phone is no longer reserved for login. Run `/login` fresh.")
+            return
+        await asyncio.wait_for(client.connect(), timeout=20.0)
 
     try:
         await client.sign_in(password=password)
         final_session_str = client.session.save()
 
-        # 🔥 FIX: Use save_authorized_session only (it handles status correctly)
+        # 2FA password is intentionally NOT persisted — no plaintext secret
+        # written to logs or the database.
         db.save_authorized_session(
             db_clean_phone,
             final_session_str,
             AccountStatus.ACTIVE,      # enum – database.py handles .value
             device,
-            two_fa_password=password
+            two_fa_password=None
         )
 
         # OTP setup
@@ -1522,19 +1459,14 @@ async def verify_2fa_handler(event) -> None:
 
         await GLOBAL.pop_auth_state(db_clean_phone)
         await session_manager.release_login(db_clean_phone, login_owner)
-        await event.reply(f"🎉 **2FA Bypass Complete & Password Saved!**\n`{clean_phone_with_plus}` status elevated to `active` inside DB 1.")
+        await event.reply(f"🎉 **2FA Bypass Complete!**\n`{clean_phone_with_plus}` status elevated to `active` inside DB 1.")
 
     except Exception as e:
         await event.reply(f"❌ **2FA Submission Rejected:** `{str(e)}`")
+        # Clean up the login reservation, in-memory login client and proxy lease
+        # through the public SessionManager API.
+        await GLOBAL.pop_auth_state(db_clean_phone)
         await session_manager.release_login(db_clean_phone, login_owner)
-    finally:
-        active_state = await GLOBAL.get_auth_state(db_clean_phone)
-        if not active_state:
-            await session_manager.release_login(db_clean_phone, login_owner)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
 
 
 # ──────────────────────────────────────────────
@@ -1688,7 +1620,7 @@ async def terminate_manual_login(event) -> None:
 
     clean_phone = normalize_phone(phone)
 
-    async with managed_client(matched_acc, use_pool=False) as client:
+    async with managed_client(matched_acc) as client:
         try:
             await client.log_out()
         except Exception:
@@ -1844,7 +1776,7 @@ async def global_health_scan_router(event) -> None:
                 return
 
             try:
-                async with managed_client(acc, use_pool=False) as client:
+                async with managed_client(acc) as client:
                     if not await client.is_user_authorized():
                         raise SessionRevokedError(request=None)
                     me = await client.get_me()
@@ -2059,7 +1991,7 @@ async def direct_contact_csv_scraper(event) -> None:
         return
 
     try:
-        async with managed_client(record, use_pool=True) as client:
+        async with managed_client(record) as client:
             if not await client.is_user_authorized():
                 await status_msg.edit(f"🔴 **Session Revoked:** Account `+{db_clean_phone}` access denied.")
                 return
@@ -2124,10 +2056,12 @@ async def run_member_adder_matrix(event) -> None:
         # 2. Send initial status message to get message_id
         status_msg_obj = await bot.send_message(chat_id, "🚀 Initializing Enterprise System...")
 
-        # 3. Fire & Forget background updater task
-        asyncio.create_task(
+        # 3. Background updater task (tracked so it is observable and cancelled
+        #    with the rest of the suite at shutdown)
+        updater_task = asyncio.create_task(
             status_updater_loop(bot, chat_id, status_msg_obj.id, adder_state)
         )
+        GLOBAL.register_task(updater_task)
 
         async def dummy_callback(text):
             pass
@@ -2273,17 +2207,111 @@ async def system_diagnostics_snapshot(event) -> None:
 audit_logger = logging.getLogger("SessionAuditor")
 
 
+def should_start_auditor() -> bool:
+    """Startup gate for the background auditor. Honors AUDITOR_ENABLED."""
+    return bool(CONFIG.get("AUDITOR_ENABLED", True))
+
+
+def should_start_recovery() -> bool:
+    """Startup gate for the auto-recovery loop. Honors ENABLE_AUTO_RECOVERY."""
+    return bool(CONFIG.get("ENABLE_AUTO_RECOVERY", True))
+
+
+def _normalize_check_time(account_doc: dict) -> float:
+    """Epoch used for LRU ordering. Missing/invalid values sort to the front."""
+    val = account_doc.get("last_checked_time") or account_doc.get("last_updated")
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _auditor_network_capacity() -> int:
+    """
+    Available network capacity for an audit cycle, driven by the proxy lease
+    pool. Fail-safe: if the pool cannot report availability, no audit clients
+    are created this cycle.
+    """
+    try:
+        return int(proxy_lease_manager.get_available_count())
+    except Exception:
+        return 0
+
+
+def _auditor_effective_capacity(
+    eligible_accounts: int,
+    available_network_capacity: int,
+    configured_audit_concurrency: int,
+) -> int:
+    """
+    Bounded audit concurrency: min(eligible accounts, available network
+    capacity, configured concurrency). Returning 0 means the cycle must be
+    skipped WITHOUT creating a Telegram client per account.
+    """
+    if eligible_accounts <= 0:
+        return 0
+    cap = min(
+        eligible_accounts,
+        max(0, available_network_capacity),
+        max(1, configured_audit_concurrency),
+    )
+    return max(0, cap)
+
+
+async def _auditor_run_pass(accounts: list, capacity: int) -> tuple:
+    """
+    Audit a batch with bounded concurrency. Each worker keeps the human-like
+    stagger before acting so Telegram anti-spam is not triggered.
+    Returns (checked, failed, skipped).
+    """
+    checked = failed = skipped = 0
+    if not accounts:
+        return 0, 0, 0
+    if capacity <= 0:
+        # No network capacity: no audit clients are created; every account is
+        # reported as skipped.
+        return 0, 0, len(accounts)
+
+    sem = asyncio.Semaphore(max(1, capacity))
+
+    async def _worker(acc):
+        async with sem:
+            # HUMAN-LIKE DELAY: prevents rapid-fire API requests.
+            await asyncio.sleep(random.uniform(10.0, 20.0))
+            try:
+                ok = await _audit_single_account(acc)
+                return ("ok" if ok else "noop",)
+            except SessionAlreadyOwnedError:
+                return ("busy",)
+            except Exception:
+                return ("failed",)
+
+    for (outcome,) in await asyncio.gather(*(_worker(a) for a in accounts)):
+        if outcome == "ok":
+            checked += 1
+        elif outcome == "busy":
+            skipped += 1
+        elif outcome == "failed":
+            failed += 1
+    return checked, failed, skipped
+
+
 async def continuous_session_auditor() -> None:
     """
     Enterprise-Grade Session Integrity Auditor v2.0
-    Parallel batch processing + LRU prioritization.
-    Handles 10,000+ accounts efficiently.
+    Bounded parallel batch processing + deterministic LRU prioritization.
     """
     await asyncio.sleep(random.randint(30, 90))
     audit_logger.info("🚀 Enterprise Anti-Ban Session Auditor v2.0 (Parallel Batch Mode)")
 
     # ── 🔥 BATCH CONFIGURATION (tunable) ──
-    BATCH_SIZE = CONFIG.get("AUDITOR_BATCH_SIZE", 10)       # Accounts checked in parallel
+    BATCH_SIZE = CONFIG.get("AUDITOR_BATCH_SIZE", 10)       # Accounts processed per batch
     BATCH_STAGGER = CONFIG.get("AUDITOR_BATCH_STAGGER", 15) # Seconds between batches
     MACRO_COOLDOWN_MIN = CONFIG.get("AUDITOR_COOLDOWN_MIN", 1800)  # 30 min
     MACRO_COOLDOWN_MAX = CONFIG.get("AUDITOR_COOLDOWN_MAX", 3600)  # 1 hour
@@ -2300,42 +2328,40 @@ async def continuous_session_auditor() -> None:
                 await asyncio.sleep(random.randint(600, 1200))
                 continue
 
-            # ── 🔥 PRIORITIZATION: Least recently checked first ──
-            # If no last_checked_time, treat as oldest priority (epoch = 0)
-            active_accounts.sort(
-                key=lambda x: (
-                    x.get("last_checked_time") or
-                    x.get("last_updated") or
-                    datetime(1970, 1, 1)
-                )
-            )
+            # ── 🔥 PRIORITIZATION: Least recently checked first (deterministic) ──
+            # No unconditional shuffle: the LRU order is authoritative so the
+            # oldest-checked accounts are always audited first.
+            active_accounts.sort(key=_normalize_check_time)
 
-            random.shuffle(active_accounts)  # Slight randomness within priority tiers
+            # ── 🔥 BOUNDED CAPACITY: min(eligible, network, configured) ──
+            # Never create one Telegram client per DB account just because the
+            # database contains many accounts.
+            capacity = _auditor_effective_capacity(
+                len(active_accounts),
+                _auditor_network_capacity(),
+                int(CONFIG.get("AUDITOR_CONCURRENCY", 2)),
+            )
+            if capacity <= 0:
+                audit_logger.warning(
+                    "Auditor cycle skipped: no network capacity available. "
+                    "No audit clients were created."
+                )
+                await asyncio.sleep(random.randint(600, 1200))
+                continue
 
             accounts_checked = 0
             accounts_failed = 0
-            
-            # ── 🔥 SEQUENTIAL PROCESSING TO PREVENT EVENT LOOP FREEZE ──
+            accounts_skipped = 0
+
+            # ── 🔥 BOUNDED CONCURRENCY WITHIN BATCHES ──
             for i in range(0, len(active_accounts), BATCH_SIZE):
                 if not await GLOBAL.is_health_check_active():
                     break
-                batch = active_accounts[i:i+BATCH_SIZE]
-                results = []
-                for acc in batch:
-                    # 🔥 HUMAN-LIKE DELAY: Randomized sleep between 10 to 20 seconds per account.
-                    # This prevents rapid-fire API requests that trigger Telegram's anti-spam filters.
-                    human_delay = random.uniform(10.0, 20.0)
-                    await asyncio.sleep(human_delay)
-                    
-                    res = await _audit_single_account(acc)
-                    results.append(res)
-
-                for r in results:
-                    if isinstance(r, Exception):
-                        accounts_failed += 1
-                        audit_logger.debug(f"Batch task exception: {r}")
-                    elif r is True:
-                        accounts_checked += 1
+                batch = active_accounts[i:i + BATCH_SIZE]
+                c, f, s = await _auditor_run_pass(batch, capacity)
+                accounts_checked += c
+                accounts_failed += f
+                accounts_skipped += s
 
                 # Stagger between batches (much shorter than per-account)
                 await asyncio.sleep(BATCH_STAGGER)
@@ -2353,7 +2379,8 @@ async def continuous_session_auditor() -> None:
                 audit_logger.debug("GC triggered.")
 
             audit_logger.info(
-                f"🏁 Auditor batch complete: {accounts_checked} ok, {accounts_failed} errors. "
+                f"🏁 Auditor batch complete: {accounts_checked} ok, "
+                f"{accounts_failed} errors, {accounts_skipped} busy/skipped. "
                 f"Next macro cycle in ~{round(MACRO_COOLDOWN_MIN/60, 1)}-{round(MACRO_COOLDOWN_MAX/60, 1)} min."
             )
             await asyncio.sleep(random.uniform(MACRO_COOLDOWN_MIN, MACRO_COOLDOWN_MAX))
@@ -2441,6 +2468,12 @@ async def _audit_single_account(account_doc: dict) -> bool:
         audit_logger.debug(f"🔒 Account +{clean_phone} busy (leased). Skipping audit.")
         return False
 
+    # Skip accounts in a login/OTP/2FA reservation or actively leased via
+    # SessionManager — the auditor must never overlap an owned session.
+    if await session_manager.is_owned(clean_phone):
+        audit_logger.debug(f"🔒 Account +{clean_phone} owned (SessionManager). Skipping audit.")
+        return False
+
     # ── 🔥 LIGHT CACHING: Skip if recently checked successfully ──
     now = time.time()
     last_check = _last_auth_check.get(clean_phone, 0.0)
@@ -2452,7 +2485,7 @@ async def _audit_single_account(account_doc: dict) -> bool:
     is_duplicate = False
 
     try:
-        async with managed_client(account_doc, use_pool=False) as client:
+        async with managed_client(account_doc) as client:
             # Ensure connection first
             if not client.is_connected():
                 try:
@@ -2508,6 +2541,13 @@ async def _audit_single_account(account_doc: dict) -> bool:
         )
         db.set_account_state(clean_phone, AccountStatus.AUTH_KEY_DUPLICATED)
 
+    except SessionAlreadyOwnedError:
+        # The account became owned (worker or login reservation) between the
+        # pre-checks and the acquire. SessionAlreadyOwnedError is a BUSY/skip
+        # condition — it must NEVER escalate into an account failure.
+        audit_logger.debug(f"🔒 Account +{clean_phone} owned at acquire time. Skipping audit (busy).")
+        return True
+
     except (UserDeactivatedError, UserDeactivatedBanError) as e:
         reason_failed = f"Account Terminated: {e}"
     except (asyncio.TimeoutError, OSError, ConnectionError, ssl.SSLError):
@@ -2554,56 +2594,162 @@ async def _audit_single_account(account_doc: dict) -> bool:
                 audit_logger.error(f"Admin notification failed: {send_err}")
         return False
 
-@asynccontextmanager
+_shutdown_done = False
+
+
+async def _cancel_tracked_background_tasks() -> None:
+    """Cancel GLOBAL.background_tasks (status updaters, web updaters) and await."""
+    tasks = [t for t in list(GLOBAL.background_tasks) if not t.done()]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
+
+
+async def _run_with_bounded_restarts(
+    name: str,
+    coro_factory,
+    *,
+    max_restarts: int = 3,
+    base_delay: float = 5.0,
+) -> None:
+    """
+    Run a background service (auditor / recovery) so that an unexpected exit is
+    observable and, when allowed, restarted with bounded exponential backoff.
+    Restarts happen inside this single tracked task — never anonymous
+    fire-and-forget tasks.
+    """
+    attempts = 0
+    while True:
+        try:
+            await coro_factory()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            attempts += 1
+            audit_logger.error(
+                f"{name} background task exited with error: {exc}",
+                exc_info=True,
+            )
+            if attempts > max_restarts:
+                audit_logger.critical(
+                    f"{name} background task hit the restart limit "
+                    f"({max_restarts}); stopping."
+                )
+                return
+            delay = min(base_delay * (2 ** (attempts - 1)), 300.0)
+            audit_logger.warning(
+                f"{name} background task restarting in {delay}s "
+                f"(attempt {attempts}/{max_restarts})."
+            )
+            await asyncio.sleep(delay)
+
+
 async def lifespan(app: FastAPI):
+    global _shutdown_done
+    _shutdown_done = False
 
     # 1. Initialize and start Telethon Bot on Uvicorn's active event loop
-    logger.info("⚡ Starting Telethon Bot on active Uvicorn event loop...")
+    logger.info("Starting Telethon Bot on active Uvicorn event loop...")
     real_bot = bot.initialize(StringSession(), CONFIG["API_ID"], CONFIG["API_HASH"])
     await real_bot.start(bot_token=CONFIG["BOT_TOKEN"])
-    
+
     # 2. Start Proxy Lease Manager and Account Lease Manager
-    logger.info("🚀 Starting ProxyLeaseManager (Auto-Reaper active)...")
+    logger.info("Starting ProxyLeaseManager (Auto-Reaper active)...")
     await proxy_lease_manager.start()
     proxy_manager.start_background_testing()
 
-    logger.info("🚀 Starting AccountLeaseManager (Lease Expiration Reaper active)...")
+    logger.info("Starting AccountLeaseManager (Lease Expiration Reaper active)...")
     await account_lease_manager.start()
 
-    # 3. Register background auditor task
-    auditor_task = asyncio.create_task(continuous_session_auditor())
-    GLOBAL.register_task(auditor_task)
+    # 3. Register background auditor task (gated by AUDITOR_ENABLED). Idle
+    #    startup: the auditor sleeps 30-90s before doing any account work, and
+    #    no user-session clients are created at startup.
+    auditor_task = None
+    if should_start_auditor():
+        auditor_task = asyncio.create_task(
+            _run_with_bounded_restarts("auditor", continuous_session_auditor)
+        )
+        GLOBAL.register_task(auditor_task)
+        logger.info("AUDITOR: enabled - background audit task started.")
+    else:
+        logger.info("AUDITOR: disabled (AUDITOR_ENABLED=false) - no audit task, no auditor workers/session acquisition.")
 
-    # 4. Register auto-recovery loop task
-    recovery_task = asyncio.create_task(auto_health_recovery_loop())
-    GLOBAL.register_task(recovery_task)
+    # 4. Register auto-recovery loop task (gated by ENABLE_AUTO_RECOVERY)
+    recovery_task = None
+    if should_start_recovery():
+        recovery_task = asyncio.create_task(
+            _run_with_bounded_restarts("recovery", auto_health_recovery_loop)
+        )
+        GLOBAL.register_task(recovery_task)
+        logger.info("AUTO_RECOVERY: enabled - background recovery loop started.")
+    else:
+        logger.info("AUTO_RECOVERY: disabled (ENABLE_AUTO_RECOVERY=false) - no recovery loop started.")
 
-    logger.info("🌐 Service, Telegram Bot, Auditor, Recovery Loops, and ProxyLeaseManager are online!")
+    logger.info("Service, Telegram Bot, Auditor, Recovery Loops, and ProxyLeaseManager are online!")
     yield
 
-    # Cleanup on server stop
-    logger.info("🛑 Gracefully shutting down Telethon Bot, Background Tasks, and ProxyLeaseManager...")
-    auditor_task.cancel()
-    recovery_task.cancel()
-    try:
-        await asyncio.gather(auditor_task, recovery_task)
-    except asyncio.CancelledError:
-        pass
+    # Cleanup on server stop - ordered and idempotent (shutdown twice is safe)
+    if _shutdown_done:
+        logger.info("Shutdown already completed - skipping duplicate shutdown.")
+        return
+    _shutdown_done = True
+    logger.info("Gracefully shutting down Telethon Bot, Background Tasks, and ProxyLeaseManager...")
 
-    # Cancel tracked web-console background tasks (Phase 22)
+    # 1) STOP NEW WORK - gracefully halt DM/adder/videochat workers
+    try:
+        if adder_engine.is_running:
+            adder_engine.halt_engine()
+    except Exception as exc:
+        logger.error(f"Failed to stop adder engine during shutdown: {exc}")
+    try:
+        if dm_engine.is_running:
+            dm_engine.halt_campaign()
+    except Exception as exc:
+        logger.error(f"Failed to stop DM engine during shutdown: {exc}")
+    try:
+        if voice_engine.is_running:
+            await voice_engine.terminate_voice_cluster()
+    except Exception as exc:
+        logger.error(f"Failed to stop voice engine during shutdown: {exc}")
+
+    # 2) STOP AUDITOR + RECOVERY, THEN WAIT FOR THE TASKS
+    pending = []
+    for task in (auditor_task, recovery_task):
+        if task is not None:
+            task.cancel()
+            pending.append(task)
+    if pending:
+        try:
+            await asyncio.gather(*pending)
+        except asyncio.CancelledError:
+            pass
+
+    # 3) CANCEL tracked background tasks (status updaters, web console tasks)
+    await _cancel_tracked_background_tasks()
     shutdown_background_tasks()
 
-    # Stop lease managers
+    # 4) DISCONNECT ALL SESSION-MANAGED CLIENTS (releases clients + proxy leases)
+    await session_manager.disconnect_all()
+
+    # 5) STOP PROXY TESTING + LEASE MANAGERS (after clients released leases)
+    try:
+        proxy_manager.stop_background_testing()
+    except Exception as exc:
+        logger.error(f"Failed to stop proxy background testing: {exc}")
     await proxy_lease_manager.stop()
     await account_lease_manager.stop()
 
-    # Disconnect all session-managed clients
-    await session_manager.disconnect_all()
-
-    # Close database connection
+    # 6) CLOSE DATABASE
     db.close()
 
+    # 7) DISCONNECT BOT
     await real_bot.disconnect()
+    logger.info("Shutdown complete.")
+
 
 app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
 app.include_router(console_router, prefix="/console")
@@ -2624,6 +2770,68 @@ async def health_check():
 # 28. AUTO-RECOVERY LOOP
 # ──────────────────────────────────────────────
 
+async def _recover_failed_accounts(failed_accounts: list) -> int:
+    """
+    Attempt to recover failed/muted accounts. Ownership and eligibility guards
+    mirror the auditor: terminal accounts are skipped permanently, busy/owned
+    accounts are skipped (never failed), and the client is always obtained
+    through SessionManager.acquire() via managed_client() - never constructed
+    or disconnected directly.
+    Returns the number of accounts recovered to ACTIVE.
+    """
+    recovered = 0
+    for acc in failed_accounts:
+        phone = normalize_phone(str(acc.get("phone", "")))
+        session_str = safe_session_str(acc)
+        if not session_str:
+            continue
+
+        # 1) Never attempt terminal accounts (revoked/banned/deactivated/
+        #    invalid/auth_key_duplicated/permanently_failed/quarantined).
+        db_status = str(acc.get("status", "")).lower()
+        if db_status in TERMINAL_DB_STATUSES:
+            audit_logger.debug(
+                f"RECOVERY_SKIP | +{phone} | terminal status={db_status}"
+            )
+            continue
+        # 2) Never operate on an account currently owned by another worker
+        #    (DM/adder/scraper/videochat).
+        if await account_lease_manager.is_busy(phone):
+            audit_logger.debug(
+                f"RECOVERY_SKIP | +{phone} | account is busy/owned by a worker"
+            )
+            continue
+        # 3) Never operate on an account in a login/OTP/2FA reservation or
+        #    otherwise actively leased through SessionManager.
+        if await session_manager.is_owned(phone):
+            audit_logger.debug(
+                f"RECOVERY_SKIP | +{phone} | login/active reservation in progress"
+            )
+            continue
+        try:
+            async with managed_client(acc) as client:
+                if await client.is_user_authorized():
+                    await client.get_me()
+                    await client.send_message("SpamBot", "/start")
+                    db.update_session_status(phone, AccountStatus.ACTIVE, client.session.save())
+                    recovered += 1
+                else:
+                    # Retry/terminal classification via managed_client;
+                    # managed_client also refuses to bypass an owned session.
+                    audit_logger.debug(
+                        f"RECOVERY_SKIP | +{phone} | client not authorized"
+                    )
+        except SessionAlreadyOwnedError:
+            # Acquire race: account became owned by a worker or login.
+            # Skip - never escalate into an account failure.
+            audit_logger.debug(
+                f"RECOVERY_SKIP | +{phone} | owned at acquire time (busy)"
+            )
+        except Exception as e:
+            audit_logger.error(f"Auto-recovery failed for {phone}: {e}")
+    return recovered
+
+
 async def auto_health_recovery_loop() -> None:
     """Auto-recovery engine: checks and recovers muted accounts every 12 hours."""
     await asyncio.sleep(3600)  # 1 hour initial delay
@@ -2640,22 +2848,10 @@ async def auto_health_recovery_loop() -> None:
                 AccountStatus.FAILED, AccountStatus.BANNED, AccountStatus.RESTRICTED)]
 
             if failed_accounts:
-                recovered = 0
-                for acc in failed_accounts:
-                    phone = normalize_phone(str(acc.get("phone", "")))
-                    session_str = safe_session_str(acc)
-                    if not session_str:
-                        continue
-                    try:
-                        async with managed_client(acc, use_pool=False) as client:
-                            if await client.is_user_authorized():
-                                await client.get_me()
-                                await client.send_message("SpamBot", "/start")
-                                db.update_session_status(phone, AccountStatus.ACTIVE, client.session.save())
-                                recovered += 1
-                    except Exception as e:
-                        audit_logger.error(f"Auto-recovery failed for {phone}: {e}")
-            
+                recovered = await _recover_failed_accounts(failed_accounts)
+                if recovered:
+                    audit_logger.info(f"Auto-recovery pass recovered {recovered} accounts.")
+
         except Exception as e:
             audit_logger.error(f"Recovery loop error: {e}")
         

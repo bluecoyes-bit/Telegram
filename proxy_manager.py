@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Callable, Set
 from urllib.parse import urlparse
 
 import requests
+import uuid
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -68,10 +69,11 @@ except ImportError:
 @dataclass
 class ProxyNode:
     """
-    Enterprise proxy node with lease tracking and cooldown state.
+    One logical proxy resource.
 
-    ALL internal proxy state flows through this dataclass.
-    Use .to_telethon_proxy() for the final Telethon representation.
+    proxy_id identifies the logical node.
+    lease_id identifies the current ownership epoch.
+    leased_to identifies the current account owner.
     """
 
     proxy_id: str
@@ -82,11 +84,14 @@ class ProxyNode:
     password: Optional[str] = None
     url: str = ""
     latency: float = 5000.0
-    health_state: str = "unknown"  # healthy | unknown | unhealthy
+    health_state: str = "unknown"
     failure_count: int = 0
+
     is_leased: bool = False
     leased_to: Optional[str] = None
+    lease_id: Optional[str] = None
     lease_time: float = 0.0
+
     cooldown_until: float = 0.0
     last_tested: float = 0.0
     provider: str = "file"
@@ -98,13 +103,18 @@ class ProxyNode:
 
     def _build_url(self) -> str:
         if self.username and self.password:
-            return f"{self.protocol}://{self.username}:{self.password}@{self.host}:{self.port}"
+            return (
+                f"{self.protocol}://"
+                f"{self.username}:{self.password}@"
+                f"{self.host}:{self.port}"
+            )
+
         return f"{self.protocol}://{self.host}:{self.port}"
 
     def to_telethon_proxy(self) -> Optional[Dict[str, Any]]:
-        """Convert to the dict format Telethon expects."""
         if not self.host or not self.port:
             return None
+
         return {
             "proxy_type": self.protocol,
             "addr": self.host,
@@ -114,10 +124,21 @@ class ProxyNode:
             "password": self.password,
         }
 
-    def to_telethon_tuple(self) -> Optional[Tuple[str, str, int, bool, Optional[str], Optional[str]]]:
-        """Convert to the tuple format Telethon supports."""
+    def to_telethon_tuple(
+        self,
+    ) -> Optional[
+        Tuple[
+            str,
+            str,
+            int,
+            bool,
+            Optional[str],
+            Optional[str],
+        ]
+    ]:
         if not self.host or not self.port:
             return None
+
         return (
             self.protocol,
             self.host,
@@ -130,27 +151,59 @@ class ProxyNode:
     def is_in_cooldown(self) -> bool:
         return time.time() < self.cooldown_until
 
-    def acquire(self, phone: str) -> bool:
+    def acquire(
+        self,
+        phone: str,
+        lease_id: str,
+    ) -> bool:
+        """
+        Claim this proxy for exactly one ownership epoch.
+        """
         if self.is_leased or self.is_in_cooldown():
             return False
+
         self.is_leased = True
         self.leased_to = phone
+        self.lease_id = lease_id
         self.lease_time = time.time()
+
         return True
 
     def release(self) -> None:
+        """
+        Clear current ownership.
+        """
         self.is_leased = False
         self.leased_to = None
+        self.lease_id = None
         self.lease_time = 0.0
 
-    def put_in_cooldown(self, duration_seconds: int = PROXY_COOLDOWN_SECONDS) -> None:
+    def put_in_cooldown(
+        self,
+        duration_seconds: int = PROXY_COOLDOWN_SECONDS,
+    ) -> None:
         self.release()
-        self.cooldown_until = time.time() + duration_seconds
-        self.failure_count += 1
-        logger.warning(
-            f"Proxy {self.url} cooldown for {duration_seconds}s "
-            f"(failure_count={self.failure_count})"
+
+        self.cooldown_until = (
+            time.time() + duration_seconds
         )
+
+        self.failure_count += 1
+
+        logger.warning(
+            "Proxy %s cooldown for %ss "
+            "(failure_count=%s)",
+            self.safe_label(),
+            duration_seconds,
+            self.failure_count,
+        )
+
+    def safe_label(self) -> str:
+        """
+        Return host:port only.
+        Never expose proxy credentials in logs.
+        """
+        return f"{self.host}:{self.port}"
 
 
 # ──────────────────────────────────────────────
@@ -385,6 +438,37 @@ class ProxyLeaseManager:
             "current_active_leases": 0,
         }
 
+    def _proxy_id_from_record(
+        self,
+        proxy_dict: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Return stable provider/node identity.
+    
+        proxy_id is preferred.
+        URL is only the final fallback for legacy file proxies.
+        """
+        proxy_id = proxy_dict.get("proxy_id")
+    
+        if proxy_id:
+            return str(proxy_id)
+    
+        url = proxy_dict.get("url")
+    
+        if url:
+            return str(url)
+    
+        host = proxy_dict.get(
+            "host",
+            proxy_dict.get("addr", ""),
+        )
+        port = proxy_dict.get("port")
+    
+        if host and port:
+            return f"{host}:{port}"
+    
+        return None
+
     async def start(self) -> None:
         if self._is_running:
             return
@@ -405,23 +489,123 @@ class ProxyLeaseManager:
         logger.info("ProxyLeaseManager stopped")
 
     async def _sync_proxies(self) -> None:
-        """Sync working proxies from ProxyManager into ProxyNodes."""
-        working = self.proxy_manager.working_proxies
+        """
+        Reconcile runtime proxy registry with ProxyManager's working set.
+    
+        Important:
+          - proxy_nodes are keyed by logical proxy_id
+          - leased nodes are never deleted merely because the provider
+            temporarily stopped reporting them
+          - unleased stale nodes can be removed
+        """
+        working = list(
+            self.proxy_manager.working_proxies
+        )
+    
+        incoming: Dict[str, Dict[str, Any]] = {}
+    
         for proxy_dict in working:
-            url = proxy_dict.get("url", "")
-            if url and url not in self.proxy_nodes:
-                node = ProxyNode(
-                    proxy_id=url,
-                    host=proxy_dict.get("host", proxy_dict.get("addr", "")),
-                    port=int(proxy_dict.get("port", 0)),
-                    protocol=proxy_dict.get("type", "socks5"),
-                    username=proxy_dict.get("username"),
-                    password=proxy_dict.get("password"),
-                    url=url,
-                    latency=proxy_dict.get("latency", 5000.0),
-                    provider="file",
+            proxy_id = self._proxy_id_from_record(
+                proxy_dict
+            )
+    
+            if not proxy_id:
+                continue
+    
+            incoming[proxy_id] = proxy_dict
+    
+        async with self._condition:
+    
+            # ------------------------------------------
+            # Add/update current nodes
+            # ------------------------------------------
+            for proxy_id, proxy_dict in incoming.items():
+    
+                node = self.proxy_nodes.get(proxy_id)
+    
+                if node is None:
+                    node = ProxyNode(
+                        proxy_id=proxy_id,
+                        host=proxy_dict.get(
+                            "host",
+                            proxy_dict.get("addr", ""),
+                        ),
+                        port=int(
+                            proxy_dict.get("port", 0)
+                        ),
+                        protocol=proxy_dict.get(
+                            "type",
+                            proxy_dict.get(
+                                "proxy_type",
+                                "socks5",
+                            ),
+                        ),
+                        username=proxy_dict.get(
+                            "username"
+                        ),
+                        password=proxy_dict.get(
+                            "password"
+                        ),
+                        url=proxy_dict.get(
+                            "url",
+                            "",
+                        ),
+                        latency=float(
+                            proxy_dict.get(
+                                "latency",
+                                5000.0,
+                            )
+                        ),
+                        provider=proxy_dict.get(
+                            "provider",
+                            getattr(
+                                self.proxy_manager.provider,
+                                "name",
+                                "unknown",
+                            ),
+                        ),
+                    )
+    
+                    self.proxy_nodes[proxy_id] = node
+    
+                else:
+                    # Update health/config metadata without
+                    # destroying active lease state.
+                    node.latency = float(
+                        proxy_dict.get(
+                            "latency",
+                            node.latency,
+                        )
+                    )
+    
+                    node.health_state = (
+                        "healthy"
+                    )
+    
+            # ------------------------------------------
+            # Remove stale UNLEASED nodes only
+            # ------------------------------------------
+            for proxy_id in list(
+                self.proxy_nodes
+            ):
+                if proxy_id in incoming:
+                    continue
+    
+                node = self.proxy_nodes[proxy_id]
+    
+                if node.is_leased:
+                    # Keep leased resource alive until
+                    # its owner explicitly releases it.
+                    continue
+    
+                self.proxy_nodes.pop(
+                    proxy_id,
+                    None,
                 )
-                self.proxy_nodes[url] = node
+    
+                self.proxy_cooldown.discard(
+                    proxy_id
+                )
 
     async def _auto_reaper_loop(self) -> None:
         """Background task that wakes up exactly when cooldowns expire."""
@@ -431,12 +615,23 @@ class ProxyLeaseManager:
                 expired_proxies: List[str] = []
                 expired_accounts: List[str] = []
 
-                for url in list(self.proxy_cooldown):
-                    node = self.proxy_nodes.get(url)
+
+                for proxy_id in list(self.proxy_cooldown):
+                    node = self.proxy_nodes.get(proxy_id)
+                
                     if node and not node.is_in_cooldown():
-                        expired_proxies.append(url)
+                        expired_proxies.append(proxy_id)
+                
                     elif node is None:
-                        expired_proxies.append(url)
+                        expired_proxies.append(proxy_id)
+
+                for proxy_id in expired_proxies:
+                    self.proxy_cooldown.discard(proxy_id)
+                
+                    logger.debug(
+                        "Auto-Reaper: proxy_id=%s cooldown expired",
+                        proxy_id,
+                    )
 
                 for phone, cooldown_until in list(self.account_cooldown.items()):
                     if now >= cooldown_until:
@@ -460,105 +655,349 @@ class ProxyLeaseManager:
                 logger.error(f"Auto-Reaper error: {e}")
                 await asyncio.sleep(COOLDOWN_CHECK_INTERVAL)
 
-    async def acquire_proxy(self, phone: str, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
+    async def acquire_proxy(
+        self,
+        phone: str,
+        timeout: float = 10.0,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Acquire a proxy lease for the given account.
-        Blocks efficiently (0% CPU) if no proxies are available.
-
-        Returns Telethon proxy dict or None if interrupted/timeout.
+        Acquire one logical proxy lease.
+    
+        Returns the Telethon proxy dictionary plus internal
+        lease metadata used only for lifecycle management.
         """
+        if not self._is_running:
+            logger.warning(
+                "PROXY_ACQUIRE_REJECTED | "
+                "manager not running | phone=%s",
+                phone,
+            )
+            return None
+    
         await self._sync_proxies()
-
-        deadline = time.time() + timeout
+    
+        deadline = (
+            time.monotonic() + max(0.0, timeout)
+        )
+    
         async with self._condition:
             while self._is_running:
-                # Check account cooldown
-                if phone in self.account_cooldown:
-                    remaining = self.account_cooldown[phone] - time.time()
-                    if remaining > 0:
-                        logger.debug(f"Account +{phone} in cooldown for {remaining:.0f}s more")
-                        if time.time() > deadline:
-                            return None
-                        try:
-                            await asyncio.wait_for(self._condition.wait(), timeout=min(remaining, 5.0))
-                        except asyncio.TimeoutError:
-                            if time.time() > deadline:
-                                return None
-                            continue
+    
+                # --------------------------------------
+                # Account cooldown
+                # --------------------------------------
+                cooldown_until = (
+                    self.account_cooldown.get(phone)
+                )
+    
+                if cooldown_until is not None:
+                    remaining = (
+                        cooldown_until
+                        - time.time()
+                    )
+    
+                    if remaining <= 0:
+                        self.account_cooldown.pop(
+                            phone,
+                            None,
+                        )
                     else:
-                        del self.account_cooldown[phone]
-
-                # Find an available proxy
-                for url, node in self.proxy_nodes.items():
-                    if url in self.proxy_cooldown:
+                        wait_for = min(
+                            remaining,
+                            max(
+                                0.0,
+                                deadline
+                                - time.monotonic(),
+                            ),
+                        )
+    
+                        if wait_for <= 0:
+                            return None
+    
+                        try:
+                            await asyncio.wait_for(
+                                self._condition.wait(),
+                                timeout=wait_for,
+                            )
+                        except asyncio.TimeoutError:
+                            if (
+                                time.monotonic()
+                                >= deadline
+                            ):
+                                return None
+    
                         continue
-                    if node.acquire(phone):
-                        self.stats["total_acquires"] += 1
-                        self.stats["current_active_leases"] += 1
-                        logger.debug(f"Proxy {url} leased to +{phone}")
-                        return node.to_telethon_proxy()
-
-                # No proxy available — wait
-                logger.debug(f"No proxies available for +{phone}, waiting...")
-                if time.time() > deadline:
+    
+                # --------------------------------------
+                # Find available node
+                # --------------------------------------
+                for proxy_id, node in self.proxy_nodes.items():
+    
+                    if proxy_id in self.proxy_cooldown:
+                        continue
+    
+                    if node.is_in_cooldown():
+                        continue
+    
+                    if node.is_leased:
+                        continue
+    
+                    lease_id = uuid.uuid4().hex[:16]
+    
+                    if not node.acquire(
+                        phone,
+                        lease_id,
+                    ):
+                        continue
+    
+                    self.stats[
+                        "total_acquires"
+                    ] += 1
+    
+                    self.stats[
+                        "current_active_leases"
+                    ] += 1
+    
+                    proxy = node.to_telethon_proxy()
+    
+                    if proxy is None:
+                        node.release()
+    
+                        self.stats[
+                            "current_active_leases"
+                        ] = max(
+                            0,
+                            self.stats[
+                                "current_active_leases"
+                            ] - 1,
+                        )
+    
+                        continue
+    
+                    # Internal metadata is deliberately
+                    # kept alongside the Telethon proxy.
+                    proxy["__proxy_id"] = proxy_id
+                    proxy["__lease_id"] = lease_id
+    
+                    logger.debug(
+                        "PROXY_ACQUIRED | "
+                        "proxy=%s | phone=%s | lease=%s",
+                        node.safe_label(),
+                        phone,
+                        lease_id,
+                    )
+    
+                    return proxy
+    
+                # --------------------------------------
+                # No capacity: efficiently wait
+                # --------------------------------------
+                remaining = (
+                    deadline
+                    - time.monotonic()
+                )
+    
+                if remaining <= 0:
+                    logger.warning(
+                        "PROXY_ACQUIRE_TIMEOUT | "
+                        "phone=%s | timeout=%ss",
+                        phone,
+                        timeout,
+                    )
                     return None
+    
+                wait_for = min(
+                    remaining,
+                    5.0,
+                )
+    
                 try:
-                    await asyncio.wait_for(self._condition.wait(), timeout=5.0)
+                    await asyncio.wait_for(
+                        self._condition.wait(),
+                        timeout=wait_for,
+                    )
                 except asyncio.TimeoutError:
-                    if time.time() > deadline:
-                        logger.warning(f"PROXY_ACQUIRE_TIMEOUT | phone={phone} | timed out after {timeout}s")
+                    if (
+                        time.monotonic()
+                        >= deadline
+                    ):
+                        logger.warning(
+                            "PROXY_ACQUIRE_TIMEOUT | "
+                            "phone=%s | timeout=%ss",
+                            phone,
+                            timeout,
+                        )
                         return None
-
+    
         return None
 
     async def release_proxy(
         self,
         *,
-        proxy_url: str,
+        proxy_url: Optional[str],
         phone: str,
+        proxy_id: Optional[str] = None,
+        lease_id: Optional[str] = None,
         should_cooldown: bool = False,
         cooldown_reason: str = "",
     ) -> None:
         """
-        Release a proxy lease.
-
-        Verifies ownership before modifying state to prevent accidentally
-        releasing another worker's lease.
+        Release exactly one proxy ownership epoch.
+    
+        Ownership validation:
+            proxy_id
+            + lease_id
+            + phone
+    
+        A stale or duplicate release must NEVER affect
+        another owner's lease or global counters.
         """
         async with self._condition:
-            node = self.proxy_nodes.get(proxy_url)
-            if node:
-                # Verify ownership
-                if node.leased_to != phone and node.leased_to is not None:
-                    logger.warning(
-                        f"PROXY_RELEASE_OWNER_MISMATCH | proxy={proxy_url} | "
-                        f"expected_owner={phone} | actual_owner={node.leased_to}"
-                    )
-                    return
-
-                if should_cooldown:
-                    node.put_in_cooldown()
-                    self.proxy_cooldown.add(proxy_url)
-                    self.account_cooldown[phone] = time.time() + ACCOUNT_COOLDOWN_SECONDS
-                    self.stats["cooldown_activations"] += 1
-                    logger.warning(
-                        f"Cooldown activated for +{phone} & proxy {proxy_url}: {cooldown_reason}"
-                    )
-                else:
-                    node.release()
-
-                self.stats["total_releases"] += 1
-                self.stats["current_active_leases"] = max(0, self.stats["current_active_leases"] - 1)
-                self._condition.notify()
+    
+            node: Optional[ProxyNode] = None
+    
+            # Preferred lookup: stable proxy ID.
+            if proxy_id:
+                node = self.proxy_nodes.get(
+                    proxy_id
+                )
+    
+            # Legacy fallback.
+            if node is None and proxy_url:
+                for candidate in self.proxy_nodes.values():
+                    if candidate.url == proxy_url:
+                        node = candidate
+                        break
+    
+            if node is None:
+                logger.warning(
+                    "PROXY_RELEASE_UNKNOWN | "
+                    "phone=%s | proxy_id=%s",
+                    phone,
+                    proxy_id,
+                )
+                return
+    
+            # ------------------------------------------
+            # Must currently be leased
+            # ------------------------------------------
+            if not node.is_leased:
+                logger.debug(
+                    "PROXY_DOUBLE_RELEASE | "
+                    "proxy=%s | phone=%s | lease=%s",
+                    node.safe_label(),
+                    phone,
+                    lease_id,
+                )
+                return
+    
+            # ------------------------------------------
+            # Verify account ownership
+            # ------------------------------------------
+            if node.leased_to != phone:
+                logger.warning(
+                    "PROXY_RELEASE_OWNER_MISMATCH | "
+                    "proxy=%s | expected=%s | actual=%s",
+                    node.safe_label(),
+                    phone,
+                    node.leased_to,
+                )
+                return
+    
+            # ------------------------------------------
+            # Verify lease epoch
+            # ------------------------------------------
+            if (
+                lease_id is not None
+                and node.lease_id != lease_id
+            ):
+                logger.warning(
+                    "PROXY_RELEASE_LEASE_MISMATCH | "
+                    "proxy=%s | phone=%s | "
+                    "expected_lease=%s | actual_lease=%s",
+                    node.safe_label(),
+                    phone,
+                    lease_id,
+                    node.lease_id,
+                )
+                return
+    
+            # ------------------------------------------
+            # Perform exactly one release
+            # ------------------------------------------
+            if should_cooldown:
+                node.put_in_cooldown()
+    
+                self.proxy_cooldown.add(
+                    node.proxy_id
+                )
+    
+                self.account_cooldown[
+                    phone
+                ] = (
+                    time.time()
+                    + ACCOUNT_COOLDOWN_SECONDS
+                )
+    
+                self.stats[
+                    "cooldown_activations"
+                ] += 1
+    
+                logger.warning(
+                    "PROXY_COOLDOWN | "
+                    "proxy=%s | phone=%s | reason=%s",
+                    node.safe_label(),
+                    phone,
+                    cooldown_reason,
+                )
+    
+            else:
+                node.release()
+    
+            self.stats[
+                "total_releases"
+            ] += 1
+    
+            self.stats[
+                "current_active_leases"
+            ] = max(
+                0,
+                self.stats[
+                    "current_active_leases"
+                ] - 1,
+            )
+    
+            self._condition.notify_all()
 
     def get_available_count(self) -> int:
-        """Get count of available (not leased, not in cooldown) proxies."""
-        self._sync_proxy_sync()
-        count = 0
-        for url, node in self.proxy_nodes.items():
-            if url not in self.proxy_cooldown and not node.is_leased and not node.is_in_cooldown():
-                count += 1
-        return count
+        """
+        Fast read-only snapshot.
+    
+        Does not mutate proxy registry.
+        """
+        return sum(
+            1
+            for node in self.proxy_nodes.values()
+            if (
+                not node.is_leased
+                and not node.is_in_cooldown()
+                and node.proxy_id
+                not in self.proxy_cooldown
+            )
+        )
+
+    async def get_available_count_async(self) -> int:
+        async with self._condition:
+            return sum(
+                1
+                for node in self.proxy_nodes.values()
+                if (
+                    not node.is_leased
+                    and not node.is_in_cooldown()
+                    and node.proxy_id
+                    not in self.proxy_cooldown
+                )
+            )
 
     def _sync_proxy_sync(self) -> None:
         """Sync from ProxyManager synchronously (for sync callers)."""
@@ -579,12 +1018,29 @@ class ProxyLeaseManager:
                 self.proxy_nodes[url] = node
 
     async def get_stats(self) -> Dict[str, Any]:
-        return {
-            **self.stats,
-            "available_proxies": self.get_available_count(),
-            "proxies_in_cooldown": len(self.proxy_cooldown),
-            "accounts_in_cooldown": len(self.account_cooldown),
-        }
+        async with self._condition:
+            return {
+                **self.stats,
+                "available_proxies": sum(
+                    1
+                    for node in self.proxy_nodes.values()
+                    if (
+                        not node.is_leased
+                        and not node.is_in_cooldown()
+                        and node.proxy_id
+                        not in self.proxy_cooldown
+                    )
+                ),
+                "total_proxy_nodes": len(
+                    self.proxy_nodes
+                ),
+                "proxies_in_cooldown": len(
+                    self.proxy_cooldown
+                ),
+                "accounts_in_cooldown": len(
+                    self.account_cooldown
+                ),
+            }
 
 
 # ──────────────────────────────────────────────

@@ -85,7 +85,16 @@ class ConfigurableProxyLeaseManager:
         self._leased[phone] = proxy
         return proxy
 
-    async def release_proxy(self, *, proxy_url, phone, should_cooldown=False, cooldown_reason=""):
+    async def release_proxy(
+        self,
+        *,
+        proxy_url,
+        phone,
+        proxy_id=None,
+        lease_id=None,
+        should_cooldown=False,
+        cooldown_reason="",
+    ):
         self._release_count += 1
         cur = self._leased.get(phone)
         if cur is None:
@@ -135,7 +144,7 @@ def _store_session(db, phone, doc):
 
 def _mock_client(phone="test", connected=False):
     client = AsyncMock()
-    client.is_connected.return_value = connected
+    client.is_connected = MagicMock(return_value=connected)
     client.is_user_authorized.return_value = True
     client.session = MagicMock()
     client.session.save.return_value = f"session_str_{phone}"
@@ -492,6 +501,36 @@ class TestModuleCollisions:
 class TestCancellationPhases:
 
     @pytest.mark.asyncio
+    async def test_stale_acquisition_rollback_cannot_clear_live_lease(self):
+        sm, db, plm, cc = _build_sm(pool_size=5)
+        p = _make_phone(1)
+        _store_session(db, p, _make_session_doc(p))
+
+        async with sm.acquire(
+            p,
+            module="m",
+            worker_id="same-worker",
+            auto_release=False,
+        ) as lease:
+            assert lease is not None
+            info = sm._sessions[sm.normalize_phone(p)]
+            live_client = info.client
+
+            await sm._rollback_acquire_failure(
+                clean_phone=sm.normalize_phone(p),
+                owner_key=lease.owner,
+                reservation_id="stale-reservation",
+                proxy_record=None,
+                client=None,
+            )
+
+            assert info.client is live_client
+            assert info.owner == lease.owner
+            assert sm._active_count == 1
+
+        await _assert_clean_resources(sm, plm)
+
+    @pytest.mark.asyncio
     async def test_cancel_during_proxy_acquisition(self):
         # proxy acquire blocks (block_on_exhausted) -> cancel -> nothing leaks
         sm, db, plm, cc = _build_sm(pool_size=0, block_on_exhausted=True)
@@ -522,7 +561,7 @@ class TestCancellationPhases:
         _store_session(db, p, _make_session_doc(p))
 
         real_client = AsyncMock()
-        real_client.is_connected.side_effect = lambda: False
+        real_client.is_connected = MagicMock(return_value=False)
         real_client.connect.side_effect = lambda: blocking.wait()
         real_client.is_user_authorized.return_value = True
         real_client.session = MagicMock()
@@ -694,6 +733,22 @@ class TestReleaseLeasePublicInterface:
             assert sm._sessions[sm._session_key(p)].lifecycle.value == "busy"
         await _assert_clean_resources(sm, plm)
 
+    @pytest.mark.asyncio
+    async def test_release_lease_correct_owner_stale_lease_id_rejected(self):
+        sm, db, plm, cc = _build_sm(pool_size=5)
+        p = _make_phone(4)
+        _store_session(db, p, _make_session_doc(p))
+        async with sm.acquire(p, module="m1", auto_release=False) as lease:
+            # correct owner but stale lease epoch -> rejected, resources stay
+            from dataclasses import replace
+            stale = replace(lease, lease_id="stale-lease")
+            await sm.release_lease(stale)
+            key = sm._session_key(p)
+            assert sm._sessions[key].lifecycle.value == "busy"
+            assert sm._sessions[key].lease_id == lease.lease_id
+            assert sm._active_count == 1
+        await _assert_clean_resources(sm, plm)
+
     def test_feature_modules_use_public_not_private(self):
         # Regression: feature modules must never call the private _release_lease.
         import os
@@ -742,6 +797,96 @@ class TestResourceAwareScheduling:
     def test_dm_capacity_never_exceeds_accounts(self):
         from dmsender import compute_dm_worker_capacity
         assert compute_dm_worker_capacity(3, 20, 20, 20) == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 13b — real ProxyLeaseManager + SessionManager count invariants
+# ---------------------------------------------------------------------------
+
+class TestResourceInvariants:
+
+    @pytest.mark.asyncio
+    async def test_session_and_proxy_counts_match(self):
+        from proxy_manager import ProxyLeaseManager
+        from session_manager import SessionManager
+
+        class _WorkingProxyManager:
+            def __init__(self):
+                self.working_proxies = [
+                    {
+                        "proxy_id": f"real-{i}",
+                        "url": f"socks5://p{i}.example:1080",
+                        "host": f"p{i}.example",
+                        "addr": f"p{i}.example",
+                        "port": 1080,
+                        "type": "socks5",
+                        "proxy_type": "socks5",
+                    }
+                    for i in range(3)
+                ]
+                self.provider = type("Provider", (), {"name": "test"})()
+
+        pm = _WorkingProxyManager()
+        plm = ProxyLeaseManager(pm)
+        await plm.start()
+
+        db = FakeDB()
+        phones = [_make_phone(i) for i in range(3)]
+        for p in phones:
+            _store_session(db, p, _make_session_doc(p))
+
+        sm = SessionManager(db, pm, plm)
+        create_counter = {"n": 0}
+
+        def _fake_create(**kwargs):
+            create_counter["n"] += 1
+            return _mock_client(kwargs.get("session_str", "test"), connected=True)
+
+        sm._create_client = _fake_create
+
+        try:
+            for i, p in enumerate(phones):
+                async with sm.acquire(p, module=f"m{i}", auto_release=False):
+                    pass
+
+            live_clients = sum(
+                1 for info in sm._sessions.values()
+                if info.client is not None
+            )
+            assert sm._active_count == live_clients
+            assert sm._active_count == 3
+
+            leased_nodes = sum(
+                1 for n in plm.proxy_nodes.values()
+                if n.is_leased
+            )
+            assert plm.stats["current_active_leases"] == leased_nodes
+            assert plm.stats["current_active_leases"] == 3
+            assert (
+                0
+                <= plm.stats["current_active_leases"]
+                <= len(plm.proxy_nodes)
+            )
+
+            await sm.disconnect_all()
+
+            assert sm._active_count == 0
+            assert sm._active_count == sum(
+                1 for info in sm._sessions.values()
+                if info.client is not None
+            )
+            assert plm.stats["current_active_leases"] == sum(
+                1 for n in plm.proxy_nodes.values()
+                if n.is_leased
+            )
+            assert plm.stats["current_active_leases"] == 0
+
+            # repeated shutdown is idempotent
+            await sm.disconnect_all()
+            assert sm._active_count == 0
+            assert plm.stats["current_active_leases"] == 0
+        finally:
+            await plm.stop()
 
 
 if __name__ == "__main__":

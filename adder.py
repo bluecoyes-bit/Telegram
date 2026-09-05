@@ -10,7 +10,8 @@ import time
 import asyncio
 import random
 import logging
-from typing import List, Dict, Optional, Any, Tuple
+from contextlib import asynccontextmanager
+from typing import List, Dict, Optional, Any, Tuple, AsyncIterator
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient
@@ -21,6 +22,8 @@ from telethon.errors import (
     UserPrivacyRestrictedError, UserAlreadyParticipantError,
     FloodWaitError, PeerFloodError, UserIdInvalidError, MessageNotModifiedError
 )
+
+from session_manager import SessionAlreadyOwnedError
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
@@ -320,201 +323,240 @@ class EnterpriseMemberAdder:
         for acc_doc in active_accounts:
             await accounts_queue.put(acc_doc)
 
-        async def initialize_account(acc_doc: dict):
-            phone = str(acc_doc.get("phone"))
+        @asynccontextmanager
+        async def account_context(acc_doc: dict) -> AsyncIterator[Optional[dict]]:
+            """
+            Context manager for Adder accounts that properly manages the session lifecycle.
+
+            Args:
+                acc_doc: Account document containing phone number and other details
+
+            Yields:
+                dict or None: Worker account data if successful, otherwise None
+            """
+            phone = str(acc_doc.get("phone", "")).strip()
             clean_phone = phone.replace("+", "")
 
-            lease = await self.session_manager.acquire(
-                clean_phone,
-                module="adder",
-                auto_release=False,
-            )
-            if not lease:
-                return None
-
-            client = lease.client
-            try:
-                if not client.is_connected():
-                    await client.connect()
-                if not await client.is_user_authorized():
-                    raise ValueError("Session Unauthorized/Dead")
-            except Exception as e:
-                logger.debug(f"Connect failed for {phone}: {e}")
-                await self.session_manager.release_lease(lease)
-                return None
+            if not clean_phone:
+                yield None
+                return
 
             try:
-                target_entity = None
+                async with self.session_manager.acquire(
+                    clean_phone,
+                    module="adder",
+                    worker_id=f"adder:{clean_phone}",
+                    auto_release=True,
+                ) as lease:
+                    if lease is None:
+                        yield None
+                        return
 
-                try:
-                    if is_private:
-                        updates = await client(ImportChatInviteRequest(resolved_token))
-                        if getattr(updates, "chats", None):
-                            target_entity = updates.chats[0]
-                    else:
-                        await client(JoinChannelRequest(resolved_token))
-                except UserAlreadyParticipantError:
-                    pass
-                except Exception:
-                    pass
+                    client = lease.client
 
-                if not target_entity:
-                    target_entity = await client.get_entity(resolved_token if is_private else target_entity_identifier)
+                    # ------------------------------------------
+                    # Connect
+                    # ------------------------------------------
+                    if not client.is_connected():
+                        await client.connect()
 
-                target_peer = InputPeerChannel(target_entity.id, target_entity.access_hash)
+                    # ------------------------------------------
+                    # Authorization
+                    # ------------------------------------------
+                    if not await client.is_user_authorized():
+                        raise ValueError("Session Unauthorized/Dead")
 
-                return {
-                    "phone": phone,
-                    "clean_phone": clean_phone,
-                    "client": client,
-                    "target_peer": target_peer,
-                    "lease": lease,
-                    "proxy_url": lease.proxy_url or "",
-                    "burst_count": 0,
-                }
-            except Exception:
-                await self.session_manager.release_lease(lease)
-                return None
+                    # ------------------------------------------
+                    # Prepare target
+                    # ------------------------------------------
+                    target_entity = None
+
+                    try:
+                        if is_private:
+                            updates = await client(ImportChatInviteRequest(resolved_token))
+                            if getattr(updates, "chats", None):
+                                target_entity = updates.chats[0]
+                        else:
+                            await client(JoinChannelRequest(resolved_token))
+                    except UserAlreadyParticipantError:
+                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "ADDER_TARGET_PREPARE_FAILED | phone=%s | error=%s",
+                            phone,
+                            exc,
+                        )
+
+                    # ------------------------------------------
+                    # Resolve entity
+                    # ------------------------------------------
+                    if target_entity is None:
+                        target_entity = await client.get_entity(
+                            resolved_token if is_private else target_entity_identifier
+                        )
+
+                    if not hasattr(target_entity, "access_hash"):
+                        raise ValueError("Target entity has no access_hash")
+
+                    target_peer = InputPeerChannel(target_entity.id, target_entity.access_hash)
+
+                    yield {
+                        "phone": phone,
+                        "clean_phone": clean_phone,
+                        "client": client,
+                        "target_peer": target_peer,
+                        "lease": lease,
+                        "proxy_url": lease.proxy_url or "",
+                        "burst_count": 0,
+                    }
+
+            except SessionAlreadyOwnedError:
+                logger.debug("ADDER_SESSION_BUSY | phone=%s", phone)
+                yield None
+
+            except Exception as exc:
+                logger.warning(
+                    "ADDER_ACCOUNT_INIT_FAILED | phone=%s | error=%s",
+                    phone,
+                    exc,
+                )
+                yield None
 
         async def worker_loop():
-            worker_account = None
-            try:
-                while self.is_running:
+            while self.is_running:
+                try:
+                    account_doc = accounts_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                async with account_context(account_doc) as worker_account:
                     if worker_account is None:
-                        try:
-                            account_doc = accounts_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                        worker_account = await initialize_account(account_doc)
-                        if worker_account is None:
-                            self.accounts_down += 1
-                            if self.adder_state:
-                                self.adder_state.failures += 1
-                            continue
-                        
-                        if self.adder_state:
-                            self.adder_state.active_workers += 1
-
-                    try:
-                        member = members_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-
-                    uname = str(member.get("username", "")).strip()
-                    uid = str(member.get("user_id", "")).strip()
-                    access_hash = str(member.get("access_hash", "0")).strip()
-                    identity = uname if (uname and uname != "None" and uname != "") else uid
-
-                    try:
-                        if uname and uname != "None" and uname != "":
-                            target_user = await worker_account["client"].get_input_entity(uname)
-                        elif uid and access_hash and access_hash != "0":
-                            target_user = InputPeerUser(int(uid), int(access_hash))
-                        else:
-                            if self.adder_state: self.adder_state.skipped += 1
-                            self.db.log_addition_state(uid, uname, "invalid_identity")
-                            continue
-
-                        api_start_time = time.time()
-                        await worker_account["client"](InviteToChannelRequest(worker_account["target_peer"], [target_user]))
-                        api_delay = time.time() - api_start_time
-
-                        self.total_added += 1
-                        worker_account["burst_count"] += 1
-                        self.db.log_addition_state(uid, uname, "success_added")
-                        
-                        if self.adder_state:
-                            self.adder_state.completed += 1
-                            self.adder_state.total_delay_sum += api_delay
-
-                        if self.total_added % PROGRESS_UPDATE_INTERVAL == 0:
-                            # Default callback only triggers if enterprise monitor is not initialized
-                            if not self.adder_state:
-                                await update_callback(f"📊 **Live Tracking:** `{self.total_added}` members added.")
-
-                        if worker_account["burst_count"] >= BURST_ADD_LIMIT:
-                            sleep_time = random.uniform(*BURST_COOLDOWN_TIME)
-                            if self.adder_state: self.adder_state.total_delay_sum += sleep_time
-                            await asyncio.sleep(sleep_time)
-                            worker_account["burst_count"] = 0
-                        else:
-                            sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
-                            if self.adder_state: self.adder_state.total_delay_sum += sleep_time
-                            await asyncio.sleep(sleep_time)
-
-                    except UserPrivacyRestrictedError:
-                        self.privacy_skips += 1
-                        if self.adder_state: self.adder_state.skipped += 1
-                        self.db.log_addition_state(uid, uname, "privacy_restricted")
-                        
-                        sleep_time = random.uniform(3, 6)
-                        if self.adder_state: self.adder_state.total_delay_sum += sleep_time
-                        await asyncio.sleep(sleep_time)
-
-                    except UserAlreadyParticipantError:
-                        if self.adder_state: self.adder_state.skipped += 1
-                        self.db.log_addition_state(uid, uname, "already_member")
-                        
-                        sleep_time = random.uniform(1.5, 3.5)
-                        if self.adder_state: self.adder_state.total_delay_sum += sleep_time
-                        await asyncio.sleep(sleep_time)
-
-                    except (PeerFloodError, FloodWaitError) as e:
                         self.accounts_down += 1
                         if self.adder_state:
                             self.adder_state.failures += 1
-                            self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
-                        await members_queue.put(member)
-                        lease = worker_account.get("lease")
-                        if lease:
-                            try:
-                                await self.session_manager.release_lease(lease)
-                            except Exception:
-                                pass
-                        worker_account = None
                         continue
 
-                    except (UserIdInvalidError, ValueError):
-                        if self.adder_state: self.adder_state.skipped += 1
-                        self.db.log_addition_state(uid, uname, "invalid_identity")
-                        continue
-
-                    except Exception as crash:
-                        err_msg = str(crash).lower()
-                        if any(k in err_msg for k in ["banned", "deactivated", "revoked", "disabled"]):
-                            self.accounts_down += 1
-                            if self.adder_state:
-                                self.adder_state.failures += 1
-                                self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
-
-                            if hasattr(self.db, "mark_account_failed"):
-                                self.db.mark_account_failed(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
-                            else:
-                                self.db.mark_account_revoked(worker_account["phone"], f"Banned at runtime: {str(crash)[:80]}")
-
-                            lease = worker_account.get("lease")
-                            if lease:
-                                try:
-                                    await self.session_manager.release_lease(lease)
-                                except Exception:
-                                    pass
-                            worker_account = None
-                            continue
-                            
-                        sleep_time = random.uniform(8, 12)
-                        if self.adder_state: self.adder_state.total_delay_sum += sleep_time
-                        await asyncio.sleep(sleep_time)
-                        
-            finally:
-                if worker_account is not None:
                     if self.adder_state:
-                        self.adder_state.active_workers = max(0, self.adder_state.active_workers - 1)
-                    lease = worker_account.get("lease")
-                    if lease:
-                        try:
-                            await self.session_manager.release_lease(lease)
-                        except Exception:
-                            pass
+                        self.adder_state.active_workers += 1
+
+                    try:
+                        while self.is_running:
+                            try:
+                                member = members_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+
+                            uname = str(member.get("username", "")).strip()
+                            uid = str(member.get("user_id", "")).strip()
+                            access_hash = str(member.get("access_hash", "0")).strip()
+                            identity = uname if (uname and uname != "None" and uname != "") else uid
+
+                            try:
+                                if uname and uname != "None" and uname != "":
+                                    target_user = await worker_account["client"].get_input_entity(uname)
+                                elif uid and access_hash and access_hash != "0":
+                                    target_user = InputPeerUser(int(uid), int(access_hash))
+                                else:
+                                    if self.adder_state:
+                                        self.adder_state.skipped += 1
+                                    self.db.log_addition_state(uid, uname, "invalid_identity")
+                                    continue
+
+                                api_start_time = time.time()
+                                await worker_account["client"](
+                                    InviteToChannelRequest(worker_account["target_peer"], [target_user])
+                                )
+                                api_delay = time.time() - api_start_time
+
+                                self.total_added += 1
+                                worker_account["burst_count"] += 1
+                                self.db.log_addition_state(uid, uname, "success_added")
+
+                                if self.adder_state:
+                                    self.adder_state.completed += 1
+                                    self.adder_state.total_delay_sum += api_delay
+
+                                if self.total_added % PROGRESS_UPDATE_INTERVAL == 0:
+                                    if not self.adder_state:
+                                        await update_callback(
+                                            f"📊 **Live Tracking:** `{self.total_added}` members added."
+                                        )
+
+                                if worker_account["burst_count"] >= BURST_ADD_LIMIT:
+                                    sleep_time = random.uniform(*BURST_COOLDOWN_TIME)
+                                    if self.adder_state:
+                                        self.adder_state.total_delay_sum += sleep_time
+                                    await asyncio.sleep(sleep_time)
+                                    worker_account["burst_count"] = 0
+                                else:
+                                    sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
+                                    if self.adder_state:
+                                        self.adder_state.total_delay_sum += sleep_time
+                                    await asyncio.sleep(sleep_time)
+
+                            except UserPrivacyRestrictedError:
+                                self.privacy_skips += 1
+                                if self.adder_state:
+                                    self.adder_state.skipped += 1
+                                self.db.log_addition_state(uid, uname, "privacy_restricted")
+
+                                sleep_time = random.uniform(3, 6)
+                                if self.adder_state:
+                                    self.adder_state.total_delay_sum += sleep_time
+                                await asyncio.sleep(sleep_time)
+
+                            except UserAlreadyParticipantError:
+                                if self.adder_state:
+                                    self.adder_state.skipped += 1
+                                self.db.log_addition_state(uid, uname, "already_member")
+
+                                sleep_time = random.uniform(1.5, 3.5)
+                                if self.adder_state:
+                                    self.adder_state.total_delay_sum += sleep_time
+                                await asyncio.sleep(sleep_time)
+
+                            except (PeerFloodError, FloodWaitError):
+                                self.accounts_down += 1
+                                if self.adder_state:
+                                    self.adder_state.failures += 1
+                                await members_queue.put(member)
+                                continue
+
+                            except (UserIdInvalidError, ValueError):
+                                if self.adder_state:
+                                    self.adder_state.skipped += 1
+                                self.db.log_addition_state(uid, uname, "invalid_identity")
+                                continue
+
+                            except Exception as crash:
+                                err_msg = str(crash).lower()
+                                if any(k in err_msg for k in ["banned", "deactivated", "revoked", "disabled"]):
+                                    self.accounts_down += 1
+                                    if self.adder_state:
+                                        self.adder_state.failures += 1
+
+                                    if hasattr(self.db, "mark_account_failed"):
+                                        self.db.mark_account_failed(
+                                            worker_account["phone"],
+                                            f"Banned at runtime: {str(crash)[:80]}",
+                                        )
+                                    else:
+                                        self.db.mark_account_revoked(
+                                            worker_account["phone"],
+                                            f"Banned at runtime: {str(crash)[:80]}",
+                                        )
+                                    continue
+
+                                sleep_time = random.uniform(8, 12)
+                                if self.adder_state:
+                                    self.adder_state.total_delay_sum += sleep_time
+                                await asyncio.sleep(sleep_time)
+                    finally:
+                        if self.adder_state:
+                            self.adder_state.active_workers = max(
+                                0,
+                                self.adder_state.active_workers - 1,
+                            )
 
         # 🔥 FIX: Launch workers concurrently and await execution
         self.active_workers = [asyncio.create_task(worker_loop()) for _ in range(MAX_WORKER_SESSIONS)]

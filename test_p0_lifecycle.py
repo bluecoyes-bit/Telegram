@@ -9,6 +9,7 @@ import asyncio
 import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from session_manager import ErrorCategory, SessionLifecycleState, SessionManager
 
 pytest_plugins = ["pytest_asyncio"]
 
@@ -56,11 +57,14 @@ class FakeProxyLeaseManager:
         self._is_running = True
         self._leased = {}
         self._counter = 0
+        self.release_calls = []
 
     async def acquire_proxy(self, phone, timeout=None):
         self._counter += 1
         proxy = {
             "url": f"socks5://proxy{self._counter}:1080",
+            "__proxy_id": f"proxy-{self._counter}",
+            "__lease_id": f"lease-{self._counter}",
             "addr": f"proxy{self._counter}",
             "port": 1080,
             "username": "user",
@@ -69,7 +73,22 @@ class FakeProxyLeaseManager:
         self._leased[phone] = proxy
         return proxy
 
-    async def release_proxy(self, *, proxy_url, phone, should_cooldown=False, cooldown_reason=""):
+    async def release_proxy(
+        self,
+        *,
+        proxy_url,
+        phone,
+        proxy_id=None,
+        lease_id=None,
+        should_cooldown=False,
+        cooldown_reason="",
+    ):
+        self.release_calls.append({
+            "proxy_url": proxy_url,
+            "phone": phone,
+            "proxy_id": proxy_id,
+            "lease_id": lease_id,
+        })
         self._leased.pop(phone, None)
 
     def get_available_count(self):
@@ -107,8 +126,8 @@ def _store_session(db, phone, doc):
 
 def _mock_client(phone="test", connected=False):
     client = AsyncMock()
-    client.is_connected.return_value = connected
-    client.is_user_authorized.return_value = True
+    client.is_connected = MagicMock(return_value=connected)
+    client.is_user_authorized = AsyncMock(return_value=True)
     client.session = MagicMock()
     client.session.save.return_value = f"session_str_{phone}"
     client.disconnect = AsyncMock()
@@ -116,19 +135,12 @@ def _mock_client(phone="test", connected=False):
 
 
 def _build_sm(db=None):
-    from session_manager import SessionManager
     _db = db or FakeDB()
     pm = FakeProxyManager()
     plm = FakeProxyLeaseManager()
     sm = SessionManager(_db, pm, plm)
     sm._original_create_client = sm._create_client
     sm._create_client = lambda **kwargs: _mock_client(kwargs.get("session_str", "test"))
-    return sm, _db
-    from session_manager import SessionManager
-    _db = db or FakeDB()
-    pm = FakeProxyManager()
-    plm = FakeProxyLeaseManager()
-    sm = SessionManager(_db, pm, plm)
     return sm, _db
 
 
@@ -149,6 +161,202 @@ class TestAcquireRelease:
             assert lease.client is not None
             assert lease.owner is not None
             assert lease.lease_id is not None
+
+    @pytest.mark.asyncio
+    async def test_session_lease_contains_proxy_identity(self):
+        sm, db = _build_sm()
+    
+        phone = _make_phone(101)
+    
+        _store_session(
+            db,
+            phone,
+            _make_session_doc(phone),
+        )
+    
+        async with sm.acquire(
+            phone,
+            module="test",
+            auto_release=False,
+        ) as lease:
+    
+            assert lease is not None
+            assert lease.proxy_id is not None
+            assert lease.proxy_lease_id is not None
+    
+            key = sm._session_key(phone)
+    
+            info = sm._sessions[key]
+    
+            assert info.proxy_id == lease.proxy_id
+            assert (
+                info.proxy_lease_id
+                == lease.proxy_lease_id
+            )
+    
+            await sm.release_lease(lease)
+
+    @pytest.mark.asyncio
+    async def test_release_uses_same_proxy_lease(self):
+        sm, db = _build_sm()
+        phone = _make_phone(102)
+        _store_session(db, phone, _make_session_doc(phone))
+        proxy = sm.proxy_lease_manager
+
+        async with sm.acquire(
+            phone,
+            module="test",
+            auto_release=False,
+        ) as lease:
+            assert lease is not None
+            await sm.release_lease(lease)
+
+        assert proxy.release_calls
+        release = proxy.release_calls[-1]
+        assert release["proxy_id"] == lease.proxy_id
+        assert release["lease_id"] == lease.proxy_lease_id
+
+    @pytest.mark.asyncio
+    async def test_active_count_returns_to_baseline(self):
+        db = FakeDB()
+        proxy = FakeProxyLeaseManager()
+    
+        sm = SessionManager(
+            db=db,
+            proxy_lease_manager=proxy,
+            max_active_clients=10,
+        )
+    
+        phone = _make_phone(1)
+        _store_session(db, phone, _make_session_doc(phone))
+    
+        with patch.object(
+            sm,
+            "_create_client",
+            return_value=_mock_client(phone),
+        ):
+            baseline = sm._active_count
+    
+            for _ in range(1000):
+                async with sm.acquire(
+                    phone,
+                    module="test",
+                    auto_release=True,
+                ) as lease:
+                    assert lease is not None
+    
+            assert sm._active_count == baseline
+
+    @pytest.mark.asyncio
+    async def test_release_disconnects_client_and_proxy(self):
+        db = FakeDB()
+        proxy = FakeProxyLeaseManager()
+    
+        sm = SessionManager(
+            db=db,
+            proxy_lease_manager=proxy,
+            max_active_clients=10,
+        )
+    
+        phone = _make_phone(2)
+        _store_session(db, phone, _make_session_doc(phone))
+    
+        client = _mock_client(phone, connected=True)
+    
+        with patch.object(
+            sm,
+            "_create_client",
+            return_value=client,
+        ):
+            async with sm.acquire(
+                phone,
+                module="test",
+                auto_release=True,
+            ) as lease:
+                assert lease is not None
+    
+        client.disconnect.assert_awaited_once()
+        assert sm._active_count == 0
+        assert len(proxy._leased) == 0
+
+    @pytest.mark.asyncio
+    async def test_quarantine_preserves_terminal_state_after_release(self):
+        db = FakeDB()
+        proxy = FakeProxyLeaseManager()
+    
+        sm = SessionManager(
+            db=db,
+            proxy_lease_manager=proxy,
+            max_active_clients=10,
+        )
+    
+        phone = _make_phone(3)
+        _store_session(db, phone, _make_session_doc(phone))
+    
+        with patch.object(
+            sm,
+            "_create_client",
+            return_value=_mock_client(phone),
+        ):
+            async with sm.acquire(
+                phone,
+                module="test",
+                auto_release=True,
+            ) as lease:
+                assert lease is not None
+                await sm.mark_quarantined(
+                    phone,
+                    "test",
+                    ErrorCategory.AUTH_KEY_DUPLICATED,
+                )
+    
+        async with sm._lock:
+            info = sm._sessions[sm._session_key(phone)]
+            assert (
+                info.lifecycle
+                == SessionLifecycleState.QUARANTINED
+            )
+            assert info.client is None
+    
+        assert sm._active_count == 0
+
+    @pytest.mark.asyncio
+    async def test_invariant_checker_after_repeated_cycles(self):
+        db = FakeDB()
+        proxy = FakeProxyLeaseManager()
+    
+        sm = SessionManager(
+            db=db,
+            proxy_lease_manager=proxy,
+            max_active_clients=10,
+        )
+    
+        for n in range(20):
+            phone = _make_phone(n)
+    
+            _store_session(
+                db,
+                phone,
+                _make_session_doc(phone),
+            )
+    
+            with patch.object(
+                sm,
+                "_create_client",
+                return_value=_mock_client(phone),
+            ):
+                async with sm.acquire(
+                    phone,
+                    module="test",
+                    auto_release=True,
+                ) as lease:
+                    assert lease is not None
+    
+        result = await sm.validate_invariants()
+    
+        assert result["ok"], result
+        assert result["active_count"] == 0
+        assert result["live_clients"] == 0
 
     @pytest.mark.asyncio
     async def test_release_makes_session_available(self):
@@ -202,13 +410,18 @@ class TestAcquireRelease1000:
         sm, db = _build_sm()
         phone = _make_phone(10)
         _store_session(db, phone, _make_session_doc(phone))
-        key = sm._session_key(phone)
+        baseline = sm._active_count
 
         for _ in range(1000):
             async with sm.acquire(phone, module="test", auto_release=False) as lease:
                 assert lease is not None
-                await sm._release_lease(key, lease.owner)
-                assert sm._sessions[key].lifecycle.value == "available"
+                await sm.release_lease(lease)
+
+        assert sm._active_count == baseline
+        result = await sm.validate_invariants()
+        assert result["ok"], result
+        assert result["active_count"] == baseline
+        assert result["live_clients"] == baseline
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +609,43 @@ class TestCancellation:
         if key in sm._sessions:
             assert sm._sessions[key].lifecycle.value in ("available", "disconnected")
 
+    @pytest.mark.asyncio
+    async def test_cancelled_task_releases_every_resource(self):
+        sm, db = _build_sm()
+        phone = _make_phone(71)
+        _store_session(db, phone, _make_session_doc(phone))
+
+        async def worker():
+            async with sm.acquire(
+                phone,
+                module="cancel-test",
+                auto_release=True,
+            ) as lease:
+                assert lease is not None
+                await asyncio.sleep(999)
+
+        task = asyncio.create_task(worker())
+        await asyncio.sleep(0.05)
+        assert sm._active_count == 1
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        key = sm._session_key(phone)
+        if key in sm._sessions:
+            info = sm._sessions[key]
+            assert info.lifecycle.value in ("available", "disconnected")
+            assert info.owner is None
+            assert info.lease_id is None
+            assert info.client is None
+            assert info.proxy_url is None
+
+        assert sm._active_count == 0
+        stats = await sm.validate_invariants()
+        assert stats["ok"], stats
+
 
 # ---------------------------------------------------------------------------
 # Tests: Active client count
@@ -443,6 +693,36 @@ class TestGracefulShutdown:
             assert sm._active_count >= 1
 
         await sm.disconnect_all()
+        assert sm._active_count == 0
+
+    @pytest.mark.asyncio
+    async def test_disconnect_all_preserves_quarantined_state(self):
+        # Shutdown must NEVER flip QUARANTINED/TERMINAL back to AVAILABLE.
+        sm, db = _build_sm()
+        phone = _make_phone(91)
+        _store_session(db, phone, _make_session_doc(phone))
+
+        async with sm.acquire(
+            phone,
+            module="test",
+            auto_release=False,
+        ) as lease:
+            assert lease is not None
+            await sm.mark_quarantined(
+                phone,
+                "shutdown test",
+                ErrorCategory.AUTH_KEY_DUPLICATED,
+            )
+
+        await sm.disconnect_all()
+
+        async with sm._lock:
+            info = sm._sessions[sm._session_key(phone)]
+            assert (
+                info.lifecycle
+                == SessionLifecycleState.QUARANTINED
+            )
+            assert info.client is None
         assert sm._active_count == 0
 
 

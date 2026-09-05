@@ -35,4 +35,9 @@ build/
 *.a
 *.dll
 *.exe
+
+# Telegram session files (credentials — NEVER commit)
+*.session
+*.session-journal
+*.session-journal-*
 ```

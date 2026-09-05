@@ -31,6 +31,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, Optional
+from urllib.parse import urlparse
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -86,16 +87,24 @@ TERMINAL_STATUSES = frozenset({
 
 @dataclass
 class SessionInfo:
-    """Runtime state for a single logical session."""
-
     phone: str
     session_fingerprint: str
     status: str
     lifecycle: SessionLifecycleState = SessionLifecycleState.UNKNOWN
+
     client: Optional[TelegramClient] = None
+    client_building: bool = False
+
     proxy_url: Optional[str] = None
+    proxy_id: Optional[str] = None
+    proxy_lease_id: Optional[str] = None
+
     owner: Optional[str] = None
     worker_id: Optional[str] = None
+
+    reservation_id: Optional[str] = None
+    lease_id: Optional[str] = None
+
     client_id: Optional[str] = None
     connection_ts: Optional[float] = None
     last_used_ts: float = field(default_factory=time.time)
@@ -105,17 +114,28 @@ class SessionInfo:
 
 @dataclass
 class SessionLease:
-    """Lease record returned when a caller acquires a session."""
-
     phone: str
     session_fingerprint: str
     client: TelegramClient
+
     proxy_url: Optional[str]
+    proxy_id: Optional[str]
+    proxy_lease_id: Optional[str]
+
     owner: str
     worker_id: Optional[str]
     lease_id: str
-    acquired_at: float = field(default_factory=time.time)
+
+    acquired_at: float = field(
+        default_factory=time.time
+    )
+
     proxy_record: Optional[dict] = None
+
+    proxy_should_cooldown: bool = False
+    proxy_cooldown_reason: str = ""
+
+    released: bool = False
 
 
 class SessionAlreadyOwnedError(Exception):
@@ -153,7 +173,22 @@ class SessionManager:
         self._session_idle_ttl = session_idle_ttl
 
     # ── helpers ──
-
+    @staticmethod
+    def _safe_proxy_label(proxy_url: Optional[str]) -> str:
+        """
+        Return a proxy label without exposing credentials.
+        """
+        if not proxy_url:
+            return ""
+    
+        try:
+            parsed = urlparse(proxy_url)
+            host = parsed.hostname or ""
+            port = parsed.port or ""
+            return f"{host}:{port}" if host else "<proxy>"
+        except Exception:
+            return "<proxy>"    
+        
     @staticmethod
     def session_fingerprint(session_str: str, api_id: int) -> str:
         """Deterministic fingerprint from session string + api_id."""
@@ -210,37 +245,50 @@ class SessionManager:
         auto_release: bool = True,
     ) -> AsyncIterator[Optional[SessionLease]]:
         """
-        Acquire a session lease for ``phone``.
-
-        Guarantees:
-          - If already BUSY/RESERVED by another owner, raises SessionAlreadyOwnedError.
-          - If QUARANTINED or TERMINAL, yields None (caller should skip).
-          - Creates exactly ONE TelegramClient for the phone.
-          - On exit, releases the lease unless ``auto_release`` is False.
+        Acquire exclusive ownership of one user session.
+    
+        Lifecycle:
+    
+            reserve
+              -> load DB record
+              -> validate status
+              -> acquire proxy
+              -> create client
+              -> atomically attach ownership
+              -> yield lease
+              -> release lease when auto_release=True
+    
+        Important:
+          * A short-lived operation owns the client for the full lease lifetime.
+          * The client and proxy are released together.
+          * A pre-yield failure rolls everything back.
+          * No session-manager lock is held during I/O.
         """
         if self._closed:
             raise RuntimeError("SessionManager is closed")
-
+    
         clean_phone = self._session_key(phone)
         lease_owner_key = f"{module}:{worker_id or uuid.uuid4().hex[:8]}"
+        reservation_id = uuid.uuid4().hex[:12]
+    
         lease: Optional[SessionLease] = None
-        reuse_existing: bool = False
         proxy_record: Optional[dict] = None
         client: Optional[TelegramClient] = None
-
-        # The entire pre-yield acquisition is cancellation-safe: if the caller's
-        # task is cancelled before a lease is yielded (e.g. while blocked in
-        # proxy acquisition, DB I/O, or a stale-client disconnect), we roll back
-        # the RESERVED reservation, release any acquired proxy, and disconnect
-        # any freshly created client so no resource leaks. A worker must never
-        # silently leave an owned session behind.
+        yielded = False
+    
         try:
-            # ── Phase 0: Idle session cleanup (OUTSIDE lock) ──
+            # ----------------------------------------------------------
+            # PHASE 0: Clean genuinely idle sessions.
+            # ----------------------------------------------------------
             await self.cleanup_idle_sessions()
-
-            # ── Phase 1: LOCK → check/reserve state → UNLOCK ──
+    
+            # ----------------------------------------------------------
+            # PHASE 1: Reserve phone in memory.
+            # NO external I/O while holding the lock.
+            # ----------------------------------------------------------
             async with self._lock:
                 existing = self._sessions.get(clean_phone)
+    
                 if existing:
                     if existing.lifecycle in (
                         SessionLifecycleState.BUSY,
@@ -251,44 +299,102 @@ class SessionManager:
                     ):
                         raise SessionAlreadyOwnedError(
                             f"Session +{clean_phone} is already owned by "
-                            f"{existing.owner} (lifecycle={existing.lifecycle.value})"
+                            f"{existing.owner} "
+                            f"(lifecycle={existing.lifecycle.value})"
                         )
+    
                     if existing.lifecycle in (
                         SessionLifecycleState.QUARANTINED,
                         SessionLifecycleState.TERMINAL,
                     ):
+                        await self._log_lifecycle(
+                            "SESSION_SKIPPED_TERMINAL",
+                            phone=clean_phone,
+                            session_fp=existing.session_fingerprint,
+                            module=module,
+                            worker_id=worker_id or "",
+                            error=f"lifecycle={existing.lifecycle.value}",
+                        )
                         yield None
                         return
-
+    
+                    # Never reuse a connected client in the normal short-lived
+                    # acquisition path. A released lease owns its client until
+                    # disconnect. Persistent workloads must explicitly keep their
+                    # lease alive with auto_release=False.
+                    if existing.client is not None:
+                        raise RuntimeError(
+                            f"Session +{clean_phone} has an unexpected retained "
+                            f"client while lifecycle={existing.lifecycle.value}"
+                        )
+    
                 if self._active_count >= self._max_active_clients:
                     raise RuntimeError(
-                        f"Maximum active clients ({self._max_active_clients}) reached"
+                        f"Maximum active clients "
+                        f"({self._max_active_clients}) reached"
                     )
-
+    
                 info = existing or SessionInfo(
                     phone=clean_phone,
                     session_fingerprint="",
                     status="",
                 )
-                if info not in self._sessions.values():
-                    self._sessions[clean_phone] = info
+    
+                self._sessions[clean_phone] = info
+    
                 info.lifecycle = SessionLifecycleState.RESERVED
                 info.owner = lease_owner_key
-
-            # ── Phase 2: I/O OUTSIDE the lock ──
+                info.worker_id = worker_id
+                info.reservation_id = reservation_id
+                info.lease_id = None
+                info.last_used_ts = time.time()
+    
+            # ----------------------------------------------------------
+            # PHASE 2: DB I/O OUTSIDE lock.
+            # ----------------------------------------------------------
             record = await self.db.get_session_by_phone_async(clean_phone)
+    
             if not record:
-                logger.warning(f"SESSION_ACQUIRE | phone={clean_phone} | no DB record")
-                await self._rollback_reservation(clean_phone, lease_owner_key)
+                await self._rollback_reservation(
+                    clean_phone,
+                    lease_owner_key,
+                    reservation_id,
+                )
                 yield None
                 return
-
+    
             status = str(record.get("status", "")).lower()
-
+    
             if status in TERMINAL_STATUSES:
-                session_str = record.get("session_string") or record.get("session", "")
-                api_id = int(record.get("api_id", CONFIG["API_ID"]))
-                fingerprint = self.session_fingerprint(session_str, api_id)
+                session_str = (
+                    record.get("session_string")
+                    or record.get("session", "")
+                )
+    
+                api_id = int(
+                    record.get(
+                        "api_id",
+                        CONFIG["API_ID"],
+                    )
+                )
+    
+                fingerprint = self.session_fingerprint(
+                    session_str,
+                    api_id,
+                )
+    
+                async with self._lock:
+                    info = self._sessions.get(clean_phone)
+    
+                    if info and info.owner == lease_owner_key:
+                        info.lifecycle = SessionLifecycleState.TERMINAL
+                        info.status = status
+                        info.session_fingerprint = fingerprint
+                        info.owner = None
+                        info.worker_id = None
+                        info.reservation_id = None
+                        info.lease_id = None
+    
                 await self._log_lifecycle(
                     "SESSION_SKIPPED_TERMINAL",
                     phone=clean_phone,
@@ -297,189 +403,251 @@ class SessionManager:
                     worker_id=worker_id or "",
                     error=f"status={status}",
                 )
-                async with self._lock:
-                    info = self._sessions.get(clean_phone)
-                    if info and info.owner == lease_owner_key:
-                        info.lifecycle = SessionLifecycleState.TERMINAL
-                        info.status = status
-                        info.session_fingerprint = fingerprint
+    
                 yield None
                 return
-
-            session_str = record.get("session_string") or record.get("session")
+    
+            # ----------------------------------------------------------
+            # PHASE 3: Validate session information.
+            # ----------------------------------------------------------
+            session_str = (
+                record.get("session_string")
+                or record.get("session")
+            )
+    
             if not session_str:
-                await self._rollback_reservation(clean_phone, lease_owner_key)
+                await self._rollback_reservation(
+                    clean_phone,
+                    lease_owner_key,
+                    reservation_id,
+                )
                 yield None
                 return
-
-            api_id = int(record.get("api_id", CONFIG["API_ID"]))
-            api_hash = str(record.get("api_hash", CONFIG["API_HASH"]))
-            fingerprint = self.session_fingerprint(session_str, api_id)
-            device = record.get("device_metadata") or random.choice(DEVICE_PROFILES)
-
-            # ── Phase 3: Check for reusable existing client ──
-            existing_client: Optional[TelegramClient] = None
+    
+            api_id = int(
+                record.get(
+                    "api_id",
+                    CONFIG["API_ID"],
+                )
+            )
+    
+            api_hash = str(
+                record.get(
+                    "api_hash",
+                    CONFIG["API_HASH"],
+                )
+            )
+    
+            fingerprint = self.session_fingerprint(
+                session_str,
+                api_id,
+            )
+    
+            device = (
+                record.get("device_metadata")
+                or random.choice(DEVICE_PROFILES)
+            )
+    
+            # ----------------------------------------------------------
+            # PHASE 4: Acquire ONE proxy route.
+            # ----------------------------------------------------------
+            if proxy_provider is not None:
+                proxy_record = await proxy_provider(clean_phone)
+    
+            elif self.proxy_lease_manager is not None:
+                proxy_record = await self.proxy_lease_manager.acquire_proxy(
+                    clean_phone,
+                    timeout=PROXY_ACQUIRE_TIMEOUT,
+                )
+    
+            if self.proxy_lease_manager is not None and proxy_record is None:
+                await self._log_lifecycle(
+                    "SESSION_WAITING_FOR_PROXY",
+                    phone=clean_phone,
+                    session_fp=fingerprint,
+                    module=module,
+                    worker_id=worker_id or "",
+                    error="proxy acquisition returned no lease",
+                )
+    
+                await self._rollback_reservation(
+                    clean_phone,
+                    lease_owner_key,
+                    reservation_id,
+                )
+    
+                yield None
+                return
+    
+            # ----------------------------------------------------------
+            # PHASE 5: Create exactly ONE Telegram client.
+            # ----------------------------------------------------------
+            client = self._create_client(
+                session_str=session_str,
+                api_id=api_id,
+                api_hash=api_hash,
+                device=device,
+                proxy=proxy_record,
+            )
+    
+            client_id = str(id(client))
+    
+            await self._log_lifecycle(
+                "SESSION_CLIENT_CREATED",
+                phone=clean_phone,
+                session_fp=fingerprint,
+                module=module,
+                worker_id=worker_id or "",
+                client_id=client_id,
+                proxy_url=(
+                    (proxy_record or {}).get("url", "")
+                    if proxy_record else ""
+                ),
+            )
+    
+            # ----------------------------------------------------------
+            # PHASE 6: Commit client + owner atomically.
+            # ----------------------------------------------------------
+            lease_id = uuid.uuid4().hex[:12]
+    
             async with self._lock:
                 info = self._sessions.get(clean_phone)
-                if info and info.client and info.client.is_connected():
-                    existing_client = info.client
-
-            if existing_client is not None:
-                await self._log_lifecycle(
-                    "SESSION_REUSED",
-                    phone=clean_phone,
-                    session_fp=fingerprint,
-                    module=module,
-                    worker_id=worker_id or "",
-                    client_id=str(id(existing_client)),
-                )
-                client = existing_client
-                reuse_existing = True
-            else:
-                # Client is gone or disconnected — clean up stale reference
-                if existing_client is not None:
-                    await self._safe_disconnect_client(existing_client)
-                    async with self._lock:
-                        info = self._sessions.get(clean_phone)
-                        if info and info.owner == lease_owner_key:
-                            info.client = None
-                            info.lifecycle = SessionLifecycleState.RESERVED
-
-                # ── Phase 4: Proxy acquisition + client creation (OUTSIDE lock) ──
-                skip_due_to_proxy = False
-
-                if proxy_provider is not None:
-                    proxy_record = await proxy_provider(clean_phone)
-                elif self.proxy_lease_manager is not None:
-                    proxy_record = await self.proxy_lease_manager.acquire_proxy(
-                        clean_phone, timeout=PROXY_ACQUIRE_TIMEOUT
+    
+                if info is None:
+                    raise SessionAlreadyOwnedError(
+                        f"Session +{clean_phone} disappeared during acquisition"
                     )
-                    if proxy_record is None:
-                        logger.warning(
-                            f"SESSION_SKIP_NO_PROXY | phone={clean_phone} | "
-                            f"module={module} | all proxies leased or timed out"
-                        )
-                        skip_due_to_proxy = True
-
-                if skip_due_to_proxy:
-                    await self._log_lifecycle(
-                        "SESSION_SKIP_NO_PROXY",
-                        phone=clean_phone,
-                        session_fp=fingerprint,
-                        module=module,
-                        worker_id=worker_id or "",
-                        error="proxy lease timeout",
+    
+                if info.owner != lease_owner_key:
+                    raise SessionAlreadyOwnedError(
+                        f"Session +{clean_phone} was acquired by another "
+                        f"owner while I/O was in progress"
                     )
-                    await self._rollback_reservation(clean_phone, lease_owner_key)
-                    yield None
-                    return
 
-                client = self._create_client(
-                    session_str=session_str,
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    device=device,
-                    proxy=proxy_record,
+                if info.reservation_id != reservation_id:
+                    raise SessionAlreadyOwnedError(
+                        f"Session +{clean_phone} reservation changed "
+                        "while I/O was in progress"
+                    )
+    
+                if info.client is not None:
+                    raise SessionAlreadyOwnedError(
+                        f"Session +{clean_phone} already has an active client"
+                    )
+    
+                info.client = client
+                info.session_fingerprint = fingerprint
+                info.status = status
+                info.lifecycle = SessionLifecycleState.BUSY
+                info.owner = lease_owner_key
+                info.worker_id = worker_id
+                info.lease_id = lease_id
+                info.client_id = client_id
+                info.connection_ts = time.time()
+                info.last_used_ts = time.time()
+                info.proxy_url = (
+                    proxy_record.get("url")
+                    if proxy_record
+                    else None
                 )
-
-                client_id = str(id(client))
-                await self._log_lifecycle(
-                    "SESSION_CONNECT_START",
-                    phone=clean_phone,
-                    session_fp=fingerprint,
-                    module=module,
-                    worker_id=worker_id or "",
-                    client_id=client_id,
-                    proxy_url=(proxy_record or {}).get("url", "") if proxy_record else "",
+                
+                info.proxy_id = (
+                    proxy_record.get("__proxy_id")
+                    if proxy_record
+                    else None
                 )
-
-                # ── Phase 5: LOCK → commit state → UNLOCK ──
-                async with self._lock:
-                    info = self._sessions.get(clean_phone)
-                    if info is None:
-                        info = SessionInfo(
-                            phone=clean_phone,
-                            session_fingerprint=fingerprint,
-                            status=status,
-                            lifecycle=SessionLifecycleState.RESERVED,
-                            client=client,
-                            proxy_url=(proxy_record or {}).get("url", "") if proxy_record else None,
-                            owner=lease_owner_key,
-                            worker_id=worker_id,
-                            client_id=client_id,
-                            connection_ts=time.time(),
-                        )
-                        self._sessions[clean_phone] = info
-                    else:
-                        if info.owner != lease_owner_key:
-                            raise SessionAlreadyOwnedError(
-                                f"Session +{clean_phone} was acquired by another owner "
-                                f"while lock was released"
-                            )
-                        info.client = client
-                        info.lifecycle = SessionLifecycleState.RESERVED
-                        info.owner = lease_owner_key
-                        info.worker_id = worker_id
-                        info.client_id = client_id
-                        info.connection_ts = time.time()
-                        info.proxy_url = (proxy_record or {}).get("url", "") if proxy_record else None
-                        info.session_fingerprint = fingerprint
-                        info.status = status
-
-                    info.lifecycle = SessionLifecycleState.BUSY
-                    info.owner = lease_owner_key
-                    info.last_used_ts = time.time()
-                    self._active_count += 1
-
-            # ── Phase 6: Create lease (OUTSIDE lock, common path for reuse and new) ──
-            proxy_url_for_lease = proxy_record.get("url", "") if proxy_record else None
-            if reuse_existing:
-                async with self._lock:
-                    info = self._sessions.get(clean_phone)
-                    proxy_url_for_lease = info.proxy_url if info else None
+                
+                info.proxy_lease_id = (
+                    proxy_record.get("__lease_id")
+                    if proxy_record
+                    else None                
+                )
+                self._active_count += 1
+    
+            # ----------------------------------------------------------
+            # PHASE 7: Produce the lease.
+            # ----------------------------------------------------------
 
             lease = SessionLease(
                 phone=clean_phone,
                 session_fingerprint=fingerprint,
                 client=client,
-                proxy_url=proxy_url_for_lease,
+            
+                proxy_url=(
+                    proxy_record.get("url")
+                    if proxy_record
+                    else None
+                ),
+            
+                proxy_id=(
+                    proxy_record.get("__proxy_id")
+                    if proxy_record
+                    else None
+                ),
+            
+                proxy_lease_id=(
+                    proxy_record.get("__lease_id")
+                    if proxy_record
+                    else None
+                ),
+            
                 owner=lease_owner_key,
                 worker_id=worker_id,
-                lease_id=uuid.uuid4().hex[:12],
-                proxy_record=(proxy_record if proxy_record else None),
+                lease_id=lease_id,
+                proxy_record=proxy_record,
+            )            
+    
+            await self._log_lifecycle(
+                "SESSION_ACQUIRED",
+                phone=clean_phone,
+                session_fp=fingerprint,
+                module=module,
+                worker_id=worker_id or "",
+                client_id=client_id,
+                proxy_url=lease.proxy_url or "",
+                lease_id=lease_id,
             )
-
-            # ── yield the lease to the caller (lock already released) ──
-            try:
-                yield lease
-            except AuthKeyDuplicatedError:
-                # Safety net: if caller doesn't catch this, quarantine automatically
-                await self.mark_quarantined(
-                    clean_phone,
-                    reason="AuthKeyDuplicatedError in acquire() caller",
-                    category=ErrorCategory.AUTH_KEY_DUPLICATED,
-                )
-                raise
-        except asyncio.CancelledError:
-            # Rollback any pre-yield state so the session is not left owned.
-            await self._cancel_rollback(
-                clean_phone, lease_owner_key, proxy_record, client
+    
+            yielded = True
+            yield lease
+    
+        except AuthKeyDuplicatedError:
+            # Handle terminal auth-key duplication centrally.
+            await self.mark_quarantined(
+                clean_phone,
+                reason="AuthKeyDuplicatedError during session operation",
+                category=ErrorCategory.AUTH_KEY_DUPLICATED,
             )
             raise
+    
+        except asyncio.CancelledError:
+            if not yielded:
+                await self._rollback_acquire_failure(
+                    clean_phone=clean_phone,
+                    owner_key=lease_owner_key,
+                    reservation_id=reservation_id,
+                    proxy_record=proxy_record,
+                    client=client,
+                )
+            raise
+    
+        except BaseException:
+            # IMPORTANT:
+            # This catches acquisition failures that happen AFTER proxy/client
+            # creation but BEFORE the lease reaches the caller.
+            if not yielded:
+                await self._rollback_acquire_failure(
+                    clean_phone=clean_phone,
+                    owner_key=lease_owner_key,
+                    reservation_id=reservation_id,
+                    proxy_record=proxy_record,
+                    client=client,
+                )
+            raise
+    
         finally:
-            clean_phone_release = self._session_key(phone)
-            if lease is not None:
-                if auto_release:
-                    await self._release_lease(clean_phone_release, lease_owner_key)
-                if (
-                    lease.proxy_record
-                    and lease.proxy_url
-                    and self.proxy_lease_manager is not None
-                ):
-                    await self.proxy_lease_manager.release_proxy(
-                        proxy_url=lease.proxy_url,
-                        phone=clean_phone_release,
-                    )
+            if lease is not None and auto_release:
+                await self.release_lease(lease)
 
     # ── Login flow ownership ──
     # The login/OTP/2FA flow creates an interactive TelegramClient BEFORE any
@@ -491,15 +659,37 @@ class SessionManager:
     # owned reservation with an explicit owner key.
 
     async def reserve_login(
-        self, phone: str, owner_key: str, client: Optional[Any] = None
+        self,
+        phone: str,
+        owner_key: str,
+        client: Optional[Any] = None,
     ) -> bool:
         """
-        Atomically reserve a phone for login. Returns True if reserved, False if
-        already owned by someone else or terminal.
+        Reserve a phone for login without holding the runtime lock across DB I/O.
         """
         clean_phone = self._session_key(phone)
+    
+        # --------------------------------------------
+        # DB check OUTSIDE runtime lock.
+        # --------------------------------------------
+        record = await self.db.get_session_by_phone_async(
+            clean_phone
+        )
+    
+        if record:
+            status = str(
+                record.get("status", "")
+            ).lower()
+    
+            if status in TERMINAL_STATUSES:
+                return False
+    
+        # --------------------------------------------
+        # Atomic in-memory reservation.
+        # --------------------------------------------
         async with self._lock:
             info = self._sessions.get(clean_phone)
+    
             if info and info.lifecycle in (
                 SessionLifecycleState.BUSY,
                 SessionLifecycleState.RESERVED,
@@ -510,13 +700,7 @@ class SessionManager:
                 SessionLifecycleState.TERMINAL,
             ):
                 return False
-
-            record = await self.db.get_session_by_phone_async(clean_phone)
-            if record:
-                status = str(record.get("status", "")).lower()
-                if status in TERMINAL_STATUSES:
-                    return False
-
+    
             new_info = SessionInfo(
                 phone=clean_phone,
                 session_fingerprint="",
@@ -524,8 +708,17 @@ class SessionManager:
                 lifecycle=SessionLifecycleState.LOGIN_PENDING,
                 client=client,
                 owner=owner_key,
+                worker_id=owner_key,
+                lease_id=uuid.uuid4().hex[:12],
             )
+    
+            if client is not None:
+                new_info.client_id = str(id(client))
+                new_info.connection_ts = time.time()
+                self._active_count += 1
+    
             self._sessions[clean_phone] = new_info
+    
             return True
 
     async def set_login_stage(
@@ -540,133 +733,663 @@ class SessionManager:
             info.lifecycle = stage
             return True
 
-    async def release_login(self, phone: str, owner_key: str) -> None:
+    async def release_login(
+        self,
+        phone: str,
+        owner_key: str,
+    ) -> None:
         """
-        Release a login reservation after completion/failure. Disconnects the
-        login client and removes the reservation so the phone can be acquired by
-        normal modules once the session is authorized and saved to DB.
+        Release a login reservation and its client safely.
         """
         clean_phone = self._session_key(phone)
         client_to_disconnect: Optional[TelegramClient] = None
+        proxy_url: Optional[str] = None
+        proxy_id: Optional[str] = None
+        proxy_lease_id: Optional[str] = None
+    
         async with self._lock:
             info = self._sessions.get(clean_phone)
-            if info and info.owner == owner_key and info.lifecycle in (
+    
+            if not info:
+                return
+    
+            if info.owner != owner_key:
+                logger.warning(
+                    "LOGIN_RELEASE_OWNER_MISMATCH | "
+                    "phone=%s | expected=%s | actual=%s",
+                    clean_phone,
+                    owner_key,
+                    info.owner,
+                )
+                return
+    
+            if info.lifecycle not in (
                 SessionLifecycleState.LOGIN_PENDING,
                 SessionLifecycleState.OTP_WAITING,
                 SessionLifecycleState.TWOFA_WAITING,
             ):
-                client_to_disconnect = info.client
-                self._sessions.pop(clean_phone, None)
-            else:
                 logger.warning(
-                    f"LOGIN_RELEASE_SKIPPED | phone={clean_phone} | "
-                    f"owner={owner_key} | state={info.lifecycle if info else None}"
+                    "LOGIN_RELEASE_INVALID_STATE | "
+                    "phone=%s | state=%s",
+                    clean_phone,
+                    info.lifecycle.value,
                 )
+                return
+    
+            client_to_disconnect = info.client
+            proxy_url = info.proxy_url
+            proxy_id = info.proxy_id
+            proxy_lease_id = info.proxy_lease_id
+    
+            if client_to_disconnect is not None:
+                self._active_count = max(
+                    0,
+                    self._active_count - 1,
+                )
+    
+            self._sessions.pop(clean_phone, None)
+    
         if client_to_disconnect is not None:
-            await self._safe_disconnect_client(client_to_disconnect)
+            await self._safe_disconnect_client(
+                client_to_disconnect
+            )
+    
+        if (
+            proxy_url
+            or proxy_id
+        ) and self.proxy_lease_manager is not None:
+            try:
+                await self.proxy_lease_manager.release_proxy(
+                    proxy_url=proxy_url,
+                    proxy_id=proxy_id,
+                    lease_id=proxy_lease_id,
+                    phone=clean_phone,
+                )
+            except Exception as exc:
+                logger.error(
+                    "LOGIN_PROXY_RELEASE_FAILED | "
+                    "phone=%s | error=%s",
+                    clean_phone,
+                    exc,
+                )
 
-    async def _rollback_reservation(self, clean_phone: str, owner_key: str) -> None:
-        """Release a RESERVED state without disconnecting client or releasing proxy."""
+    async def build_login_client(
+        self,
+        phone: str,
+        owner_key: str,
+        *,
+        session_str: str,
+        api_id: int,
+        api_hash: str,
+        device: dict,
+        proxy: Optional[dict] = None,
+    ) -> Optional[TelegramClient]:
+    
+        clean_phone = self._session_key(phone)
+    
+        login_lifecycles = (
+            SessionLifecycleState.LOGIN_PENDING,
+            SessionLifecycleState.OTP_WAITING,
+            SessionLifecycleState.TWOFA_WAITING,
+        )
+    
         async with self._lock:
             info = self._sessions.get(clean_phone)
-            if info and info.owner == owner_key:
-                info.lifecycle = SessionLifecycleState.AVAILABLE
+    
+            if (
+                not info
+                or info.owner != owner_key
+                or info.lifecycle not in login_lifecycles
+            ):
+                return None
+    
+            if info.client is not None:
+                return info.client
+    
+            if info.client_building:
+                return None
+    
+            info.client_building = True
+    
+        client: Optional[TelegramClient] = None
+        proxy_record = proxy
+    
+        try:
+            # If login caller does not supply a proxy, acquire one here.
+            if proxy_record is None and self.proxy_lease_manager is not None:
+                proxy_record = await self.proxy_lease_manager.acquire_proxy(
+                    clean_phone,
+                    timeout=PROXY_ACQUIRE_TIMEOUT,
+                )
+    
+                if proxy_record is None:
+                    return None
+    
+            client = self._create_client(
+                session_str=session_str,
+                api_id=api_id,
+                api_hash=api_hash,
+                device=device,
+                proxy=proxy_record,
+            )
+    
+            async with self._lock:
+                info = self._sessions.get(clean_phone)
+    
+                if (
+                    not info
+                    or info.owner != owner_key
+                    or info.lifecycle not in login_lifecycles
+                ):
+                    raise SessionAlreadyOwnedError(
+                        f"Login reservation lost for +{clean_phone}"
+                    )
+    
+                if info.client is not None:
+                    raise SessionAlreadyOwnedError(
+                        f"Login client already exists for +{clean_phone}"
+                    )
+    
+                info.client = client
+
+                info.proxy_url = (
+                    proxy_record.get("url")
+                    if proxy_record
+                    else None
+                )
+                
+                info.proxy_id = (
+                    proxy_record.get("__proxy_id")
+                    if proxy_record
+                    else None
+                )
+                
+                info.proxy_lease_id = (
+                    proxy_record.get("__lease_id")
+                    if proxy_record
+                    else None
+                )
+
+                info.client_id = str(id(client))
+                info.connection_ts = time.time()
+                info.last_used_ts = time.time()
+                info.client_building = False
+    
+                self._active_count += 1
+    
+            return client
+    
+        except BaseException:
+            if client is not None:
+                await self._safe_disconnect_client(client)
+    
+            if (
+                proxy_record
+                and self.proxy_lease_manager is not None
+            ):
+                proxy_url = proxy_record.get("url")
+                proxy_id = proxy_record.get("__proxy_id")
+                proxy_lease_id = proxy_record.get("__lease_id")
+
+                if proxy_url or proxy_id:
+                    try:
+                        await self.proxy_lease_manager.release_proxy(
+                            proxy_url=proxy_url,
+                            proxy_id=proxy_id,
+                            lease_id=proxy_lease_id,
+                            phone=clean_phone,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "LOGIN_BUILD_PROXY_ROLLBACK_FAILED | "
+                            "phone=%s | error=%s",
+                            clean_phone,
+                            exc,
+                        )
+    
+            raise
+    
+        finally:
+            async with self._lock:
+                info = self._sessions.get(clean_phone)
+                if info and info.owner == owner_key:
+                    info.client_building = False
+
+    async def is_owned(self, phone: str) -> bool:
+        """
+        True if ``phone`` is currently owned by THIS SessionManager instance:
+        i.e. BUSY/RESERVED by a worker, or held by a login/OTP/2FA reservation.
+        Used by background loops (auditor/recovery) to guarantee they never touch
+        an account another module is actively using.
+        """
+        clean_phone = self._session_key(phone)
+        async with self._lock:
+            info = self._sessions.get(clean_phone)
+            if not info:
+                return False
+            return info.lifecycle in (
+                SessionLifecycleState.BUSY,
+                SessionLifecycleState.RESERVED,
+                SessionLifecycleState.LOGIN_PENDING,
+                SessionLifecycleState.OTP_WAITING,
+                SessionLifecycleState.TWOFA_WAITING,
+            )
+
+    async def _rollback_reservation(
+        self,
+        clean_phone: str,
+        owner_key: str,
+        reservation_id: Optional[str] = None,
+    ) -> None:
+        """
+        Roll back a reservation that never acquired a client/proxy.
+        """
+        async with self._lock:
+            info = self._sessions.get(clean_phone)
+    
+            if not info:
+                return
+    
+            if (
+                info.owner != owner_key
+                or (
+                    reservation_id is not None
+                    and info.reservation_id != reservation_id
+                )
+            ):
+                return
+    
+            # Never overwrite terminal/quarantined states.
+            if info.lifecycle in (
+                SessionLifecycleState.QUARANTINED,
+                SessionLifecycleState.TERMINAL,
+            ):
                 info.owner = None
                 info.worker_id = None
+                info.reservation_id = None
+                info.lease_id = None
+                return
+    
+            info.lifecycle = SessionLifecycleState.AVAILABLE
+            info.owner = None
+            info.worker_id = None
+            info.reservation_id = None
+            info.lease_id = None
+            info.last_used_ts = time.time()
+
+    async def _rollback_acquire_failure(
+        self,
+        *,
+        clean_phone: str,
+        owner_key: str,
+        reservation_id: Optional[str],
+        proxy_record: Optional[dict],
+        client: Optional[TelegramClient],
+    ) -> None:
+        """
+        Roll back resources acquired before a SessionLease was successfully
+        yielded to the caller.
+    
+        This is the critical pre-yield cleanup path.
+        """
+        was_counted = False
+    
+        async with self._lock:
+            info = self._sessions.get(clean_phone)
+    
+            if (
+                info
+                and info.owner == owner_key
+                and info.reservation_id == reservation_id
+            ):
+                was_counted = info.client is not None
+    
+                info.client = None
+                info.proxy_url = None
+                info.proxy_id = None
+                info.proxy_lease_id = None
+                info.owner = None
+                info.worker_id = None
+                info.reservation_id = None
+                info.lease_id = None
+                info.client_id = None
+                info.connection_ts = None
                 info.last_used_ts = time.time()
+    
+                if info.lifecycle not in (
+                    SessionLifecycleState.QUARANTINED,
+                    SessionLifecycleState.TERMINAL,
+                ):
+                    info.lifecycle = SessionLifecycleState.AVAILABLE
+    
+            if was_counted:
+                self._active_count = max(
+                    0,
+                    self._active_count - 1,
+                )
+    
+        # Never hold SessionManager lock during I/O.
+        if client is not None:
+            await self._safe_disconnect_client(client)
+    
+        if (
+            proxy_record
+            and self.proxy_lease_manager is not None
+        ):
+            proxy_url = proxy_record.get("url")
+            proxy_id = proxy_record.get("__proxy_id")
+            proxy_lease_id = proxy_record.get("__lease_id")
+
+            if proxy_url or proxy_id:
+                try:
+                    await self.proxy_lease_manager.release_proxy(
+                        proxy_url=proxy_url,
+                        proxy_id=proxy_id,
+                        lease_id=proxy_lease_id,
+                        phone=clean_phone,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "ACQUIRE_ROLLBACK_PROXY_RELEASE_FAILED | "
+                        "phone=%s | error=%s",
+                        clean_phone,
+                        exc,
+                    )
+
 
     async def _cancel_rollback(
         self,
         clean_phone: str,
         owner_key: str,
+        reservation_id: Optional[str],
         proxy_record: Optional[dict],
         client: Optional[TelegramClient],
     ) -> None:
-        """Cancellation safety: release a RESERVED reservation, free an acquired
-        proxy, and disconnect a freshly-created client whose lease was never
-        yielded. Called only when a caller task is cancelled during pre-yield
-        acquire() phases. No lock is held across any await."""
-        # Release the reservation for this owner (no disconnect under lock).
-        async with self._lock:
-            info = self._sessions.get(clean_phone)
-            if info and info.owner == owner_key:
-                info.client = None
-                info.lifecycle = SessionLifecycleState.AVAILABLE
-                info.owner = None
-                info.worker_id = None
-                info.last_used_ts = time.time()
+        """Backward-compatible cancellation rollback wrapper."""
+        await self._rollback_acquire_failure(
+            clean_phone=clean_phone,
+            owner_key=owner_key,
+            reservation_id=reservation_id,
+            proxy_record=proxy_record,
+            client=client,
+        )
 
-        # Free any proxy that was acquired before cancellation.
-        if proxy_record and self.proxy_lease_manager is not None:
-            url = proxy_record.get("url", "")
-            if url:
-                await self.proxy_lease_manager.release_proxy(
-                    proxy_url=url,
-                    phone=clean_phone,
-                )
-
-        # Disconnect a client created but never leased.
-        if client is not None:
-            await self._safe_disconnect_client(client)
-
-    async def _release_lease(self, phone_key: str, owner_key: str) -> None:
+    async def _release_lease(
+        self,
+        phone_key: str,
+        owner_key: str,
+        lease_id: Optional[str] = None,
+    ) -> None:
+        """
+        Fully release a runtime session.
+    
+        Ownership state, client lifetime, and proxy lifetime are released together.
+    
+        No external I/O occurs while self._lock is held.
+        """
+        client_to_disconnect: Optional[TelegramClient] = None
+        proxy_url: Optional[str] = None
+        proxy_id: Optional[str] = None
+        proxy_lease_id: Optional[str] = None
+        lifecycle_after_release = SessionLifecycleState.AVAILABLE
+        client_was_active = False
+    
         async with self._lock:
             info = self._sessions.get(phone_key)
+    
             if not info:
                 return
+    
+            # Strong ownership check.
             if info.owner != owner_key:
                 logger.warning(
-                    f"LEASE_RELEASE_OWNER_MISMATCH | phone={phone_key} | "
-                    f"expected_owner={owner_key} | actual_owner={info.owner}"
+                    "LEASE_RELEASE_OWNER_MISMATCH | "
+                    "phone=%s | expected=%s | actual=%s",
+                    phone_key,
+                    owner_key,
+                    info.owner,
                 )
                 return
-            if info.lifecycle == SessionLifecycleState.AVAILABLE:
+    
+            # When a lease_id is available, require an exact match.
+            if (
+                lease_id is not None
+                and info.lease_id != lease_id
+            ):
                 logger.warning(
-                    f"DOUBLE_RELEASE_ATTEMPT | phone={phone_key} | owner={owner_key}"
+                    "LEASE_RELEASE_ID_MISMATCH | "
+                    "phone=%s | owner=%s | expected_lease=%s | "
+                    "actual_lease=%s",
+                    phone_key,
+                    owner_key,
+                    lease_id,
+                    info.lease_id,
                 )
                 return
-            info.lifecycle = SessionLifecycleState.AVAILABLE
+    
+            # Preserve terminal/quarantine state.
+            if info.lifecycle in (
+                SessionLifecycleState.QUARANTINED,
+                SessionLifecycleState.TERMINAL,
+            ):
+                lifecycle_after_release = info.lifecycle
+    
+            client_to_disconnect = info.client
+            proxy_url = info.proxy_url
+            proxy_id = info.proxy_id
+            proxy_lease_id = info.proxy_lease_id
+    
+            if client_to_disconnect is not None:
+                client_was_active = True
+                self._active_count = max(
+                    0,
+                    self._active_count - 1,
+                )
+    
+            # Clear runtime ownership.
+            info.client = None
+            
+            info.proxy_url = None
+            info.proxy_id = None
+            info.proxy_lease_id = None
+            
             info.owner = None
             info.worker_id = None
+            info.reservation_id = None
+            info.lease_id = None
+            
+            info.client_id = None
+            info.connection_ts = None
             info.last_used_ts = time.time()
+            info.lifecycle = lifecycle_after_release
+    
+        # ----------------------------------------------------------
+        # I/O OUTSIDE LOCK
+        # ----------------------------------------------------------
+        if client_to_disconnect is not None:
+            await self._safe_disconnect_client(
+                client_to_disconnect
+            )
+    
+        if (
+            proxy_url
+            or proxy_id
+        ) and self.proxy_lease_manager is not None:
+            try:
+                await self.proxy_lease_manager.release_proxy(
+                    proxy_url=proxy_url,
+                    proxy_id=proxy_id,
+                    lease_id=proxy_lease_id,
+                    phone=phone_key,
+                )
+            except Exception as exc:
+                logger.error(
+                    "SESSION_PROXY_RELEASE_FAILED | "
+                    "phone=%s | proxy=%s | error=%s",
+                    phone_key,
+                    self._safe_proxy_label(proxy_url),
+                    exc,
+                )
+    
+        await self._log_lifecycle(
+            "SESSION_RELEASED",
+            phone=phone_key,
+            module=owner_key,
+            client_id="",
+            proxy_url=proxy_url or "",
+            extra={
+                "client_was_active": client_was_active,
+                "active_count": self._active_count,
+            },
+        )
 
-    async def release_lease(self, lease: Optional[SessionLease]) -> None:
+    async def release_lease(
+        self,
+        lease: Optional[SessionLease],
+    ) -> None:
         """
-        PUBLIC lease-release interface (Phase 3.4).
+        Public idempotent lease-release API.
 
-        Feature modules (adder, dmsender, web_console, videochat, main_bot)
-        MUST release a session through this method rather than the private
-        ``_release_lease``. Ownership is verified from the lease record, so an
-        accidental release of another worker's lease is rejected.
-
-        Idempotent: ``lease=None`` or an already-released lease is a no-op
-        (a double release is logged as DOUBLE_RELEASE_ATTEMPT by
-        ``_release_lease``).
+        Ownership is validated BEFORE any mutation: a wrong-owner or stale
+        lease is rejected without touching lifecycle state, the client, the
+        proxy lease, or any counter. The lease object is only marked released
+        once its ownership is confirmed, so legitimate release attempts are
+        never blocked by a rejected forgery of the same lease.
         """
         if lease is None:
             return
+    
+        if lease.released:
+            logger.debug(
+                "DOUBLE_RELEASE_ATTEMPT | phone=%s | lease_id=%s",
+                self._session_key(lease.phone),
+                lease.lease_id,
+            )
+            return
+    
         phone_key = self._session_key(lease.phone)
-        await self._release_lease(phone_key, lease.owner)
+    
+        # Validate ownership + lease epoch before any mutation.
+        async with self._lock:
+            info = self._sessions.get(phone_key)
+    
+            if not info:
+                lease.released = True
+                return
+    
+            if info.owner != lease.owner:
+                logger.warning(
+                    "LEASE_RELEASE_OWNER_MISMATCH | "
+                    "phone=%s | expected=%s | actual=%s",
+                    phone_key,
+                    lease.owner,
+                    info.owner,
+                )
+                return
+    
+            if (
+                lease.lease_id is not None
+                and info.lease_id != lease.lease_id
+            ):
+                logger.warning(
+                    "LEASE_RELEASE_ID_MISMATCH | "
+                    "phone=%s | owner=%s | expected_lease=%s | "
+                    "actual_lease=%s",
+                    phone_key,
+                    lease.owner,
+                    lease.lease_id,
+                    info.lease_id,
+                )
+                return
+    
+            # Ownership confirmed: guard against concurrent duplicate releases.
+            lease.released = True
+    
+        await self._release_lease(
+            phone_key,
+            lease.owner,
+            lease.lease_id,
+        )
 
     async def mark_quarantined(
-        self, phone: str, reason: str, category: ErrorCategory
+        self,
+        phone: str,
+        reason: str,
+        category: ErrorCategory,
     ) -> None:
-        """Mark a session as quarantined (e.g. AuthKeyDuplicatedError)."""
+        """
+        Mark a session as terminal/quarantined and immediately release
+        its live client/proxy resources.
+    
+        Terminal state is NEVER changed back to AVAILABLE by normal release.
+        """
         clean_phone = self._session_key(phone)
+    
         client_to_disconnect: Optional[TelegramClient] = None
+        proxy_url: Optional[str] = None
+        proxy_id: Optional[str] = None
+        proxy_lease_id: Optional[str] = None
+        had_client = False
+        session_fp = ""
+    
         async with self._lock:
             info = self._sessions.get(clean_phone)
+    
             if info:
+                session_fp = info.session_fingerprint
+    
                 info.lifecycle = SessionLifecycleState.QUARANTINED
-                info.last_error = f"{category.value}: {reason}"
+                info.last_error = (
+                    f"{category.value}: {reason}"
+                )
+    
                 client_to_disconnect = info.client
+                proxy_url = info.proxy_url
+                proxy_id = info.proxy_id
+                proxy_lease_id = info.proxy_lease_id
+    
+                had_client = client_to_disconnect is not None
+    
                 info.client = None
-                self._active_count = max(0, self._active_count - 1)
-
+                info.proxy_url = None
+                info.proxy_id = None
+                info.proxy_lease_id = None
+                info.owner = None
+                info.worker_id = None
+                info.lease_id = None
+                info.client_id = None
+    
+                if had_client:
+                    self._active_count = max(
+                        0,
+                        self._active_count - 1,
+                    )
+    
+        # I/O outside lock.
         if client_to_disconnect is not None:
-            await self._safe_disconnect_client(client_to_disconnect)
-
-        # Map category to correct DB status
+            await self._safe_disconnect_client(
+                client_to_disconnect
+            )
+    
+        if (
+            proxy_url
+            or proxy_id
+        ) and self.proxy_lease_manager is not None:
+            try:
+                await self.proxy_lease_manager.release_proxy(
+                    proxy_url=proxy_url,
+                    proxy_id=proxy_id,
+                    lease_id=proxy_lease_id,
+                    phone=clean_phone,
+                )
+            except Exception as exc:
+                logger.error(
+                    "QUARANTINE_PROXY_RELEASE_FAILED | "
+                    "phone=%s | error=%s",
+                    clean_phone,
+                    exc,
+                )
+    
         category_to_db_status = {
             ErrorCategory.AUTH_KEY_DUPLICATED: "auth_key_duplicated",
             ErrorCategory.SESSION_REVOKED: "revoked",
@@ -674,45 +1397,80 @@ class SessionManager:
             ErrorCategory.ACCOUNT_BANNED: "banned",
             ErrorCategory.UNAUTHORIZED: "revoked",
         }
-        db_status = category_to_db_status.get(category, "failed")
+    
+        db_status = category_to_db_status.get(
+            category,
+            "permanently_failed",
+        )
+    
         try:
-            self._update_db_status_sync(clean_phone, db_status, reason)
-        except Exception as e:
-            logger.error(f"DB status update failed for {clean_phone}: {e}")
-
-        async with self._lock:
-            info = self._sessions.get(clean_phone)
-            session_fp = info.session_fingerprint if info else ""
+            await asyncio.to_thread(
+                self._update_db_status_sync,
+                clean_phone,
+                db_status,
+                reason,
+            )
+        except Exception as exc:
+            logger.error(
+                "QUARANTINE_DB_UPDATE_FAILED | "
+                "phone=%s | error=%s",
+                clean_phone,
+                exc,
+            )
+    
         await self._log_lifecycle(
             "SESSION_QUARANTINED",
             phone=clean_phone,
             session_fp=session_fp,
             module="session_manager",
-            error=f"category={category.value}, reason={reason}",
+            error=(
+                f"category={category.value}; "
+                f"reason={reason}"
+            ),
         )
 
-    async def release(self, phone: str, module: str) -> None:
-        """Release a previously acquired session."""
+    async def release(
+        self,
+        phone: str,
+        module: str,
+    ) -> None:
+        """
+        Backward-compatible release API.
+    
+        New code must use release_lease(SessionLease).
+        """
         clean_phone = self._session_key(phone)
+    
+        logger.warning(
+            "DEPRECATED_SESSION_RELEASE_API | "
+            "phone=%s | module=%s",
+            clean_phone,
+            module,
+        )
+    
         async with self._lock:
             info = self._sessions.get(clean_phone)
+    
             if not info:
                 return
+    
             if info.owner != module:
                 logger.warning(
-                    f"RELEASE_OWNER_MISMATCH | phone={clean_phone} | "
-                    f"expected={module} | actual={info.owner}"
+                    "RELEASE_OWNER_MISMATCH | "
+                    "phone=%s | expected=%s | actual=%s",
+                    clean_phone,
+                    module,
+                    info.owner,
                 )
                 return
-            if info.lifecycle == SessionLifecycleState.AVAILABLE:
-                logger.warning(
-                    f"DOUBLE_RELEASE_ATTEMPT | phone={clean_phone} | module={module}"
-                )
-                return
-            info.lifecycle = SessionLifecycleState.AVAILABLE
-            info.owner = None
-            info.worker_id = None
-            info.last_used_ts = time.time()
+    
+            lease_id = info.lease_id
+    
+        await self._release_lease(
+            clean_phone,
+            module,
+            lease_id,
+        )
 
     async def release_proxy(self, phone: str, proxy_url: str) -> None:
         """Release proxy lease associated with a session."""
@@ -731,6 +1489,35 @@ class SessionManager:
                 pass
 
     # ── internal ──
+
+    def create_client(
+        self,
+        *,
+        session_str: str,
+        api_id: int = 0,
+        api_hash: str = "",
+        device: Optional[dict] = None,
+        proxy: Optional[dict] = None,
+    ) -> TelegramClient:
+        """
+        PUBLIC factory — the only sanctioned way to obtain a TelegramClient for a
+        user session OUTSIDE the acquire()/lease lifecycle (e.g. the deprecated
+        backward-compat wrappers or one-off diagnostic construction).
+
+        Does NOT reserve/lease the phone; callers that perform work on an account
+        MUST use acquire()/managed_client() so ownership is enforced. This is a
+        thin pass-through to the single private factory (no second construction
+        path), kept public so no module reaches the private _create_client.
+        """
+        api_id = api_id or CONFIG["API_ID"]
+        api_hash = api_hash or CONFIG["API_HASH"]
+        return self._create_client(
+            session_str=session_str,
+            api_id=api_id,
+            api_hash=api_hash,
+            device=device or {},
+            proxy=proxy,
+        )
 
     def _create_client(
         self,
@@ -777,64 +1564,257 @@ class SessionManager:
             logger.error(f"DB status update failed for {phone}: {e}")
 
     async def disconnect_all(self) -> int:
-        """Disconnect every tracked client. Called on shutdown."""
-        clients_to_disconnect: list = []
-        async with self._lock:
-            for info in list(self._sessions.values()):
-                if info.client:
-                    clients_to_disconnect.append(info.client)
-                    info.client = None
-                    info.lifecycle = SessionLifecycleState.DISCONNECTED
-            count = len(clients_to_disconnect)
-            self._active_count = 0
-        for client in clients_to_disconnect:
-            await self._safe_disconnect_client(client)
-        return count
+        """
+        Disconnect every tracked client and release proxy ownership.
 
-    async def get_stats(self) -> Dict[str, Any]:
-        """Return runtime statistics."""
-        terminal = sum(
-            1 for s in self._sessions.values()
-            if s.lifecycle in (SessionLifecycleState.TERMINAL, SessionLifecycleState.QUARANTINED)
-        )
-        busy = sum(
-            1 for s in self._sessions.values()
-            if s.lifecycle in (SessionLifecycleState.BUSY, SessionLifecycleState.RESERVED)
-        )
-        return {
-            "total_tracked": len(self._sessions),
-            "active_clients": self._active_count,
-            "busy": busy,
-            "quarantined": terminal,
-            "max_clients": self._max_active_clients,
-        }
+        Ordered shutdown (never hold the lock during I/O):
 
-    async def cleanup_idle_sessions(self) -> int:
-        """Remove AVAILABLE sessions idle beyond TTL. Returns count removed."""
-        now = time.time()
-        removed = []
+          stop new work       -> snapshot all tracked sessions under the lock
+          clear ownership     -> atomically clear client/proxy/owner fields and
+                                 set _active_count to zero
+          disconnect clients  -> I/O outside the lock
+          release proxies     -> I/O outside the lock, using the precise
+                                 proxy_id / lease_id captured per session
+
+        Terminal/quarantined lifecycles are preserved (never flipped back to
+        AVAILABLE). Idempotent: a second call has nothing left to release.
+        """
+        snapshots: list = []
+
         async with self._lock:
             for phone_key, info in list(self._sessions.items()):
+                snapshots.append(
+                    (
+                        phone_key,
+                        info.client,
+                        info.proxy_url,
+                        info.proxy_id,
+                        info.proxy_lease_id,
+                    )
+                )
+
+                if info.lifecycle not in (
+                    SessionLifecycleState.QUARANTINED,
+                    SessionLifecycleState.TERMINAL,
+                ):
+                    info.lifecycle = SessionLifecycleState.DISCONNECTED
+
+                info.client = None
+                info.proxy_url = None
+                info.proxy_id = None
+                info.proxy_lease_id = None
+                info.owner = None
+                info.worker_id = None
+                info.lease_id = None
+                info.client_id = None
+                info.connection_ts = None
+                info.last_used_ts = time.time()
+
+            self._active_count = 0
+
+        # I/O outside the lock: disconnect clients, then release matching
+        # proxy leases using the exact proxy_id / lease_id captured above.
+        for (
+            phone_key,
+            client,
+            proxy_url,
+            proxy_id,
+            proxy_lease_id,
+        ) in snapshots:
+            if client is not None:
+                await self._safe_disconnect_client(client)
+
+            if (proxy_url or proxy_id) and self.proxy_lease_manager is not None:
+                try:
+                    await self.proxy_lease_manager.release_proxy(
+                        proxy_url=proxy_url,
+                        proxy_id=proxy_id,
+                        lease_id=proxy_lease_id,
+                        phone=phone_key,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "DISCONNECT_ALL_PROXY_RELEASE_FAILED | "
+                        "phone=%s | error=%s",
+                        phone_key,
+                        exc,
+                    )
+
+        return len(snapshots)
+
+    async def get_stats(self) -> Dict[str, Any]:
+        async with self._lock:
+            total_tracked = len(self._sessions)
+    
+            terminal = sum(
+                1
+                for s in self._sessions.values()
+                if s.lifecycle in (
+                    SessionLifecycleState.TERMINAL,
+                    SessionLifecycleState.QUARANTINED,
+                )
+            )
+    
+            busy = sum(
+                1
+                for s in self._sessions.values()
+                if s.lifecycle in (
+                    SessionLifecycleState.BUSY,
+                    SessionLifecycleState.RESERVED,
+                    SessionLifecycleState.LOGIN_PENDING,
+                    SessionLifecycleState.OTP_WAITING,
+                    SessionLifecycleState.TWOFA_WAITING,
+                )
+            )
+    
+            return {
+                "total_tracked": total_tracked,
+                "active_clients": self._active_count,
+                "busy": busy,
+                "quarantined": terminal,
+                "max_clients": self._max_active_clients,
+            }
+
+    async def validate_invariants(self) -> Dict[str, Any]:
+        """
+        Internal consistency check.
+    
+        Intended for tests/diagnostics.
+        """
+        async with self._lock:
+            live_clients = 0
+            owned_sessions = 0
+            violations = []
+    
+            for phone, info in self._sessions.items():
+    
+                if info.client is not None:
+                    live_clients += 1
+    
+                if info.owner is not None:
+                    owned_sessions += 1
+    
+                if (
+                    info.lifecycle == SessionLifecycleState.BUSY
+                    and info.client is None
+                ):
+                    violations.append(
+                        f"{phone}: BUSY without client"
+                    )
+    
+                if (
+                    info.client is None
+                    and info.proxy_url is not None
+                    and info.lifecycle != SessionLifecycleState.LOGIN_PENDING
+                    and info.lifecycle != SessionLifecycleState.OTP_WAITING
+                    and info.lifecycle != SessionLifecycleState.TWOFA_WAITING
+                ):
+                    violations.append(
+                        f"{phone}: proxy exists without client"
+                    )
+    
+                if (
+                    info.owner is None
+                    and info.lease_id is not None
+                ):
+                    violations.append(
+                        f"{phone}: lease_id without owner"
+                    )
+    
+                if (
+                    info.owner is None
+                    and info.lifecycle == SessionLifecycleState.BUSY
+                ):
+                    violations.append(
+                        f"{phone}: BUSY without owner"
+                    )
+    
+            if live_clients != self._active_count:
+                violations.append(
+                    "active_count mismatch: "
+                    f"counter={self._active_count}, "
+                    f"actual={live_clients}"
+                )
+    
+            return {
+                "ok": not violations,
+                "active_count": self._active_count,
+                "live_clients": live_clients,
+                "owned_sessions": owned_sessions,
+                "tracked_sessions": len(self._sessions),
+                "violations": violations,
+            }
+        
+    async def cleanup_idle_sessions(self) -> int:
+        """
+        Retire idle AVAILABLE clients without creating a window where another
+        worker can create a second client for the same session.
+        """
+        now = time.time()
+        retiring = []
+    
+        async with self._lock:
+            for phone_key, info in list(
+                self._sessions.items()
+            ):
                 if (
                     info.lifecycle == SessionLifecycleState.AVAILABLE
-                    and (now - info.last_used_ts) > self._session_idle_ttl
+                    and info.client is not None
+                    and (
+                        now - info.last_used_ts
+                        > self._session_idle_ttl
+                    )
                 ):
-                    removed.append((phone_key, info))
-            for phone_key, info in removed:
-                del self._sessions[phone_key]
-                if info.client:
-                    self._active_count = max(0, self._active_count - 1)
-        # Disconnect clients outside lock
-        for phone_key, info in removed:
-            if info.client:
-                await self._safe_disconnect_client(info.client)
-        return len(removed)
-
-    async def shutdown(self) -> None:
-        """Graceful shutdown — disconnect all clients."""
-        self._closed = True
-        count = await self.disconnect_all()
-        logger.info(f"SessionManager shutdown: disconnected {count} clients")
+                    cleanup_owner = (
+                        f"__cleanup__:"
+                        f"{uuid.uuid4().hex[:8]}"
+                    )
+    
+                    info.lifecycle = SessionLifecycleState.RESERVED
+                    info.owner = cleanup_owner
+                    info.lease_id = None
+    
+                    retiring.append(
+                        (
+                            phone_key,
+                            cleanup_owner,
+                            info.client,
+                        )
+                    )
+    
+        removed = 0
+    
+        for phone_key, cleanup_owner, client in retiring:
+    
+            await self._safe_disconnect_client(client)
+    
+            async with self._lock:
+                info = self._sessions.get(phone_key)
+    
+                if (
+                    info
+                    and info.owner == cleanup_owner
+                    and info.lifecycle == SessionLifecycleState.RESERVED
+                ):
+                    info.client = None
+                    info.proxy_url = None
+                    info.owner = None
+                    info.worker_id = None
+                    info.lease_id = None
+                    info.client_id = None
+                    info.lifecycle = (
+                        SessionLifecycleState.DISCONNECTED
+                    )
+                    info.last_used_ts = time.time()
+    
+                    self._active_count = max(
+                        0,
+                        self._active_count - 1,
+                    )
+    
+                    removed += 1
+    
+        return removed
 
 
 # Backwards-compatible helper used by legacy modules

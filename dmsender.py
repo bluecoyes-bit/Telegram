@@ -3,27 +3,47 @@
 Ultimate Enterprise Telegram Suite - DM Sender Engine (Database Integrated)
 Filename: dmsender.py
 
-🔥 NEW: Proxy-Driven Dynamic Rolling Batch Architecture
+PATCH 5 — FINAL DM ENGINE LIFECYCLE + RESOURCE SCHEDULING FIX
+
+Ownership model (single source of truth):
+    SessionManager.acquire()
+            |  (owns client + session lease + proxy lease)
+            v
+    SessionLease  ->  DM operation  ->  context exit
+            |  (SessionManager releases client + proxy atomically)
+            v
+    cleanup
+
+Hard rules enforced here:
+  * all user sessions go through `async with self.session_manager.acquire(...)`
+  * NO direct TelegramClient construction in the DM worker lifecycle
+  * NO manual proxy release / client disconnect inside the DM worker
+  * SessionAlreadyOwnedError / lease=None are RESOURCE conditions, never
+    permanent target failures
+  * AuthKeyDuplicatedError quarantines the account and removes the candidate;
+    the same session is never retried
+  * bounded waiting only - no busy loops, no `time.sleep()` in async code
+  * wizard state is bounded with a TTL store
+  * reporter runs for the whole campaign (based on self.is_running) and starts
+    after workers exist (no startup race)
+  * campaign completion waits for inflight work (queued == 0 AND inflight == 0)
 """
 
 import os
+import time
 import asyncio
 import logging
 import random
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeAudio, InputPeerUser
 from telethon.errors import (
-    PeerIdInvalidError, FloodWaitError, UserBannedInChannelError,
-    UserDeactivatedError, AuthKeyUnregisteredError, SessionRevokedError,
-    UserIsBlockedError, UserPrivacyRestrictedError, PeerFloodError,
-    AuthKeyDuplicatedError,
+    FloodWaitError, SessionRevokedError, AuthKeyDuplicatedError,
 )
-from pymongo import MongoClient
 
-from config import CONFIG, DEVICE_PROFILES
+from config import CONFIG
 from exception_classifier import ErrorCategory, classify_exception
 from session_manager import SessionAlreadyOwnedError
 
@@ -31,6 +51,84 @@ logger = logging.getLogger("DMSenderEngine")
 
 # Priority Override: ADMIN_ID mapped to environment variable as per system rules
 ADMIN_ID = os.environ.get("ADMIN_ID")
+
+# DB statuses that never enter SessionManager acquisition.
+TERMINAL_STATUSES = frozenset({
+    "revoked",
+    "banned",
+    "deactivated",
+    "invalid",
+    "auth_key_duplicated",
+    "permanently_failed",
+    "quarantined",
+})
+
+
+class _WizardStateStore(dict):
+    """Bounded, TTL-managed wizard state store.
+
+    Stays dict-compatible (``store[user_id] = {...}``, ``store.pop(...)``,
+    ``user_id in store``) so external callers such as main_bot keep working,
+    while enforcing a maximum item count and a time-to-live.
+    """
+
+    def __init__(self, max_items: int = 1000, ttl_seconds: int = 1800):
+        super().__init__()
+        self.max_items = max_items
+        self.ttl_seconds = ttl_seconds
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def _cleanup(self, now: float) -> None:
+        expired = [
+            key for key, (ts, _) in list(self.items())
+            if now - ts > self.ttl_seconds
+        ]
+        for key in expired:
+            dict.__delitem__(self, key)
+
+    def __setitem__(self, key, value) -> None:
+        now = self._now()
+        self._cleanup(now)
+        dict.__setitem__(self, key, (now, value))
+        while len(self) > self.max_items:
+            dict.__delitem__(self, next(iter(self)))
+
+    def __getitem__(self, key):
+        entry = dict.__getitem__(self, key)
+        ts, value = entry
+        if self._now() - ts > self.ttl_seconds:
+            dict.__delitem__(self, key)
+            raise KeyError(key)
+        return value
+
+    def __contains__(self, key) -> bool:
+        try:
+            self[key]
+            return True
+        except KeyError:
+            return False
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def pop(self, key, default=None):
+        try:
+            value = self[key]
+        except KeyError:
+            return default
+        dict.__delitem__(self, key)
+        return value
+
+    def set(self, key, value) -> None:
+        self[key] = value
+
+    def remove(self, key) -> None:
+        dict.pop(self, key, None)
 
 
 def compute_dm_worker_capacity(
@@ -64,7 +162,12 @@ class EnterpriseDMSender:
         self.account_lease_manager = account_lease_manager
         self.is_running = False
         self.active_task = None
-        self.wizard_state: Dict[int, Dict[str, Any]] = {}
+        self._campaign_halted = False
+        # Bounded wizard state (PATCH 5): TTL + max-size, still dict-compatible.
+        self.wizard_state: _WizardStateStore = _WizardStateStore(
+            max_items=1000,
+            ttl_seconds=1800,
+        )
         self.stats = {
             "total_sent": 0,
             "failed": 0,
@@ -78,6 +181,19 @@ class EnterpriseDMSender:
         self.max_lifecycle_events = 500
         self.worker_states: Dict[int, str] = {}  # worker_id -> current waiting/state label
         self._dm_stall_timeout = 60.0           # worker must never wait silently longer than this
+        self._active_workers: List = []
+        self._campaign_metrics: Optional[Dict[str, Any]] = None
+
+        # PATCH 5: tunable bounds (tests may shrink these)
+        self._queue_poll_seconds = 0.5          # worker queue-wake granularity
+        self._resource_wait_bounds: Tuple[float, float] = (0.5, 1.5)
+        self._busy_exclusion_seconds = 2.0      # don't re-select a busy account faster than this
+        self._reporter_interval_seconds = 8.0   # live dashboard refresh interval
+        self._human_delay_override: Optional[Tuple[float, float]] = None
+        self._flood_delay_cap = int(CONFIG.get("DM_MAX_RETRY_DELAY", 60))
+        self.max_target_attempts = 5            # Telegram-visible retry budget per target
+        self._attempt_counts: Dict[str, int] = {}
+        self._used_phones = set()
 
     def _emit(self, event: str, worker: Optional[int] = None,
               phone: Optional[str] = None, detail: Optional[str] = None) -> None:
@@ -97,10 +213,246 @@ class EnterpriseDMSender:
         """Return a copy of the structured event log for tests/status."""
         return list(self.lifecycle_events)
 
+    def _set_worker_state(self, worker_id: int, state: str,
+                          phone: Optional[str] = None,
+                          detail: Optional[str] = None) -> None:
+        self.worker_states[worker_id] = state
+        self._emit(state, worker=worker_id, phone=phone, detail=detail)
+
+    # ──────────────────────────────────────────────
+    # Resource capacity helpers (read-only snapshots)
+    # ──────────────────────────────────────────────
+
+    async def _get_available_proxies(self) -> int:
+        """Read-only proxy capacity snapshot. Never mutates proxy state."""
+        if self.proxy_lease_manager is None:
+            return 0
+        async_cap = getattr(self.proxy_lease_manager, "get_available_count_async", None)
+        if async_cap is not None:
+            return int(await async_cap())
+        if hasattr(self.proxy_lease_manager, "get_available_count"):
+            return int(self.proxy_lease_manager.get_available_count())
+        return 0
+
+    async def _proxies_exhausted(self) -> bool:
+        if self.proxy_lease_manager is None:
+            return False
+        try:
+            count = await self._get_available_proxies()
+        except Exception:
+            count = 0
+        return count <= 0
+
+    async def _get_session_capacity(self, configured_limit: int) -> int:
+        if self.session_manager is None:
+            return configured_limit
+        try:
+            stats = await self.session_manager.get_stats()
+            max_clients = int(
+                getattr(self.session_manager, "_max_active_clients", configured_limit)
+            )
+            return max(1, max_clients - int(stats.get("active_clients", 0)))
+        except Exception:
+            return configured_limit
+
+    async def _bounded_resource_wait(self) -> bool:
+        """Wait without busy-looping. Returns whether the campaign still runs."""
+        low, high = self._resource_wait_bounds
+        await asyncio.sleep(random.uniform(low, high))
+        return self.is_running
+
+    def _human_delay(self) -> float:
+        if self._human_delay_override is not None:
+            low, high = self._human_delay_override
+            return random.uniform(low, high)
+        count = 1
+        if self.proxy_lease_manager is not None:
+            try:
+                count = max(1, int(self.proxy_lease_manager.get_available_count()))
+            except Exception:
+                count = 1
+        base = max(0.5, 45.0 / count)
+        return random.uniform(base, base + 1.0)
+
+    # ──────────────────────────────────────────────
+    # Account eligibility
+    # ──────────────────────────────────────────────
+
+    def _filter_eligible_accounts(self, account_docs: list) -> list:
+        """Drop known terminal accounts BEFORE any SessionManager acquisition."""
+        eligible = []
+        for doc in account_docs or []:
+            status = str(doc.get("status", "") or "").lower()
+            if status in TERMINAL_STATUSES:
+                continue
+            phone = str(doc.get("phone", "") or "").strip()
+            if not phone:
+                continue
+            eligible.append(doc)
+        return eligible
+
+    @staticmethod
+    def _target_key(target: Any) -> str:
+        if isinstance(target, dict):
+            uid = str(target.get("user_id") or "")
+            uname = str(target.get("username") or "")
+            return f"{uid}:{uname}"
+        return str(target)
+
+    async def _select_eligible_account(
+        self,
+        candidate_accounts: list,
+        busy_accounts: Dict[str, float],
+        rr: Dict[str, int],
+        rr_lock: asyncio.Lock,
+    ):
+        """Round-robin selection that skips temporarily busy accounts."""
+        if not candidate_accounts:
+            return None
+        now = time.monotonic()
+        for key in [k for k, exp in busy_accounts.items() if exp <= now]:
+            busy_accounts.pop(key, None)
+        async with rr_lock:
+            for _ in range(len(candidate_accounts)):
+                idx = rr["idx"] % len(candidate_accounts)
+                rr["idx"] += 1
+                doc = candidate_accounts[idx]
+                phone = str(doc.get("phone", "") or "").strip().replace("+", "")
+                if not phone:
+                    continue
+                if busy_accounts.get(phone, 0) > now:
+                    continue
+                return doc
+        return None
+
+    # ──────────────────────────────────────────────
+    # Target helpers
+    # ──────────────────────────────────────────────
+
+    def _requeue_target(self, target: Any, target_queue: asyncio.Queue, counter: dict) -> None:
+        target_queue.put_nowait(target)
+        counter["queued"] += 1
+        if self._campaign_metrics is not None:
+            self._campaign_metrics["queued"] = counter["queued"]
+
+    def _maybe_requeue(self, worker_id: int, phone: str, target: Any) -> bool:
+        """Consume one Telegram-visible retry attempt for the target.
+
+        Returns True when the target may be requeued, False once the retry
+        budget is exhausted (target is then failed loudly).
+        """
+        key = self._target_key(target)
+        self._attempt_counts[key] = self._attempt_counts.get(key, 0) + 1
+        if self._attempt_counts[key] >= self.max_target_attempts:
+            self.stats["failed"] += 1
+            if self._campaign_metrics is not None:
+                self._campaign_metrics["failed"] += 1
+            self._set_worker_state(
+                worker_id,
+                "TARGET_FAILED",
+                phone=phone,
+                detail=f"max_attempts={self.max_target_attempts}",
+            )
+            self._emit("send_failure", worker=worker_id, phone=phone,
+                       detail=f"target exhausted retry budget")
+            return False
+        return True
+
+    def _record_result(self, worker_id: int, phone: str, result: str) -> None:
+        if result == "sent":
+            self.stats["total_sent"] += 1
+            if self._campaign_metrics is not None:
+                self._campaign_metrics["completed"] += 1
+            self._used_phones.add(phone)
+            self._set_worker_state(worker_id, "SEND_SUCCESS", phone=phone)
+        else:
+            self.stats["failed"] += 1
+            if self._campaign_metrics is not None:
+                self._campaign_metrics["failed"] += 1
+            self._set_worker_state(worker_id, "TARGET_FAILED", phone=phone, detail=result)
+
+    async def _handle_terminal_account(
+        self,
+        worker_id: int,
+        phone: str,
+        reason: str,
+        category: ErrorCategory,
+        candidate_accounts: list,
+    ) -> None:
+        """Quarantine a terminal account and remove it from current candidates.
+
+        SessionManager owns quarantine + client/proxy cleanup. DM never
+        releases a proxy or disconnects a client itself here.
+        """
+        self.stats["accounts_down"] += 1
+        self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=phone, detail=reason[:80])
+        if self.session_manager is not None:
+            try:
+                await self.session_manager.mark_quarantined(
+                    phone,
+                    reason=reason[:100],
+                    category=category,
+                )
+            except Exception:
+                pass
+        for doc in list(candidate_accounts or []):
+            candidate_phone = str(doc.get("phone", "") or "").strip().replace("+", "")
+            if candidate_phone == phone:
+                try:
+                    candidate_accounts.remove(doc)
+                except ValueError:
+                    pass
+
+    async def _handle_operation_error(
+        self,
+        worker_id: int,
+        phone: Optional[str],
+        target: Any,
+        exc: BaseException,
+        candidate_accounts: list,
+        target_queue: asyncio.Queue,
+        counter: dict,
+    ) -> None:
+        result = classify_exception(exc)
+        category = result.category
+        logger.warning(
+            "DM_WORKER_ERROR | worker=%s | phone=%s | target=%s | exc=%s | category=%s",
+            worker_id,
+            phone or "",
+            self._target_key(target),
+            type(exc).__name__,
+            category.value,
+        )
+        if result.is_quarantinable:
+            self._set_worker_state(worker_id, "TERMINAL_ACCOUNT",
+                                   phone=phone, detail=category.value)
+            await self._handle_terminal_account(
+                worker_id, phone or "", result.reason, category, candidate_accounts,
+            )
+            if self._maybe_requeue(worker_id, phone or "", target):
+                self._requeue_target(target, target_queue, counter)
+            return
+        if not result.retryable:
+            # Target-level permanent error (privacy/blocked/invalid target, ...).
+            self._set_worker_state(worker_id, "TARGET_FAILED",
+                                   phone=phone, detail=category.value)
+            self.stats["failed"] += 1
+            if self._campaign_metrics is not None:
+                self._campaign_metrics["failed"] += 1
+            self._emit("send_failure", worker=worker_id, phone=phone,
+                       detail=f"{category.value}: {result.reason[:60]}")
+            return
+        # Transient Telegram/network error: bounded retry keeps the failure visible.
+        self._set_worker_state(worker_id, "RETRYING", phone=phone, detail=category.value)
+        await self._bounded_resource_wait()
+        if self._maybe_requeue(worker_id, phone or "", target):
+            self._requeue_target(target, target_queue, counter)
+
+    # ──────────────────────────────────────────────
+    # Status generators
+    # ──────────────────────────────────────────────
+
     async def _generate_live_status(self) -> str:
-        """LIVE STATUS generated for reporters/UI. Previously MISSING — root cause
-        of the 'DM Engine Started' then silent-stop bug."""
-        import time
         elapsed = max(1, int(time.time() - getattr(self, '_campaign_start_time', time.time())))
         elapsed_min = elapsed / 60
         rate = round(self.stats['total_sent'] / elapsed_min, 1) if elapsed_min > 0.1 else 0
@@ -113,11 +465,15 @@ class EnterpriseDMSender:
             eta_str = "Calculating..."
 
         active_workers = sum(1 for t in getattr(self, '_active_workers', []) if not t.done())
+        processing = sum(1 for s in self.worker_states.values() if s == "PROCESSING")
+        waiting = sum(1 for s in self.worker_states.values()
+                      if s in ("WAITING_FOR_PROXY", "WAITING_FOR_ACCOUNT",
+                               "SESSION_BUSY", "RETRYING", "ACQUIRING_SESSION"))
 
         proxy_stats = ""
         if self.proxy_lease_manager:
             try:
-                stats = self.proxy_lease_manager.get_stats()
+                stats = await self.proxy_lease_manager.get_stats()
                 proxy_stats = (
                     f"🛡️ **PROXY POOL**\n"
                     f"   🟢 Available: `{stats['available_proxies']}`\n"
@@ -127,8 +483,16 @@ class EnterpriseDMSender:
             except Exception:
                 proxy_stats = "🛡️ **PROXY POOL** (unavailable)\n"
 
-        stalled = sum(1 for s in self.worker_states.values()
-                      if s in ("WAITING_FOR_PROXY", "WAITING_FOR_ACCOUNT", "SESSION_BUSY"))
+        metrics = getattr(self, '_campaign_metrics', None) or {}
+        snapshot = ""
+        if metrics:
+            snapshot = (
+                f"🎛️ **CAMPAIGN RESOURCES**\n"
+                f"   👥 Eligible Accounts: `{metrics.get('eligible_accounts', 0)}`\n"
+                f"   🧮 Effective Workers: `{metrics.get('effective_worker_capacity', 0)}`\n"
+                f"   ⏳ Queued: `{metrics.get('queued', 0)}` | Inflight: `{metrics.get('inflight', 0)}`\n"
+            )
+
         state_line = ""
         if self.worker_states:
             grp = {}
@@ -143,157 +507,50 @@ class EnterpriseDMSender:
             f"🎯 Targets: `{self.stats['total_targets']}`\n"
             f"   Progress: `{round((self.stats['total_sent'] + self.stats['failed']) / max(1, self.stats['total_targets']) * 100, 1)}%`\n"
             f"⚡ Rate: `{rate} msgs/min` | Runtime: `{elapsed // 60}m {elapsed % 60}s` | ETA: `{eta_str}`\n"
-            f"👷 Active Workers: `{active_workers}` | Stalled: `{stalled}`\n"
+            f"👷 Active Workers: `{active_workers}` | Waiting: `{waiting}` | Processing: `{processing}`\n"
             f"👥 Accounts: used=`{self.stats['accounts_used']}` down=`{self.stats['accounts_down']}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{snapshot}"
             f"{proxy_stats}"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔄 Worker States: `{state_line or 'idle'}`\n"
             f"🔄 *Auto-updates every 8s • `/dm_status` for manual check*"
         )
-        # PATCH FIX: Remove hardcoded DB names and directly use initialized DB layer references
-        try:
-            # self.db.scraped_members pehle hi database.py me single DB 1 par mapped hai
-            print("🎯 [DM Engine] Database Connected with Single-DB Unified Mapping.")
-        except Exception as e:
-            logger.error(f"❌ Fatal Mapping Fault in Database Router: {e}")
 
-    @staticmethod
-    async def _force_cleanup_client(client: Optional[TelegramClient]) -> None:
-        """
-        🔥 ROBUST CLIENT CLEANUP (prevents ghost tasks & Future exception spam)
-        Deeply terminates Telethon client, cancelling internal sender loops and closing raw sockets.
-        """
-        if not client:
-            return
-        try:
-            sender = getattr(client, '_sender', None)
-            if sender:
-                sender._connecting = False
-                
-                # Cancel MTProtoSender loops
-                for loop_name in ['_recv_loop', '_send_loop', '_ping_loop']:
-                    task = getattr(sender, loop_name, None)
-                    if task and not task.done():
-                        task.cancel()
-                        try:
-                            await task  # Explicitly retrieve exception to silence event loop
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                
-                # Cancel Connection loops (stops "Task was destroyed" spam)
-                connection = getattr(sender, '_connection', None)
-                if connection:
-                    for loop_name in ['_recv_loop', '_send_loop', '_ping_loop']:
-                        task = getattr(connection, loop_name, None)
-                        if task and not task.done():
-                            task.cancel()
-                            try:
-                                await task
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                
-                # Force close raw transport/socket
-                transport = getattr(sender, '_transport', None)
-                if transport:
-                    try:
-                        await asyncio.wait_for(transport.close(), timeout=1.0)
-                    except Exception:
-                        pass
-            
-            if client.is_connected():
-                await asyncio.wait_for(client.disconnect(), timeout=2.0)
-        except Exception:
-            pass
-
-    def reset_stats(self):
-        self.stats = {
-            "total_sent": 0,
-            "failed": 0,
-            "accounts_used": 0,
-            "accounts_down": 0,
-            "total_targets": 0
-        }
-
-    def halt_campaign(self):
-        """Stops the DM campaign immediately."""
-        self.is_running = False
-        if self.active_task:
-            self.active_task.cancel()
-
-    async def execute_dm_campaign(self, target_list: list, message_text: str, media_path: str, limit: int, ui_callback):
-        """
-        🔥 Proxy-Driven Dynamic Rolling Batch DM Campaign Engine
-        
-        Golden Rule: If an account hits a ban/limit, its proxy goes to cooldown,
-        and the worker immediately picks the NEXT available account to complete
-        the SAME target. Process never halts waiting for other accounts.
-        
-        Parallel Execution: If N proxies are available, N workers run in parallel.
-        If a proxy dies, worker instantly swaps to next available proxy.
-        """
-        self.is_running = True
-        self.reset_stats()
-        import time as _t
-        self._campaign_start_time = _t.time()
-        self._emit("campaign_start", detail=f"targets={len(target_list) if limit > 0 else len(target_list)}")
-
-        # Clean safe text representation
-        final_text = str(message_text).strip() if message_text else ""
-        if final_text.lower() == "skip" or not final_text:
-            final_text = None
-
-        if not final_text and (not media_path or not os.path.exists(str(media_path))):
-            await ui_callback("❌ **Campaign Aborted:** Both Text and Media payload cannot be empty. Setup aborted.")
-            self.is_running = False
-            return
-
-        all_accounts = await self.db.get_active_target_sessions()
-        if not all_accounts:
-            await ui_callback("❌ **Campaign Aborted:** Koi active verified session nahi mila.")
-            self.is_running = False
-            return
-
-
-        return await self._dynamic_rolling_worker(
-            target_list, final_text, media_path, limit, ui_callback, all_accounts
-        )
-
-    def _generate_detailed_status(self) -> str:
-        """
-        🔥 COMPREHENSIVE LIVE STATUS - Shows exactly what's happening
-        """
-        import time
-        
-        # Calculate runtime & rate
+    async def _generate_detailed_status(self) -> str:
         elapsed = max(1, int(time.time() - getattr(self, '_campaign_start_time', time.time())))
         elapsed_min = elapsed / 60
         rate = round(self.stats['total_sent'] / elapsed_min, 1) if elapsed_min > 0.1 else 0
-        
-        # ETA calculation
+
         remaining = max(0, self.stats['total_targets'] - self.stats['total_sent'] - self.stats['failed'])
         if rate > 0:
             eta_min = round(remaining / rate)
             eta_str = f"{eta_min // 60}h {(eta_min % 60)}m" if eta_min > 60 else f"{eta_min}m"
         else:
             eta_str = "Calculating..."
-        
-        # Proxy stats (if lease manager available)
+
         proxy_stats = ""
         if self.proxy_lease_manager:
-            stats = self.proxy_lease_manager.get_stats()
-            proxy_stats = (
-                f"🛡️ **PROXY POOL**\n"
-                f"   🟢 Available: `{stats['available_proxies']}`\n"
-                f"   🔒 Leased: `{stats['current_active_leases']}`\n"
-                f"   🧊 In Cooldown: `{stats['proxies_in_cooldown']}`\n"
-                f"   📊 Total Acquires: `{stats['total_acquires']}`\n"
-            )
-        
-        # Worker activity indicator
+            try:
+                stats = await self.proxy_lease_manager.get_stats()
+                available = stats.get('available_proxies', 0)
+                try:
+                    if hasattr(self.proxy_lease_manager, "get_available_count_async"):
+                        available = await self.proxy_lease_manager.get_available_count_async()
+                except Exception:
+                    pass
+                proxy_stats = (
+                    f"🛡️ **PROXY POOL**\n"
+                    f"   🟢 Available: `{available}`\n"
+                    f"   🔒 Leased: `{stats['current_active_leases']}`\n"
+                    f"   🧊 In Cooldown: `{stats['proxies_in_cooldown']}`\n"
+                    f"   📊 Total Acquires: `{stats['total_acquires']}`\n"
+                )
+            except Exception:
+                proxy_stats = "🛡️ **PROXY POOL** (unavailable)\n"
+
         active_workers = sum(1 for t in getattr(self, '_active_workers', []) if not t.done())
-        
-        # Status emoji based on health
+
         if self.stats['accounts_down'] > self.stats['accounts_used'] * 0.5:
             health_icon = "🔴"
             health_text = "CRITICAL - Many accounts down"
@@ -306,7 +563,7 @@ class EnterpriseDMSender:
         else:
             health_icon = "🟡"
             health_text = "WAITING - No proxies available"
-        
+
         return (
             f"📊 **LIVE DM CAMPAIGN DASHBOARD**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -331,381 +588,438 @@ class EnterpriseDMSender:
             f"{proxy_stats}"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔄 *Auto-updates every 8s • `/dm_status` for manual check*"
-        )    
+        )
+
+    # ──────────────────────────────────────────────
+    # Campaign control
+    # ──────────────────────────────────────────────
+
+    def reset_stats(self):
+        self.stats = {
+            "total_sent": 0,
+            "failed": 0,
+            "accounts_used": 0,
+            "accounts_down": 0,
+            "total_targets": 0
+        }
+
+    def halt_campaign(self):
+        """Stops the DM campaign immediately (resource cleanup is left to the
+        SessionManager context managers, which unwind during cancellation)."""
+        self.is_running = False
+        self._campaign_halted = True
+        if self.active_task:
+            self.active_task.cancel()
+
+    async def execute_dm_campaign(self, target_list: list, message_text: str, media_path: str, limit: int, ui_callback):
+        """
+        🔥 Proxy-Driven Dynamic Rolling Batch DM Campaign Engine
+
+        Golden Rule: If an account hits a ban/limit, the account is quarantined
+        and removed from current candidates. Each target is retried according to
+        an explicit error category, while resource starvation is surfaced as
+        WAITING_FOR_PROXY / WAITING_FOR_ACCOUNT instead of a permanent failure.
+
+        Parallel Execution: if N proxies are available, at most N workers run.
+        The engine never starts one worker per account by default.
+        """
+        self.is_running = True
+        self._campaign_halted = False
+        self.reset_stats()
+        self._campaign_start_time = time.time()
+        self._attempt_counts = {}
+        self._used_phones = set()
+        self._emit("campaign_start", detail=f"targets={len(target_list) if limit > 0 else len(target_list)}")
+
+        final_text = str(message_text).strip() if message_text else ""
+        if final_text.lower() == "skip" or not final_text:
+            final_text = None
+
+        if not final_text and (not media_path or not os.path.exists(str(media_path))):
+            await ui_callback("❌ **Campaign Aborted:** Both Text and Media payload cannot be empty. Setup aborted.")
+            self.is_running = False
+            return
+
+        all_accounts = await self.db.get_active_target_sessions()
+        if not all_accounts:
+            await ui_callback("❌ **Campaign Aborted:** Koi active verified session nahi mila.")
+            self.is_running = False
+            return
+
+        # PATCH 5: terminal accounts never reach worker acquisition.
+        candidate_accounts = self._filter_eligible_accounts(all_accounts)
+        if not candidate_accounts:
+            await ui_callback(
+                "❌ **Campaign Aborted:** Koi eligible active session nahi mila "
+                "(all accounts terminal/filtered)."
+            )
+            self.is_running = False
+            return
+
+        return await self._dynamic_rolling_worker(
+            target_list, final_text, media_path, limit, ui_callback, candidate_accounts
+        )
+
+    # ──────────────────────────────────────────────
+    # Core engine
+    # ──────────────────────────────────────────────
 
     async def _dynamic_rolling_worker(
         self, target_list: list, final_text: Optional[str], media_path: str,
-        limit: int, ui_callback, all_accounts: list
+        limit: int, ui_callback, candidate_accounts: list
     ):
-        """
-        🔥 Dynamic Rolling Batch Worker using ProxyLeaseManager
-        
-        Each worker:
-        1. Picks a target from queue
-        2. Acquires proxy lease (blocks efficiently if none available)
-        3. Connects account with leased proxy
-        4. Executes DM action
-        5. Releases proxy (with cooldown if FloodWait/PeerFlood/Ban occurred)
-        6. Immediately picks next target - never waits for other accounts
-        """
-        targets = target_list[:limit] if limit > 0 else target_list
+        targets = list(target_list[:limit] if limit > 0 else target_list)
+        candidate_accounts = self._filter_eligible_accounts(candidate_accounts)
         self.stats["total_targets"] = len(targets)
-        self.stats["accounts_used"] = len(all_accounts)
-        self._emit("target_queue_created", detail=f"targets={len(targets)}")
-        
+        self.stats["accounts_used"] = len(candidate_accounts)
+        self._emit("target_queue_created",
+                   detail=f"targets={len(targets)}, accounts={len(candidate_accounts)}")
+
         await ui_callback(f"🚀 **DM Engine Started (Dynamic Rolling Batch)!**\n"
-                         f"Targets: `{len(targets)}`, Accounts: `{len(all_accounts)}`\n"
-                         f"Concurrency dictated by available proxies.")
+                          f"Targets: `{len(targets)}`, Accounts: `{len(candidate_accounts)}`\n"
+                          f"Concurrency dictated by available proxies.")
+
+        # Campaign resource snapshot (PATCH 5).
+        self._campaign_metrics = {
+            "eligible_accounts": len(candidate_accounts),
+            "available_proxies": 0,
+            "available_session_capacity": 0,
+            "effective_worker_capacity": 0,
+            "target_count": len(targets),
+            "queued": len(targets),
+            "inflight": 0,
+            "completed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "cancelled": 0,
+            "unprocessed": 0,
+        }
 
         target_queue = asyncio.Queue()
         for t in targets:
-            await target_queue.put(t)
+            target_queue.put_nowait(t)
 
-        last_ui_update = datetime.now()
-        active_workers = []
+        counter = {"queued": len(targets), "inflight": 0}
+        busy_accounts: Dict[str, float] = {}
+        active_workers: List[asyncio.Task] = []
         self._active_workers = active_workers
-        # 🔥 FIX: Round-robin account index prevents the stuck DM engine
-        # Old code: account_queue drained to empty → workers re-queued targets with no accounts
-        # New code: _account_rr_idx cycles through all_accounts indefinitely
-        _account_rr_lock = asyncio.Lock()
-        _account_rr_idx = 0
-    
-        # 🔥 NEW: Independent Reporter Task for Live UI Updates
-        async def _reporter():
-            while self.is_running and active_workers:
-                if any(not w.done() for w in active_workers):
-                    try:
-                        await ui_callback(await self._generate_live_status())
-                    except Exception:
-                        pass
-                await asyncio.sleep(8)
-    
-        reporter_task = asyncio.create_task(_reporter())
-        _campaign_start_loop = asyncio.get_event_loop().time()
 
-        
-        async def dm_worker(worker_id: int):
-            nonlocal last_ui_update
-            current_client = None
-            current_phone = None
-            current_proxy_url = None
-            consecutive_failures = 0
-            stall_count = 0
-            self.worker_states[worker_id] = "STARTED"
-            
-            try:
-                while self.is_running and not target_queue.empty():
-                    # Step 1: Get next target
-                    try:
-                        target_data = target_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+        _rr = {"idx": 0}
+        _rr_lock = asyncio.Lock()
 
-                    # Step 2: Get next account via round-robin (cycles indefinitely)
-                    async with _account_rr_lock:
-                        nonlocal _account_rr_idx
-                        if not all_accounts:
-                            await target_queue.put(target_data)
-                            self.worker_states[worker_id] = "WAITING_FOR_ACCOUNT"
-                            self._emit("WAITING_FOR_ACCOUNT", worker=worker_id, detail="no accounts available")
-                            break
-                        account_doc = all_accounts[_account_rr_idx % len(all_accounts)]
-                        _account_rr_idx = (_account_rr_idx + 1) % len(all_accounts)
-
-                    phone = account_doc.get("phone")
-                    if not phone:
-                        continue
-
-                    clean_phone = str(phone).replace("+", "")
-                    self._emit("account_selected", worker=worker_id, phone=clean_phone)
-                    self.worker_states[worker_id] = "ACCOUNT_SELECTED"
-
-                    # Step 3: Acquire session + proxy via SessionManager
-                    # This ensures ONE SESSION → ONE CLIENT (prevents AuthKeyDuplicatedError)
-                    # and handles proxy leasing automatically.
-                    try:
-                        self._emit("session_acquire_start", worker=worker_id, phone=clean_phone)
-                        self._emit("proxy_acquire_start", worker=worker_id, phone=clean_phone)
-                        self.worker_states[worker_id] = "WAITING_FOR_ACCOUNT"
-                        try:
-                            session_ctx = self.session_manager.acquire(
-                                clean_phone,
-                                module=f"dm_worker_{worker_id}",
-                                auto_release=True,
-                                timeout=10.0,
-                            )
-                        except AttributeError:
-                            # session_manager not wired (defensive)
-                            raise
-                        async with session_ctx as lease:
-                            if not lease:
-                                self._emit("SESSION_BUSY", worker=worker_id, phone=clean_phone, detail="no lease")
-                                self.worker_states[worker_id] = "SESSION_BUSY"
-                                stall_count += 1
-                                if stall_count >= 3:
-                                    self.stats["failed"] += 1
-                                    self._emit("send_failure", worker=worker_id, phone=clean_phone,
-                                               detail="no available sessions after 3 stalls")
-                                    logger.warning(
-                                        f"DM_WORKER_STALL | worker={worker_id} | "
-                                        f"stall_count={stall_count} | dropping target (no available sessions)"
-                                    )
-                                    break
-                                # Session unavailable — re-queue target and retry
-                                self._emit("session_acquired", worker=worker_id, phone=clean_phone,
-                                           detail="lease=None (retry)")
-                                await target_queue.put(target_data)
-                                await asyncio.sleep(1.0)
-                                continue
-                            stall_count = 0
-                            self._emit("session_acquired", worker=worker_id, phone=clean_phone)
-                            self._emit("proxy_acquired", worker=worker_id, phone=clean_phone,
-                                       detail=getattr(lease, "proxy_url", None))
-                            self._emit("client_created", worker=worker_id, phone=clean_phone)
-                            self.worker_states[worker_id] = "SESSION_ACQUIRED"
-
-                            client = lease.client
-
-                            # Step 4: Connect
-                            self._emit("connect_start", worker=worker_id, phone=clean_phone)
-                            self.worker_states[worker_id] = "CONNECTING"
-                            if not client.is_connected():
-                                await client.connect()
-                            self._emit("connected", worker=worker_id, phone=clean_phone)
-                            if not await client.is_user_authorized():
-                                self._emit("authorized", worker=worker_id, phone=clean_phone, detail="NOT authorized")
-                                self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
-                                raise AuthKeyUnregisteredError(request=None)
-                            self._emit("authorized", worker=worker_id, phone=clean_phone)
-
-                            # Step 5: Execute DM action
-                            entity = None
-                            if isinstance(target_data, dict):
-                                user_id = target_data.get("user_id")
-                                access_hash = target_data.get("access_hash")
-                                username = target_data.get("username")
-                                
-                                if username and str(username).strip() and str(username).lower() != "none":
-                                    u_str = str(username).strip()
-                                    entity = u_str if u_str.startswith("@") else f"@{u_str}"
-                                elif user_id and access_hash and str(access_hash) != "0":
-                                    try:
-                                        entity = InputPeerUser(int(user_id), int(access_hash))
-                                    except Exception:
-                                        entity = None
-                                        
-                                if not entity and user_id:
-                                    entity = int(user_id)
-                            else:
-                                target_str = str(target_data).strip()
-                                if target_str.isdigit():
-                                    entity = int(target_str)
-                                else:
-                                    entity = target_str if target_str.startswith("@") else f"@{target_str}"
-
-                            if not entity:
-                                raise ValueError("Could not construct entity tokens.")
-                            self._emit("target_resolved", worker=worker_id, phone=clean_phone, detail=str(entity)[:40])
-
-                            self._emit("send_start", worker=worker_id, phone=clean_phone)
-                            if media_path and os.path.exists(str(media_path)):
-                                is_voice = str(media_path).lower().endswith(('.ogg', '.mp3', '.m4a'))
-                                attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
-                                await client.send_file(
-                                    entity, str(media_path), caption=final_text,
-                                    voice_note=is_voice, attributes=attributes
-                                )
-                            else:
-                                await client.send_message(entity, final_text)
-
-                            self.stats["total_sent"] += 1
-                            consecutive_failures = 0
-                            current_client = client
-                            current_phone = clean_phone
-                            self._emit("send_success", worker=worker_id, phone=clean_phone)
-                            self.worker_states[worker_id] = "SEND_SUCCESS"
-
-                            # Human-like delay
-                            dynamic_delay = max(0.5, 45.0 / max(1, self.proxy_lease_manager.get_available_count()))
-                            await asyncio.sleep(random.uniform(dynamic_delay, dynamic_delay + 1.0))
-
-                    except SessionAlreadyOwnedError:
-                        stall_count += 1
-                        self._emit("SESSION_BUSY", worker=worker_id, phone=clean_phone, detail="SessionAlreadyOwnedError")
-                        self.worker_states[worker_id] = "SESSION_BUSY"
-                        if stall_count >= 3:
-                            self.stats["failed"] += 1
-                            self._emit("send_failure", worker=worker_id, phone=clean_phone,
-                                       detail="session busy after 3 retries")
-                            break
-                        continue
-                    except (PeerIdInvalidError, ValueError):
-                        self.stats["failed"] += 1
-                        consecutive_failures = 0
-                        self._emit("send_failure", worker=worker_id, phone=clean_phone, detail="PeerIdInvalid/ValueError")
-
-                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(await self._generate_live_status())
-                            last_ui_update = datetime.now()
-
-                    except (UserIsBlockedError, UserPrivacyRestrictedError):
-                        self.stats["failed"] += 1
-                        consecutive_failures = 0
-                        self._emit("send_failure", worker=worker_id, phone=clean_phone, detail="Blocked/Privacy")
-
-                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(await self._generate_live_status())
-                            last_ui_update = datetime.now()
-
-                    except (FloodWaitError, PeerFloodError) as e:
-                        consecutive_failures += 1
-                        self.stats["accounts_down"] += 1
-                        self.worker_states[worker_id] = "WAITING_FOR_PROXY"
-                        self._emit("send_failure", worker=worker_id, phone=clean_phone,
-                                   detail=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}")
-                        # Cooldown the proxy if we have it
-                        if lease.proxy_url and self.proxy_lease_manager:
-                            await self.proxy_lease_manager.release_proxy(
-                                proxy_url=lease.proxy_url, phone=clean_phone,
-                                should_cooldown=True,
-                                cooldown_reason=f"FloodWait/PeerFlood: {e.seconds if hasattr(e, 'seconds') else 'limit'}",
-                            )
-
-                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(await self._generate_live_status())
-                            last_ui_update = datetime.now()
-
-                    except (AuthKeyUnregisteredError, SessionRevokedError, UserDeactivatedError):
-                        self.stats["accounts_down"] += 1
-                        self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
-                        self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=clean_phone, detail="revoked/deactivated")
-                        # Quarantine the session so no other worker uses it
-                        if self.session_manager:
-                            await self.session_manager.mark_quarantined(
-                                clean_phone,
-                                reason="Session revoked/unauthorized in dm_worker",
-                                category=ErrorCategory.UNAUTHORIZED,
-                            )
-                        if hasattr(self.db, "mark_account_revoked"):
-                            self.db.mark_account_revoked(clean_phone, "Session revoked/unauthorized")
-
-                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(await self._generate_live_status())
-                            last_ui_update = datetime.now()
-
-                    except AuthKeyDuplicatedError:
-                        self.stats["accounts_down"] += 1
-                        self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
-                        self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=clean_phone, detail="auth_key_duplicated")
-                        if self.session_manager:
-                            await self.session_manager.mark_quarantined(
-                                clean_phone,
-                                reason="AuthKeyDuplicatedError in dm_worker",
-                                category=ErrorCategory.AUTH_KEY_DUPLICATED,
-                            )
-
-                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(await self._generate_live_status())
-                            last_ui_update = datetime.now()
-                            
-                    except Exception as e:
-                        error_str = str(e).lower()
-                        if any(x in error_str for x in ["banned", "deactivated", "revoked", "unauthorized"]):
-                            self.stats["accounts_down"] += 1
-                            self.worker_states[worker_id] = "TERMINAL_ACCOUNT"
-                            self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=clean_phone, detail=error_str[:40])
-                            if self.session_manager:
-                                await self.session_manager.mark_quarantined(
-                                    clean_phone,
-                                    reason=f"Runtime drop: {error_str[:40]}",
-                                    category=ErrorCategory.UNAUTHORIZED,
-                                )
-                            if hasattr(self.db, "mark_account_revoked"):
-                                self.db.mark_account_revoked(clean_phone, f"Runtime drop: {error_str[:40]}")
-                        else:
-                            consecutive_failures += 1
-                            self._emit("send_failure", worker=worker_id, phone=clean_phone, detail=error_str[:40])
-                            if consecutive_failures >= 2:
-                                pass  # Allow retry on transient errors
-
-                        if (datetime.now() - last_ui_update).seconds >= 8 or self.stats["total_sent"] % 10 == 0:
-                            await ui_callback(await self._generate_live_status())
-                            last_ui_update = datetime.now()
-                
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self.worker_states.pop(worker_id, None)
-                if current_phone:
-                    self._emit("session_release", worker=worker_id, phone=current_phone)
-                    self._emit("proxy_release", worker=worker_id, phone=current_phone)
-                    self._emit("account_release", worker=worker_id, phone=current_phone)
-
-        
-        # 🔥 RESOURCE-AWARE SCHEDULING (Phase 13)
-        # Do NOT create N workers merely because N is the configured maximum.
-        # effective_capacity = min(eligible_accounts, available_network_capacity,
-        #                          available_session_capacity, configured_limit).
-        # At least 1 worker is kept when accounts exist so the engine blocks on
-        # proxy/session acquisition (WAITING_FOR_PROXY / WAITING_FOR_ACCOUNT)
-        # instead of silently dropping valid work.
-        _configured_limit = int(CONFIG.get("DM_MAX_WORKERS", 20))
-        _available_proxies = 0
         try:
-            _available_proxies = self.proxy_lease_manager.get_available_count()
+            _configured_limit = int(CONFIG.get("DM_MAX_WORKERS", 20))
+        except (TypeError, ValueError):
+            _configured_limit = 20
+        try:
+            _available_proxies = await self._get_available_proxies()
         except Exception:
             _available_proxies = 0
-        _session_capacity = int(CONFIG.get("DM_MAX_WORKERS", 20))
         try:
-            if self.session_manager is not None:
-                _sm_stats = await self.session_manager.get_stats()
-                _session_capacity = max(
-                    1,
-                    self.session_manager._max_active_clients
-                    - int(_sm_stats.get("active_clients", 0)),
-                )
+            _session_capacity = await self._get_session_capacity(_configured_limit)
         except Exception:
-            _session_capacity = int(CONFIG.get("DM_MAX_WORKERS", 20))
+            _session_capacity = _configured_limit
 
-        if all_accounts:
-            _eff = compute_dm_worker_capacity(
-                num_accounts=len(all_accounts),
+        num_workers = (
+            compute_dm_worker_capacity(
+                num_accounts=len(candidate_accounts),
                 available_proxies=_available_proxies,
                 session_capacity=_session_capacity,
                 configured_limit=_configured_limit,
             )
-            num_workers = _eff
-        else:
-            num_workers = 0
+            if candidate_accounts else 0
+        )
+        self._campaign_metrics.update({
+            "available_proxies": _available_proxies,
+            "available_session_capacity": _session_capacity,
+            "effective_worker_capacity": num_workers,
+        })
         self._emit("worker_started",
                    detail=f"effective_capacity={num_workers} "
-                          f"(accounts={len(all_accounts)}, proxies={_available_proxies}, "
+                          f"(accounts={len(candidate_accounts)}, proxies={_available_proxies}, "
                           f"session_cap={_session_capacity}, limit={_configured_limit})")
+
+        async def dm_worker(worker_id: int) -> None:
+            self._set_worker_state(worker_id, "STARTED")
+            try:
+                while True:
+                    # Stop path: let SessionManager contexts unwind; no new work.
+                    if not self.is_running and counter["inflight"] == 0:
+                        break
+                    try:
+                        target = await asyncio.wait_for(
+                            target_queue.get(),
+                            timeout=self._queue_poll_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        # Queue is temporarily empty. Only exit when nothing is
+                        # queued AND nothing is in flight (no silent stall).
+                        if counter["queued"] == 0 and counter["inflight"] == 0:
+                            break
+                        continue
+                    if target is None:
+                        break
+
+                    counter["queued"] = max(0, counter["queued"] - 1)
+                    counter["inflight"] += 1
+                    if self._campaign_metrics is not None:
+                        self._campaign_metrics["queued"] = counter["queued"]
+                        self._campaign_metrics["inflight"] = counter["inflight"]
+                    try:
+                        await self._handle_target(
+                            worker_id, target, final_text, media_path,
+                            candidate_accounts, busy_accounts, _rr, _rr_lock,
+                            target_queue, counter,
+                        )
+                    finally:
+                        counter["inflight"] = max(0, counter["inflight"] - 1)
+                        if self._campaign_metrics is not None:
+                            self._campaign_metrics["inflight"] = counter["inflight"]
+            except asyncio.CancelledError:
+                raise
+            finally:
+                self.worker_states.pop(worker_id, None)
+                self._emit("worker_exit", worker=worker_id)
+
+        async def reporter_loop() -> None:
+            """Reporter stays alive for the whole campaign, even while every
+            worker is temporarily waiting for a resource."""
+            self._emit("reporter_start", detail="reporter remains alive while campaign runs")
+            while self.is_running:
+                try:
+                    await ui_callback(await self._generate_live_status())
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                await asyncio.sleep(self._reporter_interval_seconds)
+
+        # PATCH 5: workers are created BEFORE the reporter starts (no race), and
+        # the reporter is driven by self.is_running, never by bool(workers).
         for i in range(num_workers):
             task = asyncio.create_task(dm_worker(i))
             active_workers.append(task)
-        
+        reporter_task = asyncio.create_task(reporter_loop())
+
         try:
             await asyncio.gather(*active_workers)
         except asyncio.CancelledError:
+            if self._campaign_metrics is not None:
+                self._campaign_metrics["cancelled"] += counter["inflight"]
             pass
         finally:
-            # 🔥 NEW: Cleanup reporter task
+            self.is_running = False
             reporter_task.cancel()
             try:
                 await reporter_task
             except asyncio.CancelledError:
                 pass
-        
-        self.is_running = False
-        final_msg = "✅ **DM CAMPAIGN COMPLETED** ✅\n" if target_queue.empty() else "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
+
+        if self._campaign_metrics is not None:
+            self._campaign_metrics["unprocessed"] = counter["queued"] + counter["inflight"]
+
+        remaining = counter["queued"] + counter["inflight"]
+        if remaining == 0 and not self._campaign_halted:
+            final_msg = "✅ **DM CAMPAIGN COMPLETED** ✅\n"
+        else:
+            final_msg = "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
         await ui_callback(final_msg + await self._generate_live_status())
-        
+
         if media_path and os.path.exists(str(media_path)):
             try:
                 os.remove(str(media_path))
             except Exception:
                 pass
+
+        self.worker_states.clear()
+        return final_msg
+
+    # ──────────────────────────────────────────────
+    # Single-target processing
+    # ──────────────────────────────────────────────
+
+    async def _handle_target(
+        self,
+        worker_id: int,
+        target: Any,
+        final_text: Optional[str],
+        media_path: str,
+        candidate_accounts: list,
+        busy_accounts: Dict[str, float],
+        rr: Dict[str, int],
+        rr_lock: asyncio.Lock,
+        target_queue: asyncio.Queue,
+        counter: dict,
+    ) -> None:
+        """Process one target: select account -> acquire -> connect -> send.
+
+        Resource starvation (SessionAlreadyOwnedError / lease=None) is treated
+        as WAITING_FOR_ACCOUNT / WAITING_FOR_PROXY and never as a target failure.
+        """
+        phone: Optional[str] = None
+        try:
+            account_doc = await self._select_eligible_account(
+                candidate_accounts, busy_accounts, rr, rr_lock,
+            )
+            if account_doc is None:
+                if not candidate_accounts:
+                    # No account could ever serve this target -> loud failure
+                    # instead of an infinite requeue loop.
+                    self._set_worker_state(worker_id, "TARGET_FAILED",
+                                           detail="no eligible accounts remaining")
+                    self.stats["failed"] += 1
+                    if self._campaign_metrics is not None:
+                        self._campaign_metrics["failed"] += 1
+                    self._emit("send_failure", worker=worker_id,
+                               detail="no eligible accounts remaining")
+                    return
+                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
+                                       detail="no eligible account available")
+                await self._bounded_resource_wait()
+                self._requeue_target(target, target_queue, counter)
+                return
+
+            phone = str(account_doc.get("phone", "") or "").strip()
+            clean_phone = phone.replace("+", "")
+            self._set_worker_state(worker_id, "ACCOUNT_SELECTED",
+                                   phone=clean_phone, detail=clean_phone)
+
+            try:
+                async with self.session_manager.acquire(
+                    clean_phone,
+                    module="dmsender",
+                    worker_id=f"dm:{worker_id}",
+                    auto_release=True,
+                    timeout=10.0,
+                ) as lease:
+                    if lease is None:
+                        busy_accounts[clean_phone] = (
+                            time.monotonic() + self._busy_exclusion_seconds
+                        )
+                        if await self._proxies_exhausted():
+                            self._set_worker_state(worker_id, "WAITING_FOR_PROXY",
+                                                   phone=clean_phone, detail="lease=None")
+                        else:
+                            self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
+                                                   phone=clean_phone, detail="lease=None")
+                            self._handle_contended_lease(clean_phone)
+                        await self._bounded_resource_wait()
+                        self._requeue_target(target, target_queue, counter)
+                        return
+
+                    client = lease.client
+                    self._set_worker_state(worker_id, "CONNECTING", phone=clean_phone)
+                    if not client.is_connected():
+                        await client.connect()
+
+                    self._set_worker_state(worker_id, "AUTHORIZED", phone=clean_phone)
+                    if not await client.is_user_authorized():
+                        raise SessionRevokedError(request=None)
+
+                    self._set_worker_state(worker_id, "PROCESSING", phone=clean_phone)
+                    result = await self._process_target(
+                        client, target, final_text, media_path,
+                    )
+                    self._record_result(worker_id, clean_phone, result)
+
+            except SessionAlreadyOwnedError:
+                busy_accounts[clean_phone] = time.monotonic() + self._busy_exclusion_seconds
+                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
+                                       phone=clean_phone,
+                                       detail="SessionAlreadyOwnedError")
+                self._handle_contended_lease(clean_phone)
+                await self._bounded_resource_wait()
+                self._requeue_target(target, target_queue, counter)
+
+            except AuthKeyDuplicatedError:
+                # SessionManager owns quarantine + proxy/client cleanup.
+                # The same session is NEVER retried.
+                self._set_worker_state(worker_id, "TERMINAL_ACCOUNT",
+                                       phone=clean_phone, detail="auth_key_duplicated")
+                await self._handle_terminal_account(
+                    worker_id, clean_phone,
+                    "AuthKeyDuplicatedError in dm_worker",
+                    ErrorCategory.AUTH_KEY_DUPLICATED,
+                    candidate_accounts,
+                )
+                busy_accounts[clean_phone] = time.monotonic() + 3600.0
+                if self._maybe_requeue(worker_id, clean_phone, target):
+                    self._requeue_target(target, target_queue, counter)
+
+            except FloodWaitError as exc:
+                seconds = int(getattr(exc, "seconds", 30) or 30)
+                delay = min(max(seconds, 1), int(getattr(self, "_flood_delay_cap", 60)))
+                busy_accounts[clean_phone] = time.monotonic() + delay
+                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
+                                       phone=clean_phone, detail=f"flood {seconds}s")
+                # SessionManager already released client+proxy on context exit.
+                await asyncio.sleep(max(0, delay))
+                if self._maybe_requeue(worker_id, clean_phone, target):
+                    self._requeue_target(target, target_queue, counter)
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as exc:
+                await self._handle_operation_error(
+                    worker_id, clean_phone, target, exc,
+                    candidate_accounts, target_queue, counter,
+                )
+
+        except asyncio.CancelledError:
+            raise
+
+    def _handle_contended_lease(self, clean_phone: str) -> None:
+        """Emit a structured waiting signal for a contended session/account."""
+        self._emit("res_wait", phone=clean_phone,
+                   detail="resource contention (temporary, not a target failure)")
+
+    async def _process_target(
+        self,
+        client,
+        target: Any,
+        final_text: Optional[str],
+        media_path: str,
+    ) -> str:
+        """Resolve the entity and deliver the DM payload. Returns "sent"."""
+        entity = None
+        if isinstance(target, dict):
+            user_id = target.get("user_id")
+            access_hash = target.get("access_hash")
+            username = target.get("username")
+
+            if username and str(username).strip() and str(username).lower() != "none":
+                u_str = str(username).strip()
+                entity = u_str if u_str.startswith("@") else f"@{u_str}"
+            elif user_id and access_hash and str(access_hash) != "0":
+                try:
+                    entity = InputPeerUser(int(user_id), int(access_hash))
+                except Exception:
+                    entity = None
+            if not entity and user_id:
+                entity = int(user_id)
+        else:
+            target_str = str(target).strip()
+            if target_str.isdigit():
+                entity = int(target_str)
+            else:
+                entity = target_str if target_str.startswith("@") else f"@{target_str}"
+
+        if not entity:
+            raise ValueError("Could not construct entity tokens.")
+
+        if media_path and os.path.exists(str(media_path)):
+            is_voice = str(media_path).lower().endswith((".ogg", ".mp3", ".m4a"))
+            attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
+            await client.send_file(
+                entity, str(media_path), caption=final_text,
+                voice_note=is_voice, attributes=attributes,
+            )
+        else:
+            if final_text is None:
+                raise ValueError("Cannot send an empty text message.")
+            await client.send_message(entity, final_text)
+        return "sent"
 
 
 def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
@@ -723,15 +1037,14 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
         if not is_admin(event.sender_id): return
         # Flush stale state data for this user to reclaim RAM
         sender_engine.wizard_state.pop(event.sender_id, None)
-        
+
         if sender_engine.is_running:
             await event.reply("⚠️ **Engine Occupied:** Campaign background me active hai.")
             return
 
         try:
-            pipeline = [{"$group": {"_id": "$source_group", "count": {"$sum": 1}}}]
             group_stats = await sender_engine.db.get_group_stats()
-            
+
             if not group_stats:
                 msg = "📊 `scraped_data` collection is empty. \n\n👉 Direct single profile target karne ke liye `@username` type karein."
                 group_list = []
@@ -745,7 +1058,7 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
                     total_users += cnt
                     group_list.append(str(grp))
                     msg += f"🔹 `{grp}` : **{cnt} users**\n"
-                
+
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━\n✨ **Total Available Users:** `{total_users}`\n\n"
                 msg += "👉 **Type the EXACT Group Name** to fetch and send messages.\n"
                 msg += "👉 **OR Type specific username/ID** to send an individual message."
@@ -769,10 +1082,10 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
         uid = event.sender_id
         if uid not in sender_engine.wizard_state:
             return
-            
+
         if event.text and event.text.startswith('/'):
             return
-            
+
         state = sender_engine.wizard_state[uid]
         step = state["step"]
 
@@ -789,11 +1102,11 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
                         "username": doc.get("username"),
                         "phone": doc.get("phone")
                     })
-                
+
                 if not extracted_targets:
                     await event.reply("❌ Is group me valid schema lines nahi mili. Phir se chunein.")
                     return
-                
+
                 state["targets"] = extracted_targets
                 state["step"] = "AWAITING_LIMIT"
                 await event.reply(
@@ -834,7 +1147,7 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
         elif step == "AWAITING_TEXT":
             msg_text = event.text.strip()
             state["text"] = msg_text
-            
+
             state["step"] = "AWAITING_MEDIA"
             await event.reply(
                 "🖼️ **Message Template Cached!**\n\n"
@@ -852,18 +1165,20 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
                 return
 
             ui_msg = await event.reply("⚡ Deploying DM Cluster Resources... Connecting to Accounts...")
-            
+
             async def update_ui_status(text_payload):
-                try: await ui_msg.edit(text_payload)
-                except Exception: pass
+                try:
+                    await ui_msg.edit(text_payload)
+                except Exception:
+                    pass
 
             target_list = state["targets"]
             msg_txt = state["text"]
             media_pth = state["media"]
             limit_val = state["limit"]
-            
+
             sender_engine.wizard_state.pop(uid)
-            
+
             sender_engine.active_task = asyncio.create_task(
                 sender_engine.execute_dm_campaign(target_list, msg_txt, media_pth, limit_val, update_ui_status)
             )
@@ -874,9 +1189,8 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
         if not sender_engine.is_running:
             await event.reply("ℹ️ **No DM campaign is currently running.**\n\nUse `/send_dmsender` to start a new campaign.")
             return
-        
-        # Generate and send detailed status
-        status_msg = sender_engine._generate_detailed_status()
+
+        status_msg = await sender_engine._generate_detailed_status()
         await event.reply(status_msg)
 
     @bot.on(events.NewMessage(pattern='/stop_dmsender'))

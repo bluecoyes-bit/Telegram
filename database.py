@@ -7,6 +7,9 @@ Filename: database.py
 
 import time
 import re
+import os
+import time
+import re
 import pickle
 import random
 import pathlib
@@ -14,17 +17,19 @@ import json
 import logging
 import asyncio
 import hashlib
+import threading
 import functools
 from functools import partial
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set, Generator, Union
+from typing import Any, Dict, List, Optional, Set, Generator, Union, Collection
 from collections import OrderedDict
 
 from pymongo import MongoClient, UpdateOne, ASCENDING, DESCENDING, DeleteMany
 from pymongo.errors import (
     BulkWriteError, AutoReconnect, ServerSelectionTimeoutError,
-    ConnectionFailure, NetworkTimeout, OperationFailure
+    ConnectionFailure, NetworkTimeout, OperationFailure, DuplicateKeyError
 )
+
 from pymongo.read_preferences import ReadPreference
 from pymongo.write_concern import WriteConcern
 
@@ -49,50 +54,99 @@ MAX_PROJECTION_FIELDS = {      # Always fetch only what's needed
     "proxy": 1, "proxy_updated_at": 1,
 }
 
+# Canonical terminal statuses (PATCH #9): a terminal account is never
+# reactivated by an ordinary worker transition.
+TERMINAL_DB_STATUSES = frozenset({
+    "revoked", "banned", "deactivated", "invalid",
+    "auth_key_duplicated", "permanently_failed", "quarantined",
+})
+
+# Finite socket timeout for Mongo I/O (PATCH #9). PyMongo defaults to an
+# infinite socket timeout; a stalled server must never hang the process.
+DATABASE_SOCKET_TIMEOUT_MS = int(
+    os.environ.get("MONGO_SOCKET_TIMEOUT_MS", "20000")
+)
+
+# Redaction sentinel for stored OTP message bodies (PATCH #9).
+OTP_MESSAGE_MASK = "*** [message masked per OTP security policy] ***"
+
 
 # ────────────────────────────────────────────────────────────────
 # PERFORMANCE: LRU CACHE DECORATOR for frequently accessed data
 # ────────────────────────────────────────────────────────────────
-
 class TTLCache:
-    """Thread-safe TTL-based LRU cache with max size limit."""
-    
-    def __init__(self, maxsize: int = 128, ttl: int = 30):
+    """Thread-safe TTL-based LRU cache with max size limit (PATCH #9).
+
+    Every mutation is protected by a single ``threading.RLock`` because this
+    cache is shared between the async event loop and the sync Mongo worker
+    threads (``_run_sync``). Expiry uses ``time.monotonic()``; eviction always
+    removes the matching timestamp so ``_timestamps`` cannot grow unboundedly.
+    """
+
+    def __init__(self, maxsize: int = 128, ttl: float = 30.0):
         self._maxsize = maxsize
         self._ttl = ttl
         self._cache: OrderedDict = OrderedDict()
         self._timestamps: Dict[str, float] = {}
-    
+        self._lock = threading.RLock()
+
     def get(self, key: str) -> Optional[Any]:
-        if key not in self._cache:
-            return None
-        if time.time() - self._timestamps.get(key, 0) > self._ttl:
-            self._cache.pop(key, None)
-            self._timestamps.pop(key, None)
-            return None
-        self._cache.move_to_end(key)
-        return self._cache[key]
-    
+        now = time.monotonic()
+        with self._lock:
+            if key not in self._cache:
+                return None
+            timestamp = self._timestamps.get(key, 0.0)
+            if now - timestamp > self._ttl:
+                self._cache.pop(key, None)
+                self._timestamps.pop(key, None)
+                return None
+            self._cache.move_to_end(key)
+            return self._cache[key]
+
     def set(self, key: str, value: Any) -> None:
-        if len(self._cache) >= self._maxsize:
-            self._cache.popitem(last=False)
-        self._cache[key] = value
-        self._timestamps[key] = time.time()
-    
+        now = time.monotonic()
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = value
+            self._timestamps[key] = now
+            while len(self._cache) > self._maxsize:
+                oldest, _ = self._cache.popitem(last=False)
+                self._timestamps.pop(oldest, None)
+
     def invalidate(self, key: Optional[str] = None) -> None:
-        if key:
+        with self._lock:
+            if key is None:
+                self._cache.clear()
+                self._timestamps.clear()
+                return
             self._cache.pop(key, None)
             self._timestamps.pop(key, None)
-        else:
-            self._cache.clear()
-            self._timestamps.clear()
-    
+
     def invalidate_pattern(self, pattern: str) -> None:
         """Invalidate all keys matching a prefix pattern."""
-        keys_to_remove = [k for k in self._cache if k.startswith(pattern)]
-        for k in keys_to_remove:
-            self._cache.pop(k, None)
-            self._timestamps.pop(k, None)
+        with self._lock:
+            keys_to_remove = [k for k in self._cache if k.startswith(pattern)]
+            for k in keys_to_remove:
+                self._cache.pop(k, None)
+                self._timestamps.pop(k, None)
+
+    def size(self) -> int:
+        """Number of live entries (including soft-expired-but-uncleaned)."""
+        with self._lock:
+            return len(self._cache)
+
+    def cleanup(self) -> None:
+        """Purge all soft-expired entries."""
+        now = time.monotonic()
+        with self._lock:
+            expired = [
+                k for k in self._cache
+                if now - self._timestamps.get(k, 0.0) > self._ttl
+            ]
+            for k in expired:
+                self._cache.pop(k, None)
+                self._timestamps.pop(k, None)
 
 
 def cached(ttl: int = 30, maxsize: int = 128):
@@ -135,6 +189,9 @@ class SuiteDatabase:
         self._lock_cleanup_interval: float = 60.0
         self._last_lock_cleanup: float = time.time()
 
+        # ── Lifecycle guard (PATCH #9): closed DB fails predictably ──
+        self._closed: bool = False
+
         # ── In-memory caches (bounded, TTL) ──
         self._stats_cache = TTLCache(maxsize=32, ttl=CONFIG.get("STATUS_BAR_CACHE_TTL", 30))
         self._session_cache = TTLCache(maxsize=512, ttl=60)  # Active sessions cache
@@ -174,6 +231,10 @@ class SuiteDatabase:
             "compressors": MONGO_CFG.compressors,
             "zlibCompressionLevel": MONGO_CFG.zlib_compression_level,
         })
+
+        # Finite socket timeout: never wait forever on a stalled server.
+        mongo_kwargs.setdefault("socketTimeoutMS", DATABASE_SOCKET_TIMEOUT_MS)
+
         
         try:
             if hasattr(self, 'client') and self.client:
@@ -214,6 +275,7 @@ class SuiteDatabase:
     
     def _ensure_connection(self) -> None:
         """Verify connection is alive before critical operations (sync)."""
+        self._check_open()
         try:
             self.client.admin.command('ping')
             self._connection_retry_count = 0
@@ -418,30 +480,43 @@ class SuiteDatabase:
         phone: str,
         new_state: str,
         *,
+        expected_states: Optional[Collection[str]] = None,
         reason: str = "",
         source: str = "",
         module: str = "",
         worker: str = "",
     ) -> bool:
         """
-        Authoritative status transition API.
+        Authoritative atomic status transition API (compare-and-set, PATCH #9).
 
-        All modules MUST use this method instead of directly writing status
-        strings.  Logs previous_state -> new_state for audit trail.
+        Without ``expected_states`` a normal (unconditional) transition runs as
+        a single atomic ``update_one`` - never a read-then-write pair.
+
+        With ``expected_states`` the update only applies when the stored status
+        is one of them (``$in`` filter), so a stale worker can never overwrite
+        a newer state, e.g. reactivate ``auth_key_duplicated`` -> ``active``.
+
+        Success is derived from the update result (matched/modified counts),
+        never from a prior ``find_one()``.
+
+        Audit log reports previous state as ``conditional`` / ``unconditional``;
+        we do NOT perform a second unsafe read just to enrich the log.
         """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return False
 
-        new_state_val = new_state.value if hasattr(new_state, 'value') else str(new_state).lower()
+        new_state_val = self._status_value(new_state)
+        expected = (
+            {self._status_value(s) for s in expected_states if s} or None
+        ) if expected_states else None
+        prev_state = "conditional" if expected else "unconditional"
 
+        self._check_open()
         try:
-            # Atomically fetch current status, then update
-            existing = self.src_accounts.find_one(
-                {"phone": clean_phone},
-                {"status": 1, "revocation_reason": 1}
-            )
-            prev_state = existing.get("status", "unknown") if existing else "unknown"
+            query: dict = {"phone": clean_phone}
+            if expected:
+                query["status"] = {"$in": sorted(expected)}
 
             update_data = {
                 "status": new_state_val,
@@ -451,25 +526,130 @@ class SuiteDatabase:
             if reason:
                 update_data["revocation_reason"] = str(reason)[:500]
 
-            self.src_accounts.update_one(
-                {"phone": clean_phone},
+            result = self.src_accounts.update_one(
+                query,
                 {"$set": update_data},
                 upsert=False,
             )
+
+            if result.matched_count == 0:
+                logger.info(
+                    f"STATUS_TRANSITION_SKIPPED | phone={clean_phone} | "
+                    f"{prev_state} -> {new_state_val} | source={source} | "
+                    f"module={module} | worker={worker} | reason={reason[:80]} | "
+                    f"no document matched the (conditional) filter"
+                )
+                return False
 
             self._session_cache.invalidate(f"session:{clean_phone}")
             self._stats_cache.invalidate("status_bar")
 
             logger.info(
-                f"STATUS_TRANSITION | phone={clean_phone} | {prev_state} -> {new_state_val} | "
-                f"source={source} | module={module} | worker={worker} | reason={reason[:80]}"
+                f"STATUS_TRANSITION | phone={clean_phone} | {prev_state} -> "
+                f"{new_state_val} | source={source} | module={module} | "
+                f"worker={worker} | reason={reason[:80]}"
             )
             return True
         except Exception as e:
-            logger.error(f"set_account_state failed for {clean_phone}: {e}")
+            logger.error(
+                f"set_account_state failed for {clean_phone} "
+                f"({type(e).__name__}): {e}"
+            )
             return False
-    
-    # ────────────────────────────────────────────────────────────
+
+    async def set_account_state_async(
+        self,
+        phone: str,
+        new_state: str,
+        *,
+        expected_states: Optional[Collection[str]] = None,
+        reason: str = "",
+        source: str = "",
+        module: str = "",
+        worker: str = "",
+    ) -> bool:
+        """Async-safe atomic status transition (single thread boundary)."""
+        return await self._run_sync(
+            self.set_account_state, phone, new_state,
+            expected_states=expected_states,
+            reason=reason, source=source, module=module, worker=worker,
+        )
+
+    def bulk_set_account_state(
+        self,
+        updates,
+        *,
+        expected_states: Optional[Collection[str]] = None,
+        reason: str = "",
+        source: str = "",
+        module: str = "",
+        worker: str = "",
+    ) -> dict:
+        """
+        Bulk compare-and-set status transition over *updates* (iterable of
+        ``(phone, new_state)`` pairs). When ``expected_states`` is given every
+        ``UpdateOne`` is conditional on the current status so bulk jobs can
+        never overwrite a terminal status. Session/stats caches for every
+        affected phone are invalidated regardless of outcome.
+        """
+        expected = None
+        if expected_states:
+            expected = {self._status_value(s) for s in expected_states if s} or None
+
+        now = datetime.now(timezone.utc)
+        phones: List[str] = []
+        ops: List[UpdateOne] = []
+        for phone, new_state in updates:
+            clean_phone = self._normalize(phone)
+            if not clean_phone:
+                continue
+            query: dict = {"phone": clean_phone}
+            if expected:
+                query["status"] = {"$in": sorted(expected)}
+            set_fields = {
+                "status": self._status_value(new_state),
+                "last_updated": now,
+                "last_checked_time": now,
+            }
+            if reason:
+                set_fields["revocation_reason"] = str(reason)[:500]
+            phones.append(clean_phone)
+            ops.append(UpdateOne(query, {"$set": set_fields}, upsert=False))
+
+        matched = modified = duplicate_errors = 0
+        try:
+            self._check_open()
+            for i in range(0, len(ops), BULK_BATCH_SIZE):
+                batch = ops[i:i + BULK_BATCH_SIZE]
+                try:
+                    res = self.src_accounts.bulk_write(batch, ordered=False)
+                    matched += res.matched_count
+                    modified += res.modified_count
+                except BulkWriteError as bwe:
+                    matched += bwe.details.get("nMatched", 0)
+                    modified += bwe.details.get("nModified", 0)
+                    duplicate_errors += len(bwe.details.get("writeErrors", []))
+        finally:
+            for p in phones:
+                self._session_cache.invalidate(f"session:{p}")
+            self._stats_cache.invalidate("status_bar")
+
+        logger.info(
+            f"BULK_STATUS_TRANSITION | source={source} | module={module} | "
+            f"worker={worker} | reason={reason[:80]} | matched={matched} "
+            f"modified={modified} duplicate_errors={duplicate_errors}"
+        )
+        return {
+            "matched": matched,
+            "modified": modified,
+            "duplicate_errors": duplicate_errors,
+        }
+
+    async def bulk_set_account_state_async(self, updates, **kwargs) -> dict:
+        """Async-safe bulk status transition."""
+        return await self._run_sync(self.bulk_set_account_state, updates, **kwargs)
+
+
     # 4. CORE ACCOUNT CRUD (optimized bulk paths)
     # ────────────────────────────────────────────────────────────
     
@@ -484,23 +664,78 @@ class SuiteDatabase:
         """Internal: strip everything but digits."""
         return str(phone).strip().replace(" ", "").replace("+", "")
 
+    @staticmethod
+    def _status_value(status: Any) -> str:
+        """Canonical lowercase status string from enum/str (case-safe)."""
+        if hasattr(status, "value"):
+            return str(status.value).strip().lower()
+        return str(status).strip().lower()
+
+    @staticmethod
+    def _sha256_hex(secret: Any) -> str:
+        """Non-reversible digest used in place of a plaintext secret body."""
+        return hashlib.sha256(
+            str(secret).encode("utf-8", errors="ignore")
+        ).hexdigest()
+
+    def _check_open(self) -> None:
+        """Raise RuntimeError once the database has been closed."""
+        if getattr(self, "_closed", False):
+            raise RuntimeError(
+                "SuiteDatabase is closed - further operations are not allowed."
+            )
+
+    def _upsert_by_phone(self, phone: str, payload: dict,
+                         set_on_insert: Optional[dict] = None) -> None:
+        """Upsert an account document; recovers from upsert duplicate-key races."""
+        update = {"$set": payload}
+        if set_on_insert:
+            update["$setOnInsert"] = set_on_insert
+        try:
+            self.src_accounts.update_one(
+                {"phone": phone}, update, upsert=True,
+            )
+        except DuplicateKeyError:
+            # Raced upsert: another writer inserted first. Apply the same set
+            # as a plain update so no partial state is left behind.
+            self.src_accounts.update_one(
+                {"phone": phone}, {"$set": payload}, upsert=False,
+            )
+
+    def _persist_proxy_identity(self, proxy_entry: dict) -> dict:
+        """Strip credentials from a proxy entry before persistence."""
+        safe = {}
+        for key in ("proxy_id", "provider", "host", "port", "scheme"):
+            if proxy_entry.get(key) is not None:
+                safe[key] = proxy_entry.get(key)
+        if proxy_entry.get("username"):
+            safe["username_present"] = True
+        if proxy_entry.get("password"):
+            safe["password_present"] = True
+        return safe
+
     def update_account_proxy(self, phone: str, proxy_entry: dict) -> None:
-        """Persist the proxy currently assigned to an account."""
+        """Persist the proxy identity assigned to an account (no credentials)."""
         clean_phone = self._normalize(phone)
         if not clean_phone or not isinstance(proxy_entry, dict):
             return
+        self._check_open()
         try:
             self.src_accounts.update_one(
                 {"phone": clean_phone},
                 {"$set": {
-                    "proxy": proxy_entry,
+                    "proxy": self._persist_proxy_identity(proxy_entry),
                     "proxy_updated_at": datetime.now(timezone.utc),
                 }}
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
         except Exception as e:
             logger.error(f"Failed to update proxy for {clean_phone}: {e}")
-    
+
+    async def update_account_proxy_async(self, phone: str, proxy_entry: dict) -> None:
+        """Async-safe proxy identity persistence."""
+        return await self._run_sync(self.update_account_proxy, phone, proxy_entry)
+
     def fetch_source_accounts(self) -> list:
         """Fetch all accounts from DB1 with projection (faster, less memory)."""
         self._ensure_connection()
@@ -524,6 +759,7 @@ class SuiteDatabase:
         if cached is not None:
             return cached
 
+        self._check_open()
         try:
             doc = self.src_accounts.find_one(
                 {"phone": clean_phone},
@@ -569,10 +805,13 @@ class SuiteDatabase:
         """
         FAST PATH: Uses run_in_executor to prevent blocking the async loop.
         """
-        self._ensure_connection()
+        self._check_open()
         active_pool = []
         
         def fetch_docs():
+            # Connection health is verified inside the worker thread so
+            # the event loop never blocks on the synchronous ping.
+            self._ensure_connection()
             cursor = self.src_accounts.find(
                 {"status": "active"},
                 {k: 1 for k in MAX_PROJECTION_FIELDS}
@@ -667,13 +906,14 @@ class SuiteDatabase:
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
-        
+        self._check_open()
+
         # Preserve existing device profile if one exists
         existing = self.src_accounts.find_one(
             {"phone": clean_phone},
             {"device_model": 1, "system_version": 1, "app_version": 1, "account_sequence_index": 1}
         )
-        
+
         if existing and existing.get("device_model"):
             final_device = {
                 "device_model": existing.get("device_model"),
@@ -686,12 +926,12 @@ class SuiteDatabase:
                 "system_version": "Windows 11",
                 "app_version": "4.8.4"
             }
-        
+
         payload = {
             "phone": clean_phone,
             "session": session_str,
             "session_string": session_str,
-            "status": status,
+            "status": self._status_value(status),
             "phone_code_hash": phone_code_hash,
             "device_model": final_device["device_model"],
             "system_version": final_device["system_version"],
@@ -702,24 +942,34 @@ class SuiteDatabase:
             ),
             "last_updated": datetime.now(timezone.utc),
         }
-        
+
         try:
-            self.src_accounts.update_one(
-                {"phone": clean_phone},
+            self._upsert_by_phone(
+                clean_phone,
+                payload,
                 {
-                    "$set": payload,
-                    "$setOnInsert": {
-                        "timestamp": int(time.time()),
-                        "authenticated_at": datetime.now(timezone.utc)
-                    }
+                    "timestamp": int(time.time()),
+                    "authenticated_at": datetime.now(timezone.utc),
                 },
-                upsert=True
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
             self._stats_cache.invalidate("status_bar")
         except Exception as e:
-            logger.error(f"save_pending_session failed for {clean_phone}: {e}")
-    
+            logger.error(
+                f"save_pending_session failed for {clean_phone} "
+                f"({type(e).__name__}): {e}"
+            )
+
+    async def save_pending_session_async(
+        self, phone: str, session_str: str, status: str,
+        phone_code_hash: str = None, device: dict = None
+    ) -> None:
+        """Async-safe login-state persistence."""
+        return await self._run_sync(
+            self.save_pending_session, phone, session_str, status,
+            phone_code_hash, device,
+        )
+
     def save_authorized_session(
         self, phone: str, session_str: str, status: str,
         device: dict, two_fa_password: str = None
@@ -727,70 +977,117 @@ class SuiteDatabase:
         """
         Atomically save verified active session.
         Uses $setOnInsert to preserve original authenticated_at date.
+
+        PATCH #9 (secret hygiene): the 2FA password is NEVER persisted. The
+        parameter is kept for signature compatibility; only a boolean flag
+        ``has_2fa`` is stored. Legacy plaintext fields written by older code
+        are left as a reported security-migration item, not read back.
         """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
-        
+
         if not isinstance(device, dict) or not device:
             device = random.choice(DEVICE_PROFILES) if DEVICE_PROFILES else {
                 "device_model": "PC 64bit", "system_version": "Windows 11", "app_version": "4.8.4"
             }
-        
+
+        self._check_open()
+
         set_payload = {
             "phone": clean_phone,
             "session_string": str(session_str),
             "session": str(session_str),
-            "status": status.value if hasattr(status, 'value') else status,
+            "status": self._status_value(status),
             "device_model": device.get("device_model", "PC 64bit"),
             "system_version": device.get("system_version", "Windows 11"),
             "app_version": device.get("app_version", "4.8.4"),
             "device_metadata": device,
-            "2fa_password": two_fa_password,
-            "password_2fa": two_fa_password or "",
+            "has_2fa": bool(two_fa_password),
             "last_updated": datetime.now(timezone.utc),
             "last_verified": datetime.now(timezone.utc),
             "verified_at": datetime.now(timezone.utc),
         }
-        
+
         try:
-            self.src_accounts.update_one(
-                {"phone": clean_phone},
+            self._upsert_by_phone(
+                clean_phone,
+                set_payload,
                 {
-                    "$set": set_payload,
-                    "$setOnInsert": {
-                        "authenticated_at": datetime.now(timezone.utc),
-                        "created_at": datetime.now(timezone.utc),
-                    }
+                    "authenticated_at": datetime.now(timezone.utc),
+                    "created_at": datetime.now(timezone.utc),
                 },
-                upsert=True
             )
-            # Invalidate caches
             self._session_cache.invalidate(f"session:{clean_phone}")
             self._stats_cache.invalidate("status_bar")
-            logger.debug(f"💾 Session saved: +{clean_phone}")
+            logger.debug(f"Session saved: +{clean_phone}")
         except Exception as e:
-            logger.error(f"❌ save_authorized_session failed for +{clean_phone}: {e}")
+            logger.error(
+                f"save_authorized_session failed for +{clean_phone} "
+                f"({type(e).__name__}): {e}"
+            )
             raise
-    
+
+    async def save_authorized_session_async(
+        self, phone: str, session_str: str, status: str,
+        device: dict, two_fa_password: str = None
+    ) -> None:
+        """Async-safe verified-session persistence."""
+        return await self._run_sync(
+            self.save_authorized_session, phone, session_str, status,
+            device, two_fa_password,
+        )
+
     def update_session_status(self, phone: str, status: str, session_str: Optional[str] = None):
+        """
+        Set/refresh account status.
+
+        PATCH #9: the transition is conditional - a non-terminal target status
+        is never written over an existing terminal status (revoked, banned,
+        auth_key_duplicated, ...). This prevents a stale worker from
+        reactivating a terminal account through the plain update path.
+        """
         clean_phone = self._normalize(phone)
-        if not clean_phone: return
+        if not clean_phone:
+            return
+        self._check_open()
         self.backup_original_session(clean_phone)
+        target_status = self._status_value(status)
+        query: dict = {"phone": clean_phone}
+        if target_status not in TERMINAL_DB_STATUSES:
+            query["status"] = {"$nin": list(TERMINAL_DB_STATUSES)}
         update_data = {
-            "status": status.value if hasattr(status, 'value') else status, # 🔥 FIX: Parse Enum
+            "status": target_status,
             "last_updated": datetime.now(timezone.utc),
         }
         if session_str:
             update_data["session"] = session_str
             update_data["session_string"] = session_str
         try:
-            self.src_accounts.update_one({"phone": clean_phone}, {"$set": update_data})
+            result = self.src_accounts.update_one(query, {"$set": update_data})
+            if (target_status not in TERMINAL_DB_STATUSES
+                    and result.matched_count == 0):
+                logger.info(
+                    f"STATUS_TRANSITION_REJECTED | phone={clean_phone} | "
+                    f"(unknown) -> {target_status} | terminal account cannot "
+                    f"be reactivated through a blind status update"
+                )
             self._session_cache.invalidate(f"session:{clean_phone}")
             self._stats_cache.invalidate("status_bar")
         except Exception as e:
-            logger.error(f"update_session_status failed for {clean_phone}: {e}")
-    
+            logger.error(
+                f"update_session_status failed for {clean_phone} "
+                f"({type(e).__name__}): {e}"
+            )
+
+    async def update_session_status_async(
+        self, phone: str, status: str, session_str: Optional[str] = None
+    ) -> None:
+        """Async-safe status refresh."""
+        return await self._run_sync(
+            self.update_session_status, phone, status, session_str,
+        )
+
     def save_migrated_session(
         self, phone: str, api_id: int, api_hash: str,
         session_str: str, device: dict
@@ -844,6 +1141,7 @@ class SuiteDatabase:
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
+        self._check_open()
         try:
             self.src_accounts.update_one(
                 {"phone": clean_phone},
@@ -864,6 +1162,7 @@ class SuiteDatabase:
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
+        self._check_open()
         try:
             self.src_accounts.update_one(
                 {"phone": clean_phone},
@@ -878,6 +1177,14 @@ class SuiteDatabase:
             self._stats_cache.invalidate("status_bar")
         except Exception as e:
             logger.error(f"mark_account_revoked error: {e}")
+
+    async def mark_account_failed_async(self, phone: str, error_msg: str) -> None:
+        """Async-safe account failure marking."""
+        return await self._run_sync(self.mark_account_failed, phone, error_msg)
+
+    async def mark_account_revoked_async(self, phone: str, system_reason: str) -> None:
+        """Async-safe account revocation marking."""
+        return await self._run_sync(self.mark_account_revoked, phone, system_reason)
     
     def remove_account_permanently(self, phone: str) -> bool:
         """Permanently delete account record."""
@@ -897,41 +1204,66 @@ class SuiteDatabase:
     # ────────────────────────────────────────────────────────────
     
     def log_received_otp(self, phone: str, sender: str, message_text: str) -> None:
-        """Log OTP message to otp_logs collection."""
+        """Log OTP message metadata to otp_logs (PATCH #9: no plaintext body).
+
+        Only safe metadata is persisted: phone, sender, timestamps, a
+        message-present flag and a non-reversible digest. The raw message
+        (which contains the OTP code) is never written to MongoDB.
+        """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
+        self._check_open()
         try:
+            raw = str(message_text or "").strip()
             self.otp_logs.insert_one({
                 "phone": clean_phone,
                 "sender": str(sender),
-                "message": str(message_text),
+                "message_present": bool(raw),
+                "message_sha256": self._sha256_hex(raw) if raw else None,
                 "timestamp": int(time.time()),
                 "date_received": datetime.now(timezone.utc),
             })
         except Exception as e:
-            logger.error(f"log_received_otp failed: {e}")
-    
+            logger.error(
+                f"log_received_otp failed for {clean_phone} ({type(e).__name__}): {e}"
+            )
+
     def get_latest_otp(self, phone: str) -> Optional[Dict[str, Any]]:
-        """Get most recent OTP entry for a phone."""
+        """Get most recent OTP entry for a phone (message body always masked).
+
+        Historical records that still contain a plaintext ``message`` field
+        are redacted to the ``OTP_MESSAGE_MASK`` sentinel on read so no OTP
+        value can ever surface through the read path.
+        """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return None
+        self._check_open()
         try:
             cursor = self.otp_logs.find(
                 {"phone": clean_phone}
             ).sort("timestamp", -1).limit(1)
             for doc in cursor:
+                doc = dict(doc)
+                doc.pop("message", None)
+                doc["message"] = OTP_MESSAGE_MASK
+                doc.pop("message_raw", None)
                 return doc
             return None
         except Exception:
+            logger.error(f"get_latest_otp failed for {clean_phone}")
             return None
 
     async def get_latest_otp_async(self, phone: str) -> Optional[Dict[str, Any]]:
-        """Async-safe OTP retrieval."""
+        """Async-safe OTP retrieval (masked)."""
         return await self._run_sync(self.get_latest_otp, phone)
-    
-    # ────────────────────────────────────────────────────────────
+
+    async def log_received_otp_async(self, phone: str, sender: str, message_text: str) -> None:
+        """Async-safe OTP metadata logging."""
+        return await self._run_sync(self.log_received_otp, phone, sender, message_text)
+
+
     # 9. SCRAPED MEMBERS MANAGEMENT (bulk operations)
     # ────────────────────────────────────────────────────────────
     
@@ -1234,10 +1566,15 @@ class SuiteDatabase:
         return await self._run_sync(run_agg)
 
     def close(self):
-        """Close MongoDB connection gracefully on shutdown."""
+        """Close MongoDB connection gracefully (idempotent, PATCH #9)."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
             if hasattr(self, 'client') and self.client:
                 self.client.close()
-                logger.info("✅ MongoDB connection closed.")
+                logger.info("MongoDB connection closed.")
+        except AutoReconnect:
+            logger.warning("MongoDB already disconnected on close (ignored).")
         except Exception as e:
             logger.error(f"Error closing MongoDB: {e}")        
