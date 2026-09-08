@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-Ultimate Enterprise Telegram Suite - Dual-Database & State Tracking Layer
-v3.0 — Optimized for 10,000+ Accounts | Sub-50ms Queries | Zero-Blocking
 Filename: database.py
 """
 
@@ -75,13 +73,6 @@ OTP_MESSAGE_MASK = "*** [message masked per OTP security policy] ***"
 # PERFORMANCE: LRU CACHE DECORATOR for frequently accessed data
 # ────────────────────────────────────────────────────────────────
 class TTLCache:
-    """Thread-safe TTL-based LRU cache with max size limit (PATCH #9).
-
-    Every mutation is protected by a single ``threading.RLock`` because this
-    cache is shared between the async event loop and the sync Mongo worker
-    threads (``_run_sync``). Expiry uses ``time.monotonic()``; eviction always
-    removes the matching timestamp so ``_timestamps`` cannot grow unboundedly.
-    """
 
     def __init__(self, maxsize: int = 128, ttl: float = 30.0):
         self._maxsize = maxsize
@@ -172,15 +163,6 @@ def cached(ttl: int = 30, maxsize: int = 128):
 # ────────────────────────────────────────────────────────────────
 
 class SuiteDatabase:
-    """
-    Enterprise-Grade MongoDB Layer for 10,000+ Accounts.
-    
-    Performance guarantees:
-    - Active session listing: < 50ms (projected, indexed)
-    - Bulk account status update: < 200ms for 500 docs
-    - OTP logging: < 5ms per insert
-    - Scraped member bulk insert: < 1s for 10,000 records
-    """
     
     def __init__(self):
         # ── In-memory lock registry (TTL-expiring, async-safe) ──
@@ -293,9 +275,6 @@ class SuiteDatabase:
         """Backward-compatible property wrapper for lock dict."""
         return self._active_task_locks
     
-    # ────────────────────────────────────────────────────────────
-    # 2. INDEX MANAGEMENT (optimized for 10k+ queries/sec)
-    # ────────────────────────────────────────────────────────────
     
     def ensure_collections_exist(self) -> None:
         """Create collections + indexes if missing. Idempotent, safe to call repeatedly."""
@@ -585,13 +564,6 @@ class SuiteDatabase:
         module: str = "",
         worker: str = "",
     ) -> dict:
-        """
-        Bulk compare-and-set status transition over *updates* (iterable of
-        ``(phone, new_state)`` pairs). When ``expected_states`` is given every
-        ``UpdateOne`` is conditional on the current status so bulk jobs can
-        never overwrite a terminal status. Session/stats caches for every
-        affected phone are invalidated regardless of outcome.
-        """
         expected = None
         if expected_states:
             expected = {self._status_value(s) for s in expected_states if s} or None
@@ -974,15 +946,6 @@ class SuiteDatabase:
         self, phone: str, session_str: str, status: str,
         device: dict, two_fa_password: str = None
     ) -> None:
-        """
-        Atomically save verified active session.
-        Uses $setOnInsert to preserve original authenticated_at date.
-
-        PATCH #9 (secret hygiene): the 2FA password is NEVER persisted. The
-        parameter is kept for signature compatibility; only a boolean flag
-        ``has_2fa`` is stored. Legacy plaintext fields written by older code
-        are left as a reported security-migration item, not read back.
-        """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
@@ -1204,12 +1167,6 @@ class SuiteDatabase:
     # ────────────────────────────────────────────────────────────
     
     def log_received_otp(self, phone: str, sender: str, message_text: str) -> None:
-        """Log OTP message metadata to otp_logs (PATCH #9: no plaintext body).
-
-        Only safe metadata is persisted: phone, sender, timestamps, a
-        message-present flag and a non-reversible digest. The raw message
-        (which contains the OTP code) is never written to MongoDB.
-        """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
@@ -1230,12 +1187,6 @@ class SuiteDatabase:
             )
 
     def get_latest_otp(self, phone: str) -> Optional[Dict[str, Any]]:
-        """Get most recent OTP entry for a phone (message body always masked).
-
-        Historical records that still contain a plaintext ``message`` field
-        are redacted to the ``OTP_MESSAGE_MASK`` sentinel on read so no OTP
-        value can ever surface through the read path.
-        """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return None
@@ -1476,14 +1427,6 @@ class SuiteDatabase:
         vars_path: str = "vars.txt",
         json_2fa_path: str = "twofa_passwords.json"
     ) -> dict:
-        """
-        Process local session files → DB1 source_accounts.
-        Streams progress updates to Telegram UI.
-
-        DELEGATES to session_migration.migrate_local_sessions — the ONLY offline
-        migration utility that constructs a user-session TelegramClient. This
-        keeps normal runtime free of direct client creation.
-        """
         from session_migration import migrate_local_sessions
 
         return await migrate_local_sessions(
@@ -1499,10 +1442,7 @@ class SuiteDatabase:
     # ────────────────────────────────────────────────────────────
     
     def compute_status_bar_data(self) -> dict:
-        """
-        Compute workspace overview stats from DB.
-        Cached externally via GlobalState.
-        """
+        
         try:
             pipeline = [
                 {"$group": {
@@ -1546,10 +1486,7 @@ class SuiteDatabase:
         
         
     async def fetch_unprocessed_scraped_pool_paginated(self, skip: int, limit: int) -> list:
-        """
-        Fetch a page of unprocessed scraped members using $skip/$limit.
-        This avoids loading the entire result set into memory.
-        """
+       
         pipeline = [
             {"$lookup": {"from": MONGODB_SETTINGS["PROCESSED_MEMBERS_COLLECTION"],
                          "localField": "user_id", "foreignField": "user_identifier", "as": "processed_match"}},

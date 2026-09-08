@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-Ultimate Enterprise Telegram Suite - Aggressive Member Extraction Engine
 Filename: scraper.py
 """
 
@@ -25,6 +24,18 @@ from telethon.errors import FloodWaitError, ChatAdminRequiredError, UserAlreadyP
 from telethon.tl.functions.phone import GetGroupParticipantsRequest
 
 from config import CONFIG, DEVICE_PROFILES
+from resource_manager import (
+    ProxyManager,
+    ProxyLeaseManager,
+    AccountLeaseManager,
+    AccountState,
+    TERMINAL_DB_STATUSES,
+    ELIGIBLE_DB_STATUSES,
+    SessionManager,
+    SessionAlreadyOwnedError,
+    SessionLifecycleState,
+    SessionLease,
+)
 
 logger = logging.getLogger("SuiteScraper")
 
@@ -43,10 +54,6 @@ class MemberScraper:
         self.account_lease_manager = account_lease_manager
 
     def resolve_group_link(self, link_str: str) -> tuple[bool, str]:
-        """
-        Decodes public/private links into standard usernames or hash tokens.
-        Returns: (is_private, resolved_string)
-        """
         if not link_str:
             return False, ""
             

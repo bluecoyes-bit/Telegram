@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-Ultimate Enterprise Telegram Suite - Central Configuration Engine (Dual-DB Core)
-v3.0 — Optimized for 10,000+ Accounts | Zero-Downtime | Production-Grade
 Filename: config.py
 """
 
@@ -78,7 +76,6 @@ def _validate_required(key: str, value: Any, display_name: str) -> None:
 
 @dataclass
 class PoolConfig:
-    """Connection pool & client caching settings for 10k-scale."""
     max_pool_size: int = field(default_factory=lambda: _env_int("MAX_POOL_SIZE", 50, 10, 500))
     max_pool_absolute: int = field(default_factory=lambda: _env_int("MAX_POOL_ABSOLUTE", 200, 20, 1000))
     status_bar_cache_ttl: int = field(default_factory=lambda: _env_int("STATUS_BAR_CACHE_TTL", 30, 5, 300))
@@ -161,7 +158,6 @@ CONFIG: Dict[str, Any] = {
     "BURST_COOLDOWN_TIME": (60, 120),
     "LOOP_KEEP_ALIVE": (30, 45),
 
-    # ── Pool / Caching (10k-scale) ──
     "MAX_POOL_SIZE": _env_int("MAX_POOL_SIZE", 50, 10, 500),
     "MAX_POOL_ABSOLUTE": _env_int("MAX_POOL_ABSOLUTE", 200, 20, 1000),
     "STATUS_BAR_CACHE_TTL": _env_int("STATUS_BAR_CACHE_TTL", 30, 5, 300),

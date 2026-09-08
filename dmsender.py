@@ -1,33 +1,4 @@
 #!/usr/bin/env python3
-"""
-Ultimate Enterprise Telegram Suite - DM Sender Engine (Database Integrated)
-Filename: dmsender.py
-
-PATCH 5 — FINAL DM ENGINE LIFECYCLE + RESOURCE SCHEDULING FIX
-
-Ownership model (single source of truth):
-    SessionManager.acquire()
-            |  (owns client + session lease + proxy lease)
-            v
-    SessionLease  ->  DM operation  ->  context exit
-            |  (SessionManager releases client + proxy atomically)
-            v
-    cleanup
-
-Hard rules enforced here:
-  * all user sessions go through `async with self.session_manager.acquire(...)`
-  * NO direct TelegramClient construction in the DM worker lifecycle
-  * NO manual proxy release / client disconnect inside the DM worker
-  * SessionAlreadyOwnedError / lease=None are RESOURCE conditions, never
-    permanent target failures
-  * AuthKeyDuplicatedError quarantines the account and removes the candidate;
-    the same session is never retried
-  * bounded waiting only - no busy loops, no `time.sleep()` in async code
-  * wizard state is bounded with a TTL store
-  * reporter runs for the whole campaign (based on self.is_running) and starts
-    after workers exist (no startup race)
-  * campaign completion waits for inflight work (queued == 0 AND inflight == 0)
-"""
 
 import os
 import time
@@ -44,8 +15,19 @@ from telethon.errors import (
 )
 
 from config import CONFIG
+from resource_manager import (
+    ProxyManager,
+    ProxyLeaseManager,
+    AccountLeaseManager,
+    AccountState,
+    TERMINAL_DB_STATUSES,
+    ELIGIBLE_DB_STATUSES,
+    SessionManager,
+    SessionAlreadyOwnedError,
+    SessionLifecycleState,
+    SessionLease,
+)
 from exception_classifier import ErrorCategory, classify_exception
-from session_manager import SessionAlreadyOwnedError
 
 logger = logging.getLogger("DMSenderEngine")
 
@@ -65,12 +47,6 @@ TERMINAL_STATUSES = frozenset({
 
 
 class _WizardStateStore(dict):
-    """Bounded, TTL-managed wizard state store.
-
-    Stays dict-compatible (``store[user_id] = {...}``, ``store.pop(...)``,
-    ``user_id in store``) so external callers such as main_bot keep working,
-    while enforcing a maximum item count and a time-to-live.
-    """
 
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 1800):
         super().__init__()
@@ -137,15 +113,6 @@ def compute_dm_worker_capacity(
     session_capacity: int,
     configured_limit: int,
 ) -> int:
-    """Phase 13 resource-aware worker capacity.
-
-    effective_capacity = min(eligible_accounts, available_network_capacity,
-                             available_session_capacity, configured_limit).
-
-    At least 1 worker is returned when accounts exist so the engine blocks on
-    proxy/session acquisition (WAITING_FOR_PROXY / WAITING_FOR_ACCOUNT) instead
-    of silently dropping valid work. Returns 0 when no accounts are eligible.
-    """
     if num_accounts <= 0:
         return 0
     return max(
@@ -279,7 +246,6 @@ class EnterpriseDMSender:
     # ──────────────────────────────────────────────
 
     def _filter_eligible_accounts(self, account_docs: list) -> list:
-        """Drop known terminal accounts BEFORE any SessionManager acquisition."""
         eligible = []
         for doc in account_docs or []:
             status = str(doc.get("status", "") or "").lower()
@@ -306,7 +272,6 @@ class EnterpriseDMSender:
         rr: Dict[str, int],
         rr_lock: asyncio.Lock,
     ):
-        """Round-robin selection that skips temporarily busy accounts."""
         if not candidate_accounts:
             return None
         now = time.monotonic()
@@ -336,11 +301,6 @@ class EnterpriseDMSender:
             self._campaign_metrics["queued"] = counter["queued"]
 
     def _maybe_requeue(self, worker_id: int, phone: str, target: Any) -> bool:
-        """Consume one Telegram-visible retry attempt for the target.
-
-        Returns True when the target may be requeued, False once the retry
-        budget is exhausted (target is then failed loudly).
-        """
         key = self._target_key(target)
         self._attempt_counts[key] = self._attempt_counts.get(key, 0) + 1
         if self._attempt_counts[key] >= self.max_target_attempts:
@@ -379,11 +339,6 @@ class EnterpriseDMSender:
         category: ErrorCategory,
         candidate_accounts: list,
     ) -> None:
-        """Quarantine a terminal account and remove it from current candidates.
-
-        SessionManager owns quarantine + client/proxy cleanup. DM never
-        releases a proxy or disconnects a client itself here.
-        """
         self.stats["accounts_down"] += 1
         self._emit("TERMINAL_ACCOUNT", worker=worker_id, phone=phone, detail=reason[:80])
         if self.session_manager is not None:
@@ -612,17 +567,7 @@ class EnterpriseDMSender:
             self.active_task.cancel()
 
     async def execute_dm_campaign(self, target_list: list, message_text: str, media_path: str, limit: int, ui_callback):
-        """
-        🔥 Proxy-Driven Dynamic Rolling Batch DM Campaign Engine
-
-        Golden Rule: If an account hits a ban/limit, the account is quarantined
-        and removed from current candidates. Each target is retried according to
-        an explicit error category, while resource starvation is surfaced as
-        WAITING_FOR_PROXY / WAITING_FOR_ACCOUNT instead of a permanent failure.
-
-        Parallel Execution: if N proxies are available, at most N workers run.
-        The engine never starts one worker per account by default.
-        """
+     
         self.is_running = True
         self._campaign_halted = False
         self.reset_stats()

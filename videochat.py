@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-Ultimate Enterprise Telegram Suite - WebRTC VoiceChat & Cross-DB Session Migration Engine
 Filename: videochat.py
 """
 
@@ -20,6 +19,19 @@ from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelReq
 from telethon.tl.functions.messages import ImportChatInviteRequest, DeleteHistoryRequest
 from telethon.errors import (
     FloodWaitError, PhoneNumberBannedError, UserAlreadyParticipantError,
+)
+
+from resource_manager import (
+    ProxyManager,
+    ProxyLeaseManager,
+    AccountLeaseManager,
+    AccountState,
+    TERMINAL_DB_STATUSES,
+    ELIGIBLE_DB_STATUSES,
+    SessionManager,
+    SessionAlreadyOwnedError,
+    SessionLifecycleState,
+    SessionLease,
 )
 
 logger = logging.getLogger("VideoChatEngineFallback")
@@ -770,13 +782,6 @@ class CloudVoiceChatEngine:
         chat_id: int,
         audio_path: str,
     ) -> None:
-        """Keep-alive heartbeat while the voice call is ACTIVE.
-
-        Returns when the target drops the call, ``self.is_running`` turns False,
-        the takeover guard fires, or the stream is cancelled. Every exit path
-        unwinds back through _run_stream -> _execute_single_stream's acquire
-        context (deterministic session + proxy release).
-        """
         guard = self._takeover_events.setdefault(phone, asyncio.Event())
         keepalive_cycle = 0
         try:

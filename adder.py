@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-Ultimate Enterprise Telegram Suite - High-Performance Multi-Account Rotating Member Adder
 Filename: adder.py
 """
 
@@ -23,11 +22,21 @@ from telethon.errors import (
     FloodWaitError, PeerFloodError, UserIdInvalidError, MessageNotModifiedError
 )
 
-from session_manager import SessionAlreadyOwnedError
+from resource_manager import (
+    ProxyManager,
+    ProxyLeaseManager,
+    AccountLeaseManager,
+    AccountState,
+    TERMINAL_DB_STATUSES,
+    ELIGIBLE_DB_STATUSES,
+    SessionManager,
+    SessionAlreadyOwnedError,
+    SessionLifecycleState,
+    SessionLease,
+)
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
-from proxy_manager import ProxyManager
 from exception_classifier import ErrorCategory, classify_exception
 from scraper import MemberScraper
 
@@ -180,7 +189,6 @@ async def status_updater_loop(client, chat_id, message_id, state: AdderState):
 
 
 class EnterpriseMemberAdder:
-    """Manages multi-account smart rotation loops, safe bursts padding, and anti-ban tracking matrix."""
     
     def __init__(self, db: SuiteDatabase, proxy_manager: Optional[ProxyManager] = None,
                  proxy_lease_manager=None, session_manager=None, account_lease_manager=None):
@@ -206,7 +214,6 @@ class EnterpriseMemberAdder:
     # ──────────────────────────────────────────────
     @staticmethod
     async def _force_cleanup_client(client: Optional[TelegramClient]) -> None:
-        """Deeply terminates Telethon client, cancelling internal sender loops and closing raw sockets."""
         if not client:
             return
         try:
@@ -250,10 +257,7 @@ class EnterpriseMemberAdder:
             pass
 
     async def execute_adding_pipeline(self, target_group_link: str, update_callback, adder_state: Optional[AdderState] = None) -> str:
-        """
-        Executes structural lookups from Scraped DB pool, starts multiple account workers,
-        and updates progress states back to the live central Telegram Bot UI dashboard.
-        """
+    
         self.is_running = True
         self.adder_state = adder_state
         self.total_added = 0
@@ -325,15 +329,6 @@ class EnterpriseMemberAdder:
 
         @asynccontextmanager
         async def account_context(acc_doc: dict) -> AsyncIterator[Optional[dict]]:
-            """
-            Context manager for Adder accounts that properly manages the session lifecycle.
-
-            Args:
-                acc_doc: Account document containing phone number and other details
-
-            Yields:
-                dict or None: Worker account data if successful, otherwise None
-            """
             phone = str(acc_doc.get("phone", "")).strip()
             clean_phone = phone.replace("+", "")
 

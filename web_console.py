@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-Ultimate Enterprise Telegram Suite - Pure Backend API Core
 Filename: web_console.py
 """
 
@@ -40,6 +39,18 @@ from telethon.tl.types import (
 from telethon.utils import get_peer_id
 
 from config import CONFIG
+from resource_manager import (
+    ProxyManager,
+    ProxyLeaseManager,
+    AccountLeaseManager,
+    AccountState,
+    TERMINAL_DB_STATUSES,
+    ELIGIBLE_DB_STATUSES,
+    SessionManager,
+    SessionAlreadyOwnedError,
+    SessionLifecycleState,
+    SessionLease,
+)
 from exception_classifier import ErrorCategory, classify_exception, ConnectionResult
 
 # =====================================================================

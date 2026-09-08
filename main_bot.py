@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Ultimate Enterprise Telegram Suite — Master Controller v2.0
-Enterprise-Grade Architecture | 100% Feature Parity | Zero Memory Leaks
-"""
 
 import os, sys, asyncio, logging, random, time, pathlib, ssl, re, gc, socket
 from datetime import datetime, timedelta, timezone
@@ -28,9 +24,18 @@ import httpx
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
-from proxy_manager import ProxyManager, ProxyLeaseManager
-from session_manager import SessionManager, SessionAlreadyOwnedError, SessionLifecycleState
-from account_lease_manager import AccountLeaseManager, AccountState, TERMINAL_DB_STATUSES, ELIGIBLE_DB_STATUSES
+from resource_manager import (
+    ProxyManager,
+    ProxyLeaseManager,
+    AccountLeaseManager,
+    AccountState,
+    TERMINAL_DB_STATUSES,
+    ELIGIBLE_DB_STATUSES,
+    SessionManager,
+    SessionAlreadyOwnedError,
+    SessionLifecycleState,
+    SessionLease,
+)
 from exception_classifier import (
     ErrorCategory,
     classify_exception,
@@ -247,11 +252,6 @@ class GlobalState:
             return state
 
     async def set_auth_state(self, phone_key: str, state: AuthState) -> None:
-        # Auth states hold a NON-OWNING reference to a login client: the
-        # SessionManager owns the client and its proxy lease. GlobalState never
-        # disconnects clients directly — SessionManager's release_login()/release
-        # paths do that, keeping counts and leases coherent.
-        async with self._auth_lock:
             self.auth_states[phone_key] = state
 
     async def pop_auth_state(self, phone_key: str) -> Optional[AuthState]:
@@ -259,11 +259,6 @@ class GlobalState:
             return self.auth_states.pop(phone_key, None)
 
     async def cleanup_stale_auth_states(self) -> int:
-        # Remove expired login states. A stale entry means the login was never
-        # completed, so the login reservation (and its client + proxy lease) is
-        # still owned by SessionManager under the "login:<phone>" owner key.
-        # Release it through the public API so cleanup stays coherent; the
-        # client is never disconnected directly from here.
         async with self._auth_lock:
             stale = [k for k, v in self.auth_states.items() if v.is_expired()]
             for k in stale:
@@ -362,7 +357,6 @@ dm_engine = setup_dmsender_handlers(bot, db, proxy_manager, proxy_lease_manager,
 from telethon.errors import QueryIdInvalidError
 
 async def safe_answer(event, text=None, alert=False):
-    """Safely answers callback queries, ignoring expired ID errors."""
     try:
         await event.answer(text, alert=alert)
     except QueryIdInvalidError:
@@ -377,7 +371,6 @@ def get_proxy_count() -> int:
         return len(proxy_manager.working_proxies) if hasattr(proxy_manager, 'working_proxies') else 0
 
 def clean_phone_input(phone_str: str) -> str:
-    """Sanitize and normalize phone number to international format."""
     if not phone_str:
         return ""
     digits_only = "".join(c for c in str(phone_str) if c.isdigit())
@@ -453,30 +446,9 @@ async def build_premium_status_bar(all_sessions: list) -> str:
     """Cache-enabled SaaS-style operational summary. Async wrapper for GLOBAL cache."""
     return await GLOBAL.get_status_bar(all_sessions)
 
-# ──────────────────────────────────────────────
-# CLIENT FACTORY (delegates to SessionManager)
-# ──────────────────────────────────────────────
-# All TelegramClient creation now routes through SessionManager.acquire().
-# The function below is the ONLY route to a runtime user-session client.
 
 @asynccontextmanager
 async def managed_client(record: dict):
-    """
-    Context manager for Telethon client lifecycle.
-
-    DELEGATES to SessionManager.acquire() — the single source of truth for all
-    TelegramClient creation, ownership, proxy lease and release. No direct
-    TelegramClient(...) calls are made here or anywhere else.
-
-    Every managed client, including auditor/recovery health checks, uses the
-    controlled network route: a proxy lease is acquired and released through
-    SessionManager's ProxyLeaseManager, and runtime ownership is enforced by
-    acquire(). A health check NEVER connects a direct-IP user session that
-    could overlap an actively owned account. If the proxy pool is exhausted the
-    lease is not obtained and the operation is skipped (never a direct
-    fallback). Use auto_release=True so SessionManager performs the single,
-    canonical release/disconnect on exit.
-    """
     phone = normalize_phone(str(record.get("phone", "")))
 
     async with session_manager.acquire(
@@ -541,13 +513,6 @@ def _login_proxy_label(client: TelegramClient) -> str:
 
 
 async def shared_login_process(phone: str, login_owner: str) -> dict:
-    """
-    Send the login code request strictly through a SessionManager-owned proxy
-    lease (ProxyLeaseManager). Rotates through multiple healthy proxy leases if
-    one fails. Never falls back to a direct-IP connection, and never constructs
-    or owns a client outside SessionManager: each attempt is a public
-    build_login_client() under the caller's existing login reservation.
-    """
     clean_phone = normalize_phone(phone)
     existing = db.get_session_by_phone(clean_phone)
 
@@ -1749,8 +1714,6 @@ async def global_health_scan_router(event) -> None:
 
     status_msg = await event.reply(
         "⚕️ **Global Health Scan & Auto-Recovery Initiated!**\n\n"
-        "System is currently scanning all `failed` and `restricted` accounts. "
-        "Agar unka temporary Telegram Spam Mute expire ho gaya hoga, toh unhe auto-recover karke wapas `ACTIVE` pool mein add kiya jayega. Please wait..."
     )
 
     all_accounts = await db.get_all_accounts_raw()
@@ -1824,7 +1787,7 @@ async def turn_off_health_cmd(event) -> None:
         return
     await GLOBAL.set_health_check(False)
     logger.warning("🛑 Admin disabled health auditor.")
-    await event.reply("🛑 **System Health Check / Auditor has been TURNED OFF.**\nBackground account validations, get_me() requests, and ban-checks are now completely paused.")
+    await event.reply("🛑 **System Health Check / Auditor has been TURNED OFF.**\nBackground account validations, get_me() requests, and checks are now completely paused.")
 
 
 @bot.on(events.NewMessage(pattern=r'/turnon_health'))
@@ -2233,11 +2196,6 @@ def _normalize_check_time(account_doc: dict) -> float:
 
 
 def _auditor_network_capacity() -> int:
-    """
-    Available network capacity for an audit cycle, driven by the proxy lease
-    pool. Fail-safe: if the pool cannot report availability, no audit clients
-    are created this cycle.
-    """
     try:
         return int(proxy_lease_manager.get_available_count())
     except Exception:
@@ -2249,11 +2207,6 @@ def _auditor_effective_capacity(
     available_network_capacity: int,
     configured_audit_concurrency: int,
 ) -> int:
-    """
-    Bounded audit concurrency: min(eligible accounts, available network
-    capacity, configured concurrency). Returning 0 means the cycle must be
-    skipped WITHOUT creating a Telegram client per account.
-    """
     if eligible_accounts <= 0:
         return 0
     cap = min(
@@ -2265,11 +2218,6 @@ def _auditor_effective_capacity(
 
 
 async def _auditor_run_pass(accounts: list, capacity: int) -> tuple:
-    """
-    Audit a batch with bounded concurrency. Each worker keeps the human-like
-    stagger before acting so Telegram anti-spam is not triggered.
-    Returns (checked, failed, skipped).
-    """
     checked = failed = skipped = 0
     if not accounts:
         return 0, 0, 0
@@ -2303,10 +2251,6 @@ async def _auditor_run_pass(accounts: list, capacity: int) -> tuple:
 
 
 async def continuous_session_auditor() -> None:
-    """
-    Enterprise-Grade Session Integrity Auditor v2.0
-    Bounded parallel batch processing + deterministic LRU prioritization.
-    """
     await asyncio.sleep(random.randint(30, 90))
     audit_logger.info("🚀 Enterprise Anti-Ban Session Auditor v2.0 (Parallel Batch Mode)")
 
@@ -2327,15 +2271,8 @@ async def continuous_session_auditor() -> None:
             if not active_accounts:
                 await asyncio.sleep(random.randint(600, 1200))
                 continue
-
-            # ── 🔥 PRIORITIZATION: Least recently checked first (deterministic) ──
-            # No unconditional shuffle: the LRU order is authoritative so the
-            # oldest-checked accounts are always audited first.
             active_accounts.sort(key=_normalize_check_time)
 
-            # ── 🔥 BOUNDED CAPACITY: min(eligible, network, configured) ──
-            # Never create one Telegram client per DB account just because the
-            # database contains many accounts.
             capacity = _auditor_effective_capacity(
                 len(active_accounts),
                 _auditor_network_capacity(),
@@ -2452,10 +2389,6 @@ async def check_session_authorization(client, phone_display: str = "") -> tuple:
 
 
 async def _audit_single_account(account_doc: dict) -> bool:
-    """
-    Check one account's session health.
-    Returns True if healthy, raises/returns False if revoked.
-    """
     phone = account_doc.get("phone")
     clean_phone = normalize_phone(str(phone)) if phone else ""
 
@@ -2616,12 +2549,6 @@ async def _run_with_bounded_restarts(
     max_restarts: int = 3,
     base_delay: float = 5.0,
 ) -> None:
-    """
-    Run a background service (auditor / recovery) so that an unexpected exit is
-    observable and, when allowed, restarted with bounded exponential backoff.
-    Restarts happen inside this single tracked task — never anonymous
-    fire-and-forget tasks.
-    """
     attempts = 0
     while True:
         try:
@@ -2771,14 +2698,6 @@ async def health_check():
 # ──────────────────────────────────────────────
 
 async def _recover_failed_accounts(failed_accounts: list) -> int:
-    """
-    Attempt to recover failed/muted accounts. Ownership and eligibility guards
-    mirror the auditor: terminal accounts are skipped permanently, busy/owned
-    accounts are skipped (never failed), and the client is always obtained
-    through SessionManager.acquire() via managed_client() - never constructed
-    or disconnected directly.
-    Returns the number of accounts recovered to ACTIVE.
-    """
     recovered = 0
     for acc in failed_accounts:
         phone = normalize_phone(str(acc.get("phone", "")))
