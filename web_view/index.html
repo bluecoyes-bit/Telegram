@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Telegram Web Premium</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-wrapper">
+
+        <!-- ==========================================
+             OVERLAY & MOBILE TOGGLES
+             ========================================== -->
+        <div class="overlay" id="overlay"></div>
+        <button class="mobile-menu-toggle" id="mobileMenuToggle">
+            <i class="fas fa-bars"></i>
+        </button>
+
+        <!-- ==========================================
+             PANE 1: SIDEBAR (Accounts Pool & Navigation)
+             ========================================== -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="user-profile" id="mainUserProfile">
+                    <div class="user-avatar" id="mainUserAvatar" style="background: var(--accent-blue);">M</div>
+                    <div class="user-info">
+                        <h3 id="mainUserName">Choose Account</h3>
+                        <p id="mainUserStatus">Telegram Premium Suite</p>
+                    </div>
+                </div>
+                <div class="sidebar-header-actions">
+                    <i class="fas fa-pen" id="newMessageBtn" title="New Message"></i>
+                </div>
+            </div>
+            
+            <!-- 🔥 Search + Account Switcher -->
+            <div class="sidebar-search">
+                <div class="search-box" style="margin: 0 12px 8px;">
+                    <i class="fas fa-search"></i>
+                    <input type="text" id="sidebarSearchInput" placeholder="Search accounts, chats...">
+                </div>
+            </div>
+
+            <!-- Account Sessions List -->
+            <nav class="menu" id="accountSessionsList">
+                <!-- JS dynamically injects account sessions -->
+            </nav>
+
+            <!-- Sidebar Footer with Premium Tools -->
+            <div class="sidebar-footer">
+                <div class="menu-item" id="openSessionAnalytics">
+                    <i class="fas fa-chart-line"></i>
+                    <span>Session Analytics</span>
+                </div>
+                <div class="menu-item" id="openContactsList">
+                    <i class="fas fa-address-book" style="color: var(--accent-blue);"></i>
+                    <span>My Contacts</span>
+                </div>
+                <div class="menu-item" id="openMassOperations">
+                    <i class="fas fa-bolt"></i>
+                    <span>Mass Operations</span>
+                </div>
+                <div class="menu-item" id="openFolders">
+                    <i class="fas fa-folder"></i>
+                    <span>Chat Folders</span>
+                </div>
+                <div class="menu-divider"></div>
+                <div class="menu-item" id="openSettings">
+                    <i class="fas fa-cog"></i>
+                    <span>Settings</span>
+                </div>
+                <div class="menu-item" id="toggleNightMode">
+                    <i class="fas fa-moon"></i>
+                    <span>Night Mode</span>
+                </div>
+                <div class="menu-item" id="logoutBtn">
+                    <i class="fas fa-sign-out-alt"></i>
+                    <span>Logout</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ==========================================
+             PANE 2: CHAT LIST (Middle Column)
+             ========================================== -->
+        <section class="chat-list-panel" id="chatListPanel">
+            <div class="search-header">
+                <div class="search-box">
+                    <i class="fas fa-search"></i>
+                    <input type="text" id="searchInput" placeholder="Search messages, users...">
+                </div>
+                <!-- Filter Tabs -->
+                <div class="filter-tabs">
+                    <button class="filter-tab active" data-filter="all">All</button>
+                    <button class="filter-tab" data-filter="personal">Personal</button>
+                    <button class="filter-tab" data-filter="groups">Groups</button>
+                    <button class="filter-tab" data-filter="channels">Channels</button>
+                    <button class="filter-tab" data-filter="bots">Bots</button>
+                </div>
+            </div>
+            
+            <!-- Premium Stories Row -->
+            <div class="stories-row" id="storiesRow">
+                <div class="story-item unseen">
+                    <div class="story-avatar" style="background: linear-gradient(135deg, #6c5ce7, #a29bfe);"><span>A</span></div>
+                    <span class="story-name">Add Story</span>
+                </div>
+                <!-- JS dynamically injects more stories -->
+            </div>
+
+            <!-- Chat Folders Tabs -->
+            <div class="folder-tabs" id="folderTabs">
+                <button class="folder-tab active" data-folder="all">All</button>
+                <!-- JS dynamically injects folder tabs -->
+            </div>
+
+            <!-- Dynamic Chat List -->
+            <div class="chat-list" id="chatList">
+                <!-- JS dynamically injects chat items -->
+            </div>
+        </section>
+
+        <!-- ==========================================
+             PANE 3: CHAT WINDOW (Main Conversation Area)
+             ========================================== -->
+        <main class="chat-window" id="chatWindow">
+            <!-- Placeholder when no chat is selected -->
+            <div id="chatWindowPlaceholder" class="chat-placeholder">
+                <div class="telegram-welcome-badge">
+                    <i class="fas fa-comments"></i>
+                    <span>Select a conversation to start messaging</span>
+                </div>
+            </div>
+            
+            <!-- Actual Chat Content -->
+            <div id="chatWindowActualContent" style="display: none;">
+                <!-- Chat Header -->
+                <header class="chat-header-bar" id="chatHeaderBar">
+                    <div class="chat-header-info">
+                        <button id="mobileChatBack" class="mobile-back-btn" style="display: none;">
+                            <i class="fas fa-arrow-left"></i>
+                        </button>
+                        <div class="header-avatar" id="headerAvatar" style="cursor: pointer;">?</div>
+                        <div class="header-text" style="cursor: pointer;" id="headerText">
+                            <h3 id="headerName">Loading...</h3>
+                            <p id="headerStatus">click for details</p>
+                        </div>
+                    </div>
+                    <div class="header-actions" id="headerActions">
+                        <i class="fas fa-search" id="chatSearchBtn" title="Search in chat"></i>
+                        <i class="fas fa-phone" id="voiceCallBtn" title="Voice Call"></i>
+                        <i class="fas fa-video" id="videoCallBtn" title="Video Call"></i>
+                        <i class="fas fa-ellipsis-v" id="openInfoPanel" title="More Actions"></i>
+                    </div>
+                </header>
+
+                <!-- Chat Background / Messages Area -->
+                <div class="chat-background" id="chatBackground">
+                    <div class="messages" id="messages">
+                        <!-- JS dynamically injects messages here -->
+                    </div>
+                </div>
+
+                <!-- Reply Preview -->
+                <div class="reply-preview" id="replyPreview" style="display: none;">
+                    <div class="reply-preview-content">
+                        <div class="reply-preview-info">
+                            <span class="reply-preview-name" id="replyPreviewName">User</span>
+                            <span class="reply-preview-text" id="replyPreviewText">Message...</span>
+                        </div>
+                        <button class="reply-preview-close" id="replyPreviewClose">&times;</button>
+                    </div>
+                </div>
+
+                <!-- Input Area -->
+                <footer class="input-area" id="inputArea">
+                    <div class="input-area-inner">
+                        <i class="fas fa-smile" id="toggleEmoji" title="Emoji & Stickers"></i>
+                        <i class="fas fa-paperclip" id="attachBtn" title="Attach Media"></i>
+                        <div class="message-input-wrapper">
+                            <input type="text" id="messageInput" class="message-input" placeholder="Message..." autocomplete="off">
+                        </div>
+                        <i class="fas fa-microphone" id="voiceMsgBtn" title="Voice Message"></i>
+                        <button id="sendBtn" class="send-btn" title="Send">
+                            <i class="fas fa-paper-plane"></i>
+                        </button>
+                    </div>
+                </footer>
+            </div>
+        </main>
+
+        <!-- ==========================================
+             PANE 4: EMOJI & STICKERS PANEL
+             ========================================== -->
+        <aside class="emoji-panel" id="emojiPanel">
+            <div class="emoji-header">
+                <div class="emoji-tabs">
+                    <button class="emoji-tab active" data-tab="emoji">😊 Emoji</button>
+                    <button class="emoji-tab" data-tab="stickers">🎯 Stickers</button>
+                    <button class="emoji-tab" data-tab="gifs">🎬 GIFs</button>
+                </div>
+                <button class="emoji-panel-close" id="emojiPanelClose">&times;</button>
+            </div>
+            <div class="emoji-content" id="emojiContent">
+                <div class="emoji-category-title" id="emojiCategoryTitle">Frequently Used</div>
+                <div class="emoji-grid" id="emojiGrid">
+                    <!-- JS dynamically injects emojis -->
+                </div>
+            </div>
+            <div class="emoji-footer" id="emojiFooter">
+                <span>😀 😂 😍 🥰 😎 🤔 👍 👎 🔥 💯</span>
+            </div>
+        </aside>
+
+        <!-- ==========================================
+             PANE 5: PREMIUM INFO PANEL (Right Drawer)
+             ========================================== -->
+        <aside class="info-panel" id="infoPanel">
+            <header class="info-panel-header">
+                <button class="info-panel-close" id="infoPanelClose">
+                    <i class="fas fa-times"></i>
+                </button>
+                <h3 id="infoPanelTitle">Group Information</h3>
+            </header>
+            <div class="info-panel-content">
+                <!-- Profile Section -->
+                <div class="info-profile-section" id="infoProfileSection" style="cursor: pointer;">
+                    <div class="info-avatar" id="infoAvatar">?</div>
+                    <h3 id="infoName">Name</h3>
+                    <p id="infoStatus">status</p>
+                </div>
+
+                <!-- Shared Media -->
+                <div class="info-section">
+                    <div class="info-section-title">📸 Shared Media</div>
+                    <div class="info-media-grid" id="infoMediaGrid">
+                        <div class="media-item" data-type="photo"><i class="fas fa-image"></i> <span>0 photos</span></div>
+                        <div class="media-item" data-type="video"><i class="fas fa-video"></i> <span>0 videos</span></div>
+                        <div class="media-item" data-type="file"><i class="fas fa-file"></i> <span>0 files</span></div>
+                        <div class="media-item" data-type="link"><i class="fas fa-link"></i> <span>0 links</span></div>
+                    </div>
+                </div>
+
+                <!-- Group Members (if group) -->
+                <div class="info-section" id="infoMembersSection">
+                    <div class="info-section-title">
+                        👥 Members 
+                        <span id="infoMemberCount" style="color: var(--accent-blue); font-weight: 700;">0</span>
+                    </div>
+                    <div id="infoMembersList" class="info-members-list">
+                        <!-- JS dynamically injects member items -->
+                    </div>
+                </div>
+
+                <!-- Shared Files -->
+                <div class="info-section">
+                    <div class="info-section-title">📁 Shared Files</div>
+                    <div id="infoSharedFiles" class="info-shared-files">
+                        <p style="color: var(--text-secondary); font-size: 13px;">No shared files</p>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ==========================================
+             MEMBER DETAILS MINI-PANEL (inline inside info panel)
+             ========================================== -->
+        <div class="member-detail-panel" id="memberDetailPanel" style="display: none;">
+            <div class="member-detail-header">
+                <button class="member-detail-back" id="memberDetailBack"><i class="fas fa-arrow-left"></i></button>
+                <h3>Member Details</h3>
+            </div>
+            <div class="member-detail-content">
+                <div class="member-detail-avatar" id="memberDetailAvatar">?</div>
+                <h3 id="memberDetailName">Name</h3>
+                <p id="memberDetailUsername">@username</p>
+                <p id="memberDetailBio" style="color: var(--text-secondary); font-size: 13px;">No bio</p>
+                <div class="member-detail-actions">
+                    <button class="btn-primary" id="memberDetailMessage"><i class="fas fa-comment"></i> Send Message</button>
+                    <button class="btn-secondary" id="memberDetailCall"><i class="fas fa-phone"></i> Call</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==========================================
+         MODALS
+         ========================================== -->
+
+    <!-- Session Analytics Modal -->
+    <div class="modal" id="sessionAnalyticsModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3><i class="fas fa-chart-line" style="color: var(--accent-blue);"></i> Session Node Analytics</h3>
+                <button class="modal-close" onclick="closeModal('sessionAnalyticsModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="analytics-stats-grid">
+                    <div class="analytics-stat">
+                        <span class="stat-label">Total Sessions</span>
+                        <span class="stat-value" id="analyticsTotalSessions">0</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Active</span>
+                        <span class="stat-value" id="analyticsActive" style="color: #2ecc71;">0</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Banned</span>
+                        <span class="stat-value" id="analyticsBanned" style="color: var(--error);">0</span>
+                    </div>
+                    <div class="analytics-stat">
+                        <span class="stat-label">Flooded</span>
+                        <span class="stat-value" id="analyticsFlooded" style="color: #f39c12;">0</span>
+                    </div>
+                </div>
+                <hr style="margin: 16px 0;">
+                <div class="info-row"><span>📱 Phone Link:</span> <span id="analyticsPhone">-</span></div>
+                <div class="info-row"><span>🌐 Data Center:</span> <span id="analyticsDC">-</span></div>
+                <div class="info-row"><span>🛜 Network Route:</span> <span id="analyticsRoute">-</span></div>
+                <div class="info-row"><span>🛡️ SpamBot Check:</span> <span id="analyticsSpam">✅ Unknown</span></div>
+                <div class="info-row"><span>📋 Violation Audit:</span> <span id="analyticsAudit">0 violations</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Mass Operations Modal -->
+    <div class="modal" id="massOperationsModal">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <h3><i class="fas fa-bolt" style="color: #f39c12;"></i> Mass Operations Command Center</h3>
+                <button class="modal-close" onclick="closeModal('massOperationsModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Operation Type</label>
+                    <select id="massOperationType" class="form-select">
+                        <option value="scrape">Scrape Members</option>
+                        <option value="add">Add Members</option>
+                        <option value="dm">Send DM</option>
+                        <option value="forward">Batch Forward</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Target Channel/Group Link or @Username</label>
+                    <input type="text" id="massTargetInput" placeholder="@username or https://t.me/...">
+                </div>
+                <div class="form-group">
+                    <label>Account Limit</label>
+                    <input type="number" id="massAccountLimit" placeholder="Max accounts to use" value="50">
+                </div>
+                <button class="btn-primary" id="executeBatchBtn"><i class="fas fa-play"></i> Execute Batch</button>
+                <div class="log-box">
+                    <div class="log-title">Live Operational Logging Pipeline</div>
+                    <div id="massLogOutput">[System Standby] Ready to accept outbound script execution streams...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Forward Chat Picker Modal -->
+    <div class="modal" id="forwardChatPickerModal">
+        <div class="modal-dialog" style="max-width: 400px; height: 75vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3><i class="fas fa-share" style="color: var(--accent-blue);"></i> Forward To...</h3>
+                <button class="modal-close" onclick="closeModal('forwardChatPickerModal')">&times;</button>
+            </div>
+            <div style="padding: 10px 20px; border-bottom: 1px solid var(--border-color);">
+                <div class="search-box" style="margin: 0;">
+                    <i class="fas fa-search"></i>
+                    <input type="text" id="forwardChatSearchInput" placeholder="Search chats...">
+                </div>
+            </div>
+            <div class="modal-body" id="forwardChatsContainer" style="overflow-y: auto; flex: 1;">
+                <!-- JS dynamically injects chat list -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Message Deletion Modal -->
+    <div class="modal" id="messageDeletionModal">
+        <div class="modal-dialog" style="max-width: 360px;">
+            <div class="modal-header" style="border: none; padding-bottom: 4px;">
+                <h3>Delete Message</h3>
+                <button class="modal-close" onclick="closeModal('messageDeletionModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="color: var(--text-secondary); font-size: 14px; margin-bottom: 16px;">Are you sure? This action cannot be undone.</p>
+                <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
+                    <input type="checkbox" id="deleteEveryoneCheckbox" style="width: 16px; height: 16px; accent-color: var(--error);">
+                    <label for="deleteEveryoneCheckbox" style="font-size: 13.5px; color: var(--error); font-weight: 600; cursor: pointer;">Also delete for everyone</label>
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 12px;">
+                    <button onclick="closeModal('messageDeletionModal')" class="btn-secondary">Cancel</button>
+                    <button id="confirmMessageDeleteBtn" class="btn-danger">Delete</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Contacts List Modal -->
+    <div class="modal" id="contactsListModal">
+        <div class="modal-dialog" style="max-width: 420px; height: 85vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3><i class="fas fa-users" style="color: var(--accent-blue);"></i> Contacts Book</h3>
+                <button class="modal-close" onclick="closeModal('contactsListModal')">&times;</button>
+            </div>
+            <div style="padding: 12px 20px; border-bottom: 1px solid var(--border-color);">
+                <div class="search-box" style="margin: 0;">
+                    <i class="fas fa-search"></i>
+                    <input type="text" id="contactSearchInput" placeholder="Search by name or number...">
+                </div>
+            </div>
+            <div class="modal-body" id="contactsListContainer" style="overflow-y: auto; flex: 1;">
+                <!-- JS dynamically injects contacts -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal (Multi-Page) -->
+    <div class="modal" id="settingsModal">
+        <div class="modal-dialog" style="max-width: 700px; height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3><i class="fas fa-cog"></i> Settings</h3>
+                <button class="modal-close" onclick="closeModal('settingsModal')">&times;</button>
+            </div>
+            <div class="settings-layout" style="display: flex; flex: 1; overflow: hidden;">
+                <!-- Settings Sidebar -->
+                <div class="settings-sidebar" style="width: 200px; border-right: 1px solid var(--border-color); overflow-y: auto; padding: 8px 0;">
+                    <div class="settings-nav-item active" data-page="general"><i class="fas fa-sliders-h"></i> General</div>
+                    <div class="settings-nav-item" data-page="notifications"><i class="fas fa-bell"></i> Notifications</div>
+                    <div class="settings-nav-item" data-page="privacy"><i class="fas fa-shield-alt"></i> Privacy & Security</div>
+                    <div class="settings-nav-item" data-page="appearance"><i class="fas fa-palette"></i> Appearance</div>
+                    <div class="settings-nav-item" data-page="language"><i class="fas fa-language"></i> Language</div>
+                    <div class="settings-nav-item" data-page="accounts"><i class="fas fa-users-cog"></i> Account Management</div>
+                    <div class="settings-nav-item" data-page="premium"><i class="fas fa-crown" style="color: #f1c40f;"></i> Premium</div>
+                    <div class="settings-nav-item" data-page="about"><i class="fas fa-info-circle"></i> About</div>
+                </div>
+                <!-- Settings Content -->
+                <div class="settings-content" id="settingsContent" style="flex: 1; overflow-y: auto; padding: 20px 24px;">
+                    <!-- JS dynamically injects settings pages -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat Folders Modal -->
+    <div class="modal" id="foldersModal">
+        <div class="modal-dialog" style="max-width: 500px;">
+            <div class="modal-header">
+                <h3><i class="fas fa-folder"></i> Chat Folders</h3>
+                <button class="modal-close" onclick="closeModal('foldersModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="foldersContainer">
+                <!-- JS dynamically injects folders -->
+            </div>
+        </div>
+    </div>
+
+    <!-- New Message / New Chat Modal -->
+    <div class="modal" id="newMessageModal">
+        <div class="modal-dialog" style="max-width: 400px; height: 70vh;">
+            <div class="modal-header">
+                <h3><i class="fas fa-pen"></i> New Message</h3>
+                <button class="modal-close" onclick="closeModal('newMessageModal')">&times;</button>
+            </div>
+            <div style="padding: 12px 20px;">
+                <div class="search-box" style="margin: 0;">
+                    <i class="fas fa-search"></i>
+                    <input type="text" id="newMessageSearch" placeholder="Search contacts or usernames...">
+                </div>
+            </div>
+            <div class="modal-body" id="newMessageContainer" style="overflow-y: auto;">
+                <!-- JS injects contact list -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Profile Photo Viewer Modal -->
+    <div class="modal" id="photoViewerModal">
+        <div class="photo-viewer-overlay" onclick="closeModal('photoViewerModal')">
+            <div class="photo-viewer-container">
+                <button class="photo-viewer-close" onclick="closeModal('photoViewerModal')">&times;</button>
+                <div class="photo-viewer-content">
+                    <img id="photoViewerImage" src="" alt="Profile Photo" style="max-width: 90vw; max-height: 85vh; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.5);">
+                </div>
+                <div class="photo-viewer-caption" id="photoViewerCaption"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Media Viewer Modal (for shared media) -->
+    <div class="modal" id="mediaViewerModal">
+        <div class="photo-viewer-overlay" onclick="closeModal('mediaViewerModal')">
+            <div class="photo-viewer-container">
+                <button class="photo-viewer-close" onclick="closeModal('mediaViewerModal')">&times;</button>
+                <div class="media-navigation">
+                    <button id="mediaPrevBtn" class="media-nav-btn"><i class="fas fa-chevron-left"></i></button>
+                    <div class="media-viewer-content" id="mediaViewerContent">
+                        <img id="mediaViewerImage" src="" alt="" style="max-width: 85vw; max-height: 80vh; border-radius: 8px;">
+                    </div>
+                    <button id="mediaNextBtn" class="media-nav-btn"><i class="fas fa-chevron-right"></i></button>
+                </div>
+                <div class="media-viewer-info" id="mediaViewerInfo">1 / 1</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Call Modal (Voice/Video) -->
+    <div class="modal" id="callModal">
+        <div class="modal-dialog call-modal-dialog" style="max-width: 360px; text-align: center; padding: 40px 20px;">
+            <div class="call-avatar" id="callAvatar" style="width: 80px; height: 80px; border-radius: 50%; background: var(--accent-blue); display: flex; align-items: center; justify-content: center; margin: 0 auto 16px; font-size: 32px; color: white;">?</div>
+            <h3 id="callName" style="margin-bottom: 4px;">Name</h3>
+            <p id="callStatus" style="color: var(--text-secondary); font-size: 14px; margin-bottom: 24px;">Calling...</p>
+            <div class="call-actions" style="display: flex; justify-content: center; gap: 24px;">
+                <button class="call-action-btn" style="width: 56px; height: 56px; border-radius: 50%; background: var(--error); color: white; border: none; font-size: 22px; cursor: pointer;" onclick="closeModal('callModal')"><i class="fas fa-phone-slash"></i></button>
+                <button class="call-action-btn" style="width: 56px; height: 56px; border-radius: 50%; background: var(--accent-blue); color: white; border: none; font-size: 22px; cursor: pointer;"><i class="fas fa-microphone-slash"></i></button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==========================================
+         COMPLETE JAVASCRIPT ENGINE
+         ========================================== -->
+    <script src="script.js"></script>
+</body>
+</html>
