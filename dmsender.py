@@ -26,6 +26,8 @@ from resource_manager import (
     SessionAlreadyOwnedError,
     SessionLifecycleState,
     SessionLease,
+    notify_auditor_stop,
+    notify_auditor_resume,
 )
 from exception_classifier import ErrorCategory, classify_exception
 
@@ -578,6 +580,11 @@ class EnterpriseDMSender:
         self._attempt_counts = {}
         self._used_phones = set()
         self._emit("campaign_start", detail=f"targets={len(target_list)}")
+        # Fully stop the background auditor/recovery while the campaign owns the pool.
+        try:
+            notify_auditor_stop()
+        except Exception:
+            pass
         try:
             final_text = str(message_text).strip() if message_text else ""
             if final_text.lower() == "skip" or not final_text:
@@ -608,6 +615,11 @@ class EnterpriseDMSender:
             # Always reset, even on unexpected exceptions — otherwise the
             # engine reports "Occupied" forever.
             self.is_running = False
+            # Background auditor/recovery can resume now that the campaign is done.
+            try:
+                notify_auditor_resume()
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────
     # Core engine

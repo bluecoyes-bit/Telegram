@@ -39,6 +39,37 @@ from exception_classifier import ErrorCategory, classify_exception
 logger = logging.getLogger("ResourceManager")
 
 # ────────────────────────────────────────────────────────────────
+# OPERATION → AUDITOR LIFECYCLE HOOKS
+# main_bot registers stop/start hooks at startup; engines call the notify
+# helpers when an operation begins/ends so the auditor is FULLY stopped
+# (task cancelled, zero proxy churn) while campaigns run.
+# ────────────────────────────────────────────────────────────────
+_operation_hooks: Dict[str, Callable[[], Any]] = {}
+
+
+def register_auditor_hooks(stop_hook: Callable[[], Any], start_hook: Callable[[], Any]) -> None:
+    _operation_hooks["stop"] = stop_hook
+    _operation_hooks["start"] = start_hook
+
+
+def notify_auditor_stop() -> None:
+    hook = _operation_hooks.get("stop")
+    if hook is not None:
+        try:
+            hook()
+        except Exception as exc:
+            logger.warning(f"Auditor stop hook failed: {exc}")
+
+
+def notify_auditor_resume() -> None:
+    hook = _operation_hooks.get("start")
+    if hook is not None:
+        try:
+            hook()
+        except Exception as exc:
+            logger.warning(f"Auditor resume hook failed: {exc}")
+
+# ────────────────────────────────────────────────────────────────
 # 0. SHARED UTILITIES & UNIFIED CONSTANTS
 # ────────────────────────────────────────────────────────────────
 def compute_session_fingerprint(session_str: str, api_id: int) -> str:

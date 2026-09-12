@@ -35,6 +35,7 @@ from resource_manager import (
     SessionAlreadyOwnedError,
     SessionLifecycleState,
     SessionLease,
+    register_auditor_hooks,
 )
 from exception_classifier import (
     ErrorCategory,
@@ -1378,12 +1379,14 @@ async def centralized_ui_router(event) -> None:
 
     elif route == "diag_pause_auditor":
         await GLOBAL.set_health_check(False)
+        stop_auditor()  # actually cancel the background auditor + recovery tasks
         logger.warning("🛑 Auditor paused via UI.")
         await event.edit("⏸️ **Auditor Health Checks PAUSED.**", buttons=back_to_lvl1)
         await event.answer()
 
     elif route == "diag_resume_auditor":
         await GLOBAL.set_health_check(True)
+        start_auditor()  # actually restart the background auditor + recovery tasks
         logger.info("✅ Auditor resumed via UI.")
         await event.edit("▶️ **Auditor Health Checks RESUMED.**", buttons=back_to_lvl1)
         await event.answer()
@@ -2059,6 +2062,7 @@ async def turn_off_health_cmd(event) -> None:
     if not is_admin(event.sender_id):
         return
     await GLOBAL.set_health_check(False)
+    stop_auditor()  # actually cancel the background auditor + recovery tasks
     logger.warning("🛑 Admin disabled health auditor.")
     await event.reply("🛑 **System Health Check / Auditor has been TURNED OFF.**\nBackground account validations, get_me() requests, and checks are now completely paused.")
 
@@ -2068,6 +2072,7 @@ async def turn_on_health_cmd(event) -> None:
     if not is_admin(event.sender_id):
         return
     await GLOBAL.set_health_check(True)
+    start_auditor()  # actually restart the background auditor + recovery tasks
     logger.info("✅ Admin enabled health auditor.")
     await event.reply("✅ **System Health Check / Auditor has been TURNED ON.**\nBackground account validations have resumed.")
 
@@ -2270,7 +2275,7 @@ async def direct_contact_csv_scraper(event) -> None:
 # 22. MEMBER ADDER
 # ──────────────────────────────────────────────
 
-@bot.on(events.NewMessage(pattern=r"^/addmembers (.+)"))
+@bot.on(events.NewMessage(pattern=r"^/addmembers\s+(\S+)(?:\s+(\d+))?"))
 async def run_member_adder_matrix(event) -> None:
     if not is_admin(event.sender_id):
         return
@@ -2281,13 +2286,21 @@ async def run_member_adder_matrix(event) -> None:
 
     chat_id = event.chat_id
     target_group_link = event.pattern_match.group(1).strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
+    requested_workers = None
+    try:
+        requested_workers = int(event.pattern_match.group(2)) if event.pattern_match.group(2) else None
+    except (ValueError, TypeError):
+        requested_workers = None
 
     # Session ownership is handled by SessionManager/AccountLeaseManager
-    logger.info(f"⚡ Launching enterprise adder to target: {target_group_link}")
+    logger.info(
+        f"⚡ Launching enterprise adder to target: {target_group_link} "
+        f"(requested_workers={requested_workers})"
+    )
 
     try:
         # 1. Initialize State Tracker
-        adder_state = AdderState(total_target=0, max_workers=10)
+        adder_state = AdderState(total_target=0, max_workers=requested_workers or 10)
 
         # 2. Send initial status message to get message_id
         status_msg_obj = await bot.send_message(chat_id, "🚀 Initializing Enterprise System...")
@@ -2306,7 +2319,8 @@ async def run_member_adder_matrix(event) -> None:
         result_text = await adder_engine.execute_adding_pipeline(
             target_group_link=target_group_link,
             update_callback=dummy_callback,
-            adder_state=adder_state
+            adder_state=adder_state,
+            requested_workers=requested_workers,
         )
 
         # 5. Send final summary report
@@ -2453,6 +2467,53 @@ def should_start_recovery() -> bool:
     return bool(CONFIG.get("ENABLE_AUTO_RECOVERY", True))
 
 
+# ── 🔥 AUDITOR & RECOVERY CONTROLLER: full stop/resume around operations ──
+_auditor_task: Optional[asyncio.Task] = None
+_recovery_task: Optional[asyncio.Task] = None
+
+
+def stop_auditor() -> None:
+    """Completely stop the background auditor AND auto-recovery (cancel tasks).
+    Called when dmsender / adder / videochat operations start, or when the
+    admin explicitly pauses health checks, so the operation owns the proxy
+    pool with zero background churn."""
+    global _auditor_task, _recovery_task
+    if _auditor_task is not None and not _auditor_task.done():
+        _auditor_task.cancel()
+        logger.info("🛑 Auditor STOPPED — background health checks cancelled.")
+    _auditor_task = None
+    if _recovery_task is not None and not _recovery_task.done():
+        _recovery_task.cancel()
+        logger.info("🛑 Recovery STOPPED — background recovery cancelled.")
+    _recovery_task = None
+    GLOBAL.update_auditor_state(phase="paused")
+
+
+def start_auditor() -> None:
+    """Resume the background auditor and auto-recovery if enabled, not running,
+    and no operation currently owns the proxy pool."""
+    global _auditor_task, _recovery_task
+    # Never resume while an active operation still owns the proxy pool. The
+    # operation's own finally block will call start_auditor again when it ends.
+    if adder_engine.is_running or dm_engine.is_running or voice_engine.is_running:
+        logger.info("⏸ Auditor resume deferred — an operation still owns the proxy pool.")
+        return
+    if should_start_auditor():
+        if _auditor_task is None or _auditor_task.done():
+            _auditor_task = asyncio.create_task(
+                _run_with_bounded_restarts("auditor", continuous_session_auditor)
+            )
+            GLOBAL.register_task(_auditor_task)
+            logger.info("✅ Auditor RESUMED — background health checks restarted.")
+    if should_start_recovery():
+        if _recovery_task is None or _recovery_task.done():
+            _recovery_task = asyncio.create_task(
+                _run_with_bounded_restarts("recovery", auto_health_recovery_loop)
+            )
+            GLOBAL.register_task(_recovery_task)
+            logger.info("✅ Recovery RESUMED — background recovery restarted.")
+
+
 def _normalize_check_time(account_doc: dict) -> float:
     """Epoch used for LRU ordering. Missing/invalid values sort to the front."""
     val = account_doc.get("last_checked_time") or account_doc.get("last_updated")
@@ -2563,10 +2624,6 @@ async def _auditor_run_pass(accounts: list, capacity: int) -> dict:
 
 async def continuous_session_auditor() -> None:
     await asyncio.sleep(random.randint(30, 90))
-    audit_logger.info(
-        "🚀 Session Auditor online (batch mode) — checking ACTIVE + FAILED accounts, "
-        "human-paced via the proxy cooldown window."
-    )
 
     # ── 🔥 BATCH CONFIGURATION (tunable) ──
     BATCH_SIZE = CONFIG.get("AUDITOR_BATCH_SIZE", 10)       # Accounts processed per batch
@@ -2576,6 +2633,11 @@ async def continuous_session_auditor() -> None:
     RECHECK_SECONDS = max(60, int(CONFIG.get("AUDITOR_RECHECK_MINUTES", 720)) * 60)
     CONCURRENCY = max(1, int(CONFIG.get("AUDITOR_CONCURRENCY", 3)))
     pass_no = 0
+
+    audit_logger.info(
+        "🚀 Session Auditor online (batch mode) — checking ACTIVE + FAILED accounts, "
+        f"recheck interval={RECHECK_SECONDS // 3600}h, human-paced via the proxy cooldown window."
+    )
 
     while True:
         try:
@@ -2618,7 +2680,10 @@ async def continuous_session_auditor() -> None:
             due = [acc for acc in audit_pool
                    if (now - _normalize_check_time(acc)) >= RECHECK_SECONDS]
             if not due:
-                audit_logger.debug("Auditor: all accounts checked recently; nothing due.")
+                audit_logger.info(
+                    f"Auditor: all {len(audit_pool)} accounts checked within the last "
+                    f"{RECHECK_SECONDS // 3600}h; nothing due. Sleeping."
+                )
                 GLOBAL.update_auditor_state(
                     phase="resting", due=0, batch=0, batches=0,
                     next_batch_at=None, next_pass_at=time.time() + 300)
@@ -2629,7 +2694,7 @@ async def continuous_session_auditor() -> None:
             total_batches = (len(due) + BATCH_SIZE - 1) // BATCH_SIZE
             audit_logger.info(
                 f"🔍 Audit pass starting: {len(due)} due of {len(audit_pool)} "
-                f"(active+failed pool), concurrency={capacity}."
+                f"(active+failed pool), concurrency={capacity}, recheck={RECHECK_SECONDS // 3600}h."
             )
             GLOBAL.update_auditor_state(
                 phase="scanning", pass_no=pass_no, pool=len(audit_pool), due=len(due),
@@ -2986,28 +3051,28 @@ async def lifespan(app: FastAPI):
     logger.info("Starting AccountLeaseManager (Lease Expiration Reaper active)...")
     await account_lease_manager.start()
 
-    # 3. Register background auditor task (gated by AUDITOR_ENABLED). Idle
-    #    startup: the auditor sleeps 30-90s before doing any account work, and
-    #    no user-session clients are created at startup.
+    # 3. Register background auditor task via the controller (gated by
+    #    AUDITOR_ENABLED). Engines fully stop/resume the auditor around
+    #    operations through the registered hooks.
+    register_auditor_hooks(stop_auditor, start_auditor)
     auditor_task = None
     if should_start_auditor():
-        auditor_task = asyncio.create_task(
-            _run_with_bounded_restarts("auditor", continuous_session_auditor)
-        )
-        GLOBAL.register_task(auditor_task)
+        start_auditor()
+        auditor_task = _auditor_task
         logger.info("AUDITOR: enabled - background audit task started.")
     else:
         logger.info("AUDITOR: disabled (AUDITOR_ENABLED=false) - no audit task, no auditor workers/session acquisition.")
 
     # 4. Register auto-recovery loop task (gated by ENABLE_AUTO_RECOVERY)
-    recovery_task = None
+    global _recovery_task
     if should_start_recovery():
-        recovery_task = asyncio.create_task(
+        _recovery_task = asyncio.create_task(
             _run_with_bounded_restarts("recovery", auto_health_recovery_loop)
         )
-        GLOBAL.register_task(recovery_task)
+        GLOBAL.register_task(_recovery_task)
         logger.info("AUTO_RECOVERY: enabled - background recovery loop started.")
     else:
+        _recovery_task = None
         logger.info("AUTO_RECOVERY: disabled (ENABLE_AUTO_RECOVERY=false) - no recovery loop started.")
 
     logger.info("Service, Telegram Bot, Auditor, Recovery Loops, and ProxyLeaseManager are online!")
@@ -3038,8 +3103,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to stop voice engine during shutdown: {exc}")
 
     # 2) STOP AUDITOR + RECOVERY, THEN WAIT FOR THE TASKS
+    #    (_auditor_task may differ from the startup reference if engines
+    #    stopped/resumed it during the session.)
     pending = []
-    for task in (auditor_task, recovery_task):
+    for task in (auditor_task, _auditor_task, _recovery_task):
         if task is not None:
             task.cancel()
             pending.append(task)
