@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, sys, asyncio, logging, random, time, pathlib, ssl, re, gc, socket
+import os, sys, asyncio, logging, random, time, pathlib, ssl, re, gc, socket, json, secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable, Set
@@ -11,16 +11,20 @@ from enum import Enum, auto
 import uvicorn
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.tl.types import User
-from telethon.tl.functions.messages import DeleteHistoryRequest
+from telethon.tl.types import User, InputPeerChannel, InputPeerUser
+from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
+from telethon.tl.functions.messages import (
+    DeleteHistoryRequest, CheckChatInviteRequest, ImportChatInviteRequest,
+)
 from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.errors import *
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import gc
 import httpx
+import subprocess
 
 from config import CONFIG, DEVICE_PROFILES
 from database import SuiteDatabase
@@ -35,6 +39,7 @@ from resource_manager import (
     SessionAlreadyOwnedError,
     SessionLifecycleState,
     SessionLease,
+    register_auditor_hooks,
 )
 from exception_classifier import (
     ErrorCategory,
@@ -94,9 +99,44 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 # 🔥 FIX: Silence Telethon's repetitive internal network warnings when testing proxies
 logging.getLogger("telethon.network.mtprotosender").setLevel(logging.ERROR)
 logging.getLogger("telethon.network.connection.connection").setLevel(logging.ERROR)
+# Silence urllib3 proxy-test retry spam (each failed proxy test logs 2+ useless
+# "Tunnel connection failed" warnings per pass).
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _ensure_web_api_token() -> str:
+    """Guarantee a stable WEB_API_TOKEN for this process and the dashboard.
+
+    Env-configured tokens win. Otherwise reuse `.web_api_token` so restarts
+    do not 401 in-flight browser tabs. Tests that import web_console without
+    this helper still see a fail-closed 503 when CONFIG is empty.
+    """
+    token = str(CONFIG.get("WEB_API_TOKEN") or "").strip()
+    if token:
+        return token
+    token_path = Path(__file__).resolve().parent / ".web_api_token"
+    try:
+        if token_path.is_file():
+            stored = token_path.read_text(encoding="utf-8").strip()
+            if stored:
+                CONFIG["WEB_API_TOKEN"] = stored
+                return stored
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(32)
+    CONFIG["WEB_API_TOKEN"] = token
+    try:
+        token_path.write_text(token, encoding="utf-8")
+    except OSError:
+        logger.warning("Could not persist WEB_API_TOKEN to %s", token_path)
+    logger.warning(
+        "WEB_API_TOKEN was unset; generated a local token (saved to .web_api_token). "
+        "Set WEB_API_TOKEN in the environment for production."
+    )
+    return token
 
 # ──────────────────────────────────────────────
 # TYPED CONFIGURATION
@@ -181,6 +221,26 @@ class GlobalState:
         # Health check flag
         self.health_check_active: bool = True
 
+        # Live monitor task (/live real-time console)
+        self._live_task: Optional[asyncio.Task] = None
+
+        # ── 🔥 BACKGROUND ACTIVITY STATE (auditor / recovery) ──
+        # Live status published by the background loops and rendered in the
+        # Telegram console status bar.
+        self.auditor_state: Dict[str, Any] = {
+            "phase": "starting", "pass_no": 0, "pool": 0, "due": 0,
+            "batch": 0, "batches": 0, "ok": 0, "dead": 0, "busy": 0,
+            "no_proxy": 0, "errors": 0, "skipped": 0,
+            "current": {}, "next_batch_at": None, "next_pass_at": None,
+            "updated_at": 0.0,
+        }
+        self.recovery_state: Dict[str, Any] = {
+            "phase": "waiting", "next_sweep_in": None,
+            "last_recovered": None, "updated_at": 0.0,
+        }
+        # Rolling feed of recent per-account results, shown live in the console.
+        self.live_feed: "OrderedDict[float, str]" = OrderedDict()
+
         # Background task registry
         self.background_tasks: Set[asyncio.Task] = set()
 
@@ -189,10 +249,13 @@ class GlobalState:
     # ── 🔥 NEW: Cached status bar ──
 
     # ── YEH DO METHODS GlobalState class ke ANDAR DAALO ──
-    async def get_status_bar(self, all_sessions: list) -> str:
-        """Return cached status bar, recompute only if expired."""
+    async def get_status_bar(self, all_sessions: list, live: bool = False) -> str:
+        """Return cached status bar, recompute only if expired.
+
+        live=True always recomputes fresh (used by the /live real-time monitor).
+        """
         now = time.time()
-        if now < self._status_bar_expires and self._status_bar_cache:
+        if not live and now < self._status_bar_expires and self._status_bar_cache:
             return self._status_bar_cache
         
         # Cache miss — compute fresh
@@ -205,7 +268,84 @@ class GlobalState:
             AccountStatus.FAILED, AccountStatus.BANNED))
         worker_id = CONFIG.get("WORKER_NODE_ID", "worker_01")
         proxy_count = getattr(proxy_manager, 'working_count', 0)
-        
+
+        # ── 🔥 LIVE SYSTEM ACTIVITY (auditor / proxy pool / recovery) ──
+        now_ts = time.time()
+        try:
+            free_proxies = proxy_lease_manager.get_available_count()
+            total_proxies = len(proxy_lease_manager.proxy_nodes)
+            resting_proxies = len(proxy_lease_manager.proxy_cooldown)
+            leased_proxies = int(proxy_lease_manager.stats.get("current_active_leases", 0))
+            cooling_until = [n.cooldown_until for n in proxy_lease_manager.proxy_nodes.values()
+                             if n.is_in_cooldown()]
+            next_free_eta = (min(cooling_until) - now_ts) if cooling_until else None
+        except Exception:
+            free_proxies = resting_proxies = leased_proxies = total_proxies = 0
+            next_free_eta = None
+
+        a = self.auditor_state
+        a_phase = a.get("phase", "starting")
+        if a_phase == "scanning":
+            auditor_line = (
+                f"🔍 Pass #{a.get('pass_no', 0)} • batch {a.get('batch', 0)}/{a.get('batches', 0)} "
+                f"({a.get('due', 0)} due) • ✅ {a.get('ok', 0)} 🪦 {a.get('dead', 0)} "
+                f"⏭ {a.get('busy', 0) + a.get('skipped', 0) + a.get('no_proxy', 0)} ⚠️ {a.get('errors', 0)}"
+            )
+        elif a_phase == "resting":
+            npa = a.get("next_pass_at")
+            auditor_line = (
+                f"💤 Resting • next pass in ~{_fmt_eta(npa - now_ts)}"
+                if npa else "💤 Resting"
+            )
+        elif a_phase == "waiting_proxy":
+            auditor_line = "⏳ Waiting for free proxy (pool resting after last use)"
+        elif a_phase == "paused":
+            auditor_line = "⏸ Paused • operation running"
+        else:
+            auditor_line = "🚀 Starting..."
+
+        activity_lines = [f"🧠 Auditor: {auditor_line}"]
+        if a_phase == "scanning":
+            current_phones = sorted((a.get("current") or {}).keys())
+            if current_phones:
+                shown = ", ".join(f"+{p}" for p in current_phones[:3])
+                more = len(current_phones) - 3
+                activity_lines.append(
+                    f"   ↳ Testing now: {shown}" + (f" (+{more} more)" if more > 0 else ""))
+            else:
+                activity_lines.append("   ↳ Connecting next account...")
+            nba = a.get("next_batch_at")
+            if nba and nba > now_ts:
+                activity_lines.append(f"   ↳ Next batch in ~{_fmt_eta(nba - now_ts)}")
+
+        r = self.recovery_state
+        if r.get("phase") == "sweeping":
+            recovery_line = "🩹 Sweeping failed accounts (human-paced)..."
+        elif r.get("next_sweep_in") is not None:
+            recovery_line = f"💤 Idle • next sweep in ~{_fmt_eta(r.get('next_sweep_in'))}"
+        else:
+            recovery_line = "💤 Idle"
+        if r.get("last_recovered") is not None:
+            recovery_line += f" • last: 🟢 {r.get('last_recovered')} recovered"
+
+        proxy_line = (
+            f"🛡️ Proxy Pool: `{free_proxies}` free • `{resting_proxies}` resting • "
+            f"`{leased_proxies}` leased (of `{total_proxies}`)"
+        )
+        if free_proxies == 0 and resting_proxies > 0 and next_free_eta is not None:
+            proxy_line += f" • next free in ~{_fmt_eta(next_free_eta)}"
+        try:
+            reserve = proxy_lease_manager.login_reserve_limit()
+        except Exception:
+            reserve = 0
+        if reserve > 0:
+            proxy_line += f" • 🔐 {reserve} reserved for login"
+
+        feed_lines = []
+        for ts, line in list(self.live_feed.items())[-6:]:
+            clock = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            feed_lines.append(f"`{clock}` {line}")
+
         self._status_bar_cache = (
             "**Workspace Overview**\n"
             f"Total Inventory: `{total}` Accounts\n"
@@ -214,6 +354,12 @@ class GlobalState:
             f"🟠 `{failed_cnt}` Failed / Spam Muted (Recoverable)\n"
             f"🔴 `{revoked_cnt}` Revoked / Dead\n"
             f"Infrastructure: ⚡ Node `{worker_id}` • 🛡️ `{proxy_count}` Proxies Healthy\n"
+            "\n"
+            "**⚙️ System Activity**\n"
+            + "\n".join(activity_lines) + "\n"
+            + proxy_line + "\n"
+            + f"🏥 Recovery: {recovery_line}\n"
+            + ("\n**📜 Live Feed**\n" + "\n".join(feed_lines) + "\n" if feed_lines else "")
         )
         self._status_bar_expires = now + self._status_bar_ttl
         return self._status_bar_cache
@@ -279,10 +425,54 @@ class GlobalState:
         async with self._lock:
             self.health_check_active = active
 
+    # ── Background Activity ──
+    def update_auditor_state(self, **kwargs) -> None:
+        """Publish live auditor progress for the Telegram console status bar."""
+        self.auditor_state.update(kwargs)
+        self.auditor_state["updated_at"] = time.time()
+
+    def mark_audit_account_started(self, phone: str) -> None:
+        """Register an account as currently under test (shown live in console)."""
+        self.auditor_state.setdefault("current", {})[str(phone)] = time.time()
+
+    def mark_audit_account_finished(self, phone: str) -> None:
+        self.auditor_state.get("current", {}).pop(str(phone), None)
+
+    def push_live_event(self, line: str) -> None:
+        """Record a per-account result for the console live feed (keep last 6)."""
+        self.live_feed[time.time()] = line
+        while len(self.live_feed) > 6:
+            self.live_feed.popitem(last=False)
+
+    # ── Live Monitor (/live) ──
+    def set_live_task(self, task: Optional[asyncio.Task]) -> None:
+        self._live_task = task
+
+    def get_live_task(self) -> Optional[asyncio.Task]:
+        return self._live_task
+
+    def update_recovery_state(self, **kwargs) -> None:
+        """Publish live recovery-loop progress for the Telegram console status bar."""
+        self.recovery_state.update(kwargs)
+        self.recovery_state["updated_at"] = time.time()
+
     # ── Background Tasks ──
     def register_task(self, task: asyncio.Task) -> None:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
+
+
+def _fmt_eta(seconds: Any) -> str:
+    """Human-friendly countdown: 1h 23m / 4m 30s / 45s."""
+    try:
+        s = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "?"
+    if s >= 3600:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    if s >= 60:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s}s"
 
 
 # Initialize global state
@@ -442,9 +632,83 @@ def get_account_label(acc: dict) -> str:
 
 
 
-async def build_premium_status_bar(all_sessions: list) -> str:
+async def build_premium_status_bar(all_sessions: list, live: bool = False) -> str:
     """Cache-enabled SaaS-style operational summary. Async wrapper for GLOBAL cache."""
-    return await GLOBAL.get_status_bar(all_sessions)
+    return await GLOBAL.get_status_bar(all_sessions, live=live)
+
+
+# ──────────────────────────────────────────────
+# 1b. LIVE MONITOR (real-time console, /live)
+# ──────────────────────────────────────────────
+
+LIVE_REFRESH_SECONDS = 5.0
+
+
+async def _live_monitor_loop(message) -> None:
+    """Continuously re-edit the monitor message with fresh state."""
+    try:
+        while True:
+            try:
+                all_sessions = await db.get_all_suite_sessions()
+                bar = await build_premium_status_bar(all_sessions, live=True)
+                now_str = datetime.now().strftime("%H:%M:%S")
+                text = (
+                    "🔴 **LIVE MONITOR** — auto-refresh every 5s\n\n"
+                    f"{bar}"
+                    f"\n_Updated: {now_str}_"
+                )
+                await message.edit(
+                    text,
+                    buttons=[[Button.inline("⏹ Stop Live", data="live_stop")]],
+                    parse_mode="md",
+                )
+            except FloodWaitError as e:
+                await asyncio.sleep(min(float(e.seconds) + 1.0, 60.0))
+                continue
+            except Exception as e:
+                logger.error(f"Live monitor refresh failed: {e}")
+            await asyncio.sleep(LIVE_REFRESH_SECONDS)
+    except asyncio.CancelledError:
+        try:
+            await message.edit("🔴 **LIVE MONITOR** stopped.", buttons=None)
+        except Exception:
+            pass
+        raise
+
+
+@bot.on(events.NewMessage(pattern='/live$'))
+async def live_monitor_start(event) -> None:
+    if not is_admin(event.sender_id):
+        return
+    old = GLOBAL.get_live_task()
+    if old and not old.done():
+        old.cancel()
+    msg = await event.reply("🔴 **LIVE MONITOR** starting...")
+    task = asyncio.create_task(_live_monitor_loop(msg))
+    GLOBAL.register_task(task)
+    GLOBAL.set_live_task(task)
+
+
+@bot.on(events.NewMessage(pattern='/liveoff$'))
+async def live_monitor_stop_cmd(event) -> None:
+    if not is_admin(event.sender_id):
+        return
+    task = GLOBAL.get_live_task()
+    if task and not task.done():
+        task.cancel()
+        await event.reply("⏹ Live monitor stopped.")
+    else:
+        await event.reply("No live monitor is running.")
+
+
+@bot.on(events.CallbackQuery(data="live_stop"))
+async def live_monitor_stop_button(event) -> None:
+    if not is_admin(event.sender_id):
+        return
+    task = GLOBAL.get_live_task()
+    if task and not task.done():
+        task.cancel()
+    await safe_answer(event, "Live monitor stopped.")
 
 
 @asynccontextmanager
@@ -1002,11 +1266,11 @@ async def centralized_ui_router(event) -> None:
 
     # ── ACTION: HEALTH SCAN ──
     elif route == "action_health_scan":
-        await event.edit("⚕️ **Global Health Scan & Auto-Recovery Initiated!**\n\nScanning `failed` and `restricted` accounts...", buttons=None)
+        await event.edit("⚕️ **Global Health Scan & Auto-Recovery Initiated!**\n\nScanning `failed` accounts (human-paced, 3-6 min per account)...", buttons=None)
 
         all_accounts = await db.get_all_accounts_raw()
-        failed_accounts = [acc for acc in all_accounts if acc.get("status") in (
-            AccountStatus.FAILED, AccountStatus.BANNED, AccountStatus.RESTRICTED)]
+        # FAILED accounts only — banned, restricted and revoked are never touched.
+        failed_accounts = [acc for acc in all_accounts if acc.get("status") == AccountStatus.FAILED]
 
         if not failed_accounts:
             await event.edit(
@@ -1017,27 +1281,53 @@ async def centralized_ui_router(event) -> None:
 
         recovered_count = 0
         still_restricted = 0
-        scan_sem = asyncio.Semaphore(5)
+        no_proxy_count = 0
+        busy_count = 0
+        scan_sem = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 3))))
+        scan_delay = CONFIG.get("RECOVERY_ACCOUNT_DELAY", (180, 360))
 
         async def _ui_scan_worker(acc):
-            nonlocal recovered_count, still_restricted
+            nonlocal recovered_count, still_restricted, no_proxy_count, busy_count
+            phone = normalize_phone(str(acc.get("phone", "")))
+            # FIRST-COME-FIRST-USE LOCK: never touch an account owned by
+            # another task (campaign, login, auditor).
+            if await account_lease_manager.is_busy(phone) or await session_manager.is_owned(phone):
+                busy_count += 1
+                logger.debug(f"[UIHealthScan] +{phone} busy on another task — skipped.")
+                return
             async with scan_sem:
-                phone = normalize_phone(str(acc.get("phone", "")))
-                session_str = safe_session_str(acc)
-                if not session_str:
+                # Human pacing between account scans (3-6 min + micro-jitter).
+                await asyncio.sleep(random.uniform(float(scan_delay[0]), float(scan_delay[1])))
+                if not safe_session_str(acc):
                     still_restricted += 1
                     return
                 try:
                     async with managed_client(acc) as client:
+                        # Connect explicitly; no free proxy = skip, never mark.
+                        if not client.is_connected():
+                            try:
+                                await asyncio.wait_for(client.connect(), timeout=15.0)
+                            except Exception as conn_err:
+                                no_proxy_count += 1
+                                logger.debug(f"[UIHealthScan] +{phone} connect skipped: {conn_err}")
+                                return
                         if await client.is_user_authorized():
                             await client.get_me()
                             await client.send_message("SpamBot", "/start")
-                            db.update_session_status(phone, AccountStatus.ACTIVE, client.session.save())
+                            await db.update_session_status_async(phone, AccountStatus.ACTIVE, client.session.save())
                             recovered_count += 1
                             return
+                        still_restricted += 1
+                except SessionAlreadyOwnedError:
+                    # Safety net: owned at acquire time — never mark it.
+                    busy_count += 1
+                    logger.debug(f"[UIHealthScan] +{phone} owned at acquire time — skipped.")
+                except ConnectionError as e:
+                    # No proxy leaseable / connect refused: skip, never mark failed.
+                    no_proxy_count += 1
+                    logger.debug(f"[UIHealthScan] +{phone} skipped (no proxy/connect): {e}")
                 except Exception:
                     still_restricted += 1
-                await asyncio.sleep(0.5)
 
         await asyncio.gather(*[asyncio.create_task(_ui_scan_worker(a)) for a in failed_accounts])
 
@@ -1047,6 +1337,8 @@ async def centralized_ui_router(event) -> None:
             f"🔍 Scanned: `{len(failed_accounts)}` accounts\n"
             f"🟢 **Successfully Recovered:** `{recovered_count}`\n"
             f"🟠 **Still Restricted:** `{still_restricted}`\n"
+            f"🛡️ **Skipped (No Proxy Available):** `{no_proxy_count}`\n"
+            f"🔒 **Skipped (Busy on Another Task):** `{busy_count}`\n"
         )
         await event.edit(report, buttons=[[Button.inline("⬅️ Back to Accounts", data="nav_lvl1_accounts")]])
 
@@ -1126,12 +1418,14 @@ async def centralized_ui_router(event) -> None:
 
     elif route == "diag_pause_auditor":
         await GLOBAL.set_health_check(False)
+        stop_auditor()  # actually cancel the background auditor + recovery tasks
         logger.warning("🛑 Auditor paused via UI.")
         await event.edit("⏸️ **Auditor Health Checks PAUSED.**", buttons=back_to_lvl1)
         await event.answer()
 
     elif route == "diag_resume_auditor":
         await GLOBAL.set_health_check(True)
+        start_auditor()  # actually restart the background auditor + recovery tasks
         logger.info("✅ Auditor resumed via UI.")
         await event.edit("▶️ **Auditor Health Checks RESUMED.**", buttons=back_to_lvl1)
         await event.answer()
@@ -1686,6 +1980,109 @@ async def clean_banned_accounts_router(event) -> None:
 
 
 # ──────────────────────────────────────────────
+# 15b. RESTORE ACCOUNTS WRONGLY KILLED BY SPAM MISCLASSIFICATION
+# ──────────────────────────────────────────────
+
+@bot.on(events.NewMessage(pattern='/restore_spambanned'))
+async def restore_spambanned_router(event) -> None:
+    """
+    Restore accounts that were incorrectly marked terminal because the
+    classifier misread a temporary spam restriction
+    (USER_BANNED_IN_CHANNEL) as ACCOUNT_BANNED.
+
+    For every account currently in a terminal/quarantined state whose
+    revocation_reason contains spam-restriction text, the command pulls
+    the most recent session string snapshot from `session_backups`,
+    restores it into `source_accounts`, and sets status back to `failed`
+    so the auditor/recovery loop will re-verify it with SpamBot as
+    Telegram lifts the restriction.
+    """
+    if not is_admin(event.sender_id):
+        return
+
+    status_msg = await event.reply(
+        "🛠️ **Spam-Ban Misclassification Restore Initiated**\n\n"
+        "Scanning terminal accounts killed by `USER_BANNED_IN_CHANNEL` / spam-restriction misclassification..."
+    )
+
+    SPAM_REASON_KEYWORDS = [
+        "temporarily banned from sending in supergroups/channels",
+        "user_banned_in_channel",
+        "supergroups/channels",
+        "spam restriction",
+    ]
+
+    restored_count = 0
+    no_backup_count = 0
+    not_misclassified_count = 0
+    errors: list[str] = []
+
+    try:
+        all_accounts = await db.get_all_accounts_raw()
+        terminal_statuses = set(TERMINAL_DB_STATUSES)
+
+        for acc in all_accounts:
+            phone = normalize_phone(str(acc.get("phone", "")))
+            status = str(getattr(acc.get("status"), "value", acc.get("status"))).lower()
+            reason = str(acc.get("revocation_reason") or "").lower()
+
+            if status not in terminal_statuses:
+                continue
+            if not any(kw in reason for kw in SPAM_REASON_KEYWORDS):
+                not_misclassified_count += 1
+                continue
+
+            try:
+                backup = db.session_backups.find_one(
+                    {"phone": phone},
+                    sort=[("backup_created_at", -1)],
+                )
+                if not backup:
+                    no_backup_count += 1
+                    logger.warning(f"[RestoreSpamBanned] No backup for {phone}")
+                    continue
+
+                session_snapshot = str(backup.get("session_snapshot") or "").strip()
+                if not session_snapshot or session_snapshot == "None":
+                    no_backup_count += 1
+                    logger.warning(f"[RestoreSpamBanned] Empty backup session for {phone}")
+                    continue
+
+                restored = await db.restore_session_from_backup_async(
+                    phone,
+                    session_snapshot,
+                    reason="Restored from spam-restriction misclassification; pending recovery",
+                )
+                if restored:
+                    restored_count += 1
+                    logger.info(f"[RestoreSpamBanned] Restored +{phone} to failed with backup session")
+                else:
+                    errors.append(f"+{phone}: terminal account no longer present")
+            except Exception as inner:
+                logger.error(f"[RestoreSpamBanned] Failed to restore +{phone}: {inner}", exc_info=True)
+                errors.append(f"+{phone}: {inner}")
+
+        report = (
+            "✅ **Spam-Ban Restore Complete**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 **Restored to `failed`:** `{restored_count}`\n"
+            f"🟠 **No usable backup:** `{no_backup_count}`\n"
+            f"🔴 **Terminal but not spam-related:** `{not_misclassified_count}`\n"
+        )
+        if errors:
+            report += f"⚠️ **Errors:** `{len(errors)}`\n"
+            report += "\n".join(f"`{e}`" for e in errors[:10])
+        report += (
+            "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "ℹ️ Restored accounts will be re-checked by the auditor/recovery loop via SpamBot."
+        )
+        await status_msg.edit(report)
+    except Exception as ex:
+        logger.error(f"Restore spam-banned error: {ex}", exc_info=True)
+        await status_msg.edit(f"❌ **Restore Failed:** `{str(ex)}`")
+
+
+# ──────────────────────────────────────────────
 # 16. REMOVE ACCOUNT
 # ──────────────────────────────────────────────
 
@@ -1717,8 +2114,8 @@ async def global_health_scan_router(event) -> None:
     )
 
     all_accounts = await db.get_all_accounts_raw()
-    failed_accounts = [acc for acc in all_accounts if acc.get("status") in (
-        AccountStatus.FAILED, AccountStatus.BANNED, AccountStatus.RESTRICTED)]
+    # Scan FAILED accounts only — banned, restricted and revoked are never touched.
+    failed_accounts = [acc for acc in all_accounts if acc.get("status") == AccountStatus.FAILED]
 
     if not failed_accounts:
         await status_msg.edit("✅ **System Health Excellent:** Koi bhi account 'failed' ya 'muted' state mein nahi hai. Auto-recovery ki zaroorat nahi.")
@@ -1727,12 +2124,23 @@ async def global_health_scan_router(event) -> None:
     recovered_count = 0
     permanently_dead_count = 0
     still_restricted_count = 0
-    scan_semaphore = asyncio.Semaphore(5)
+    no_proxy_count = 0
+    busy_count = 0
+    scan_semaphore = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 3))))
+    scan_delay = CONFIG.get("RECOVERY_ACCOUNT_DELAY", (180, 360))
 
     async def scan_and_recover(acc):
-        nonlocal recovered_count, permanently_dead_count, still_restricted_count
+        nonlocal recovered_count, permanently_dead_count, still_restricted_count, no_proxy_count, busy_count
+        phone = normalize_phone(str(acc.get("phone", "")))
+        # FIRST-COME-FIRST-USE LOCK: an account busy on any other task
+        # (campaign, login, auditor) is never touched by the health scan.
+        if await account_lease_manager.is_busy(phone) or await session_manager.is_owned(phone):
+            busy_count += 1
+            logger.debug(f"[HealthScan] +{phone} busy on another task — skipped.")
+            return
         async with scan_semaphore:
-            phone = normalize_phone(str(acc.get("phone", "")))
+            # Human pacing between account scans (3-6 min + micro-jitter).
+            await asyncio.sleep(random.uniform(float(scan_delay[0]), float(scan_delay[1])))
             session_str = safe_session_str(acc)
             if not session_str:
                 still_restricted_count += 1
@@ -1745,18 +2153,27 @@ async def global_health_scan_router(event) -> None:
                     me = await client.get_me()
                     try:
                         await client.send_message("SpamBot", "/start")
-                        db.update_session_status(phone, AccountStatus.ACTIVE, client.session.save())
+                        await db.update_session_status_async(phone, AccountStatus.ACTIVE, client.session.save())
                         recovered_count += 1
-                    except (ChatWriteForbiddenError, Exception):
+                    except Exception as spam_err:
                         still_restricted_count += 1
-                        db.mark_account_failed(phone, f"Still Restricted")
+                        logger.debug(f"[HealthScan] +{phone} still restricted: {spam_err}")
+                        await db.mark_account_failed_async(phone, f"Still Restricted")
+            except SessionAlreadyOwnedError:
+                # Safety net: account became owned between the pre-check and
+                # the acquire. Never mark it — another task owns it.
+                busy_count += 1
+                logger.debug(f"[HealthScan] +{phone} owned at acquire time — skipped.")
             except (UserDeactivatedError, UserDeactivatedBanError, SessionRevokedError, AuthKeyUnregisteredError):
                 permanently_dead_count += 1
-                db.mark_account_revoked(phone, "Permanently Banned / Revoked by Telegram.")
+                await db.mark_account_revoked_async(phone, "Permanently Banned / Revoked by Telegram.")
+            except ConnectionError as e:
+                # No proxy leaseable / connect refused: skip, never mark failed.
+                no_proxy_count += 1
+                logger.debug(f"[HealthScan] +{phone} skipped (no proxy/connect): {e}")
             except Exception:
                 still_restricted_count += 1
-                db.mark_account_failed(phone, "Unstable connectivity")
-            await asyncio.sleep(0.5)
+                await db.mark_account_failed_async(phone, "Unstable connectivity")
 
     tasks = [asyncio.create_task(scan_and_recover(acc)) for acc in failed_accounts]
     await asyncio.gather(*tasks)
@@ -1771,6 +2188,8 @@ async def global_health_scan_router(event) -> None:
         f"🟢 **Successfully Recovered:** `{recovered_count}` (Spam mute lifted!)\n"
         f"🟠 **Still Restricted/Muted:** `{still_restricted_count}` (Need more time)\n"
         f"🔴 **Permanently Dead:** `{permanently_dead_count}` (Marked as Revoked)\n"
+        f"🛡️ **Skipped (No Proxy Available):** `{no_proxy_count}`\n"
+        f"🔒 **Skipped (Busy on Another Task):** `{busy_count}`\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 **New Active Pool Size:** `{total_active}` Accounts ready for use."
     )
@@ -1786,6 +2205,7 @@ async def turn_off_health_cmd(event) -> None:
     if not is_admin(event.sender_id):
         return
     await GLOBAL.set_health_check(False)
+    stop_auditor()  # actually cancel the background auditor + recovery tasks
     logger.warning("🛑 Admin disabled health auditor.")
     await event.reply("🛑 **System Health Check / Auditor has been TURNED OFF.**\nBackground account validations, get_me() requests, and checks are now completely paused.")
 
@@ -1795,6 +2215,7 @@ async def turn_on_health_cmd(event) -> None:
     if not is_admin(event.sender_id):
         return
     await GLOBAL.set_health_check(True)
+    start_auditor()  # actually restart the background auditor + recovery tasks
     logger.info("✅ Admin enabled health auditor.")
     await event.reply("✅ **System Health Check / Auditor has been TURNED ON.**\nBackground account validations have resumed.")
 
@@ -1997,7 +2418,7 @@ async def direct_contact_csv_scraper(event) -> None:
 # 22. MEMBER ADDER
 # ──────────────────────────────────────────────
 
-@bot.on(events.NewMessage(pattern=r"^/addmembers (.+)"))
+@bot.on(events.NewMessage(pattern=r"^/addmembers\s+(\S+)(?:\s+(\d+))?"))
 async def run_member_adder_matrix(event) -> None:
     if not is_admin(event.sender_id):
         return
@@ -2008,13 +2429,21 @@ async def run_member_adder_matrix(event) -> None:
 
     chat_id = event.chat_id
     target_group_link = event.pattern_match.group(1).strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
+    requested_workers = None
+    try:
+        requested_workers = int(event.pattern_match.group(2)) if event.pattern_match.group(2) else None
+    except (ValueError, TypeError):
+        requested_workers = None
 
     # Session ownership is handled by SessionManager/AccountLeaseManager
-    logger.info(f"⚡ Launching enterprise adder to target: {target_group_link}")
+    logger.info(
+        f"⚡ Launching enterprise adder to target: {target_group_link} "
+        f"(requested_workers={requested_workers})"
+    )
 
     try:
         # 1. Initialize State Tracker
-        adder_state = AdderState(total_target=0, max_workers=10)
+        adder_state = AdderState(total_target=0, max_workers=requested_workers or 10)
 
         # 2. Send initial status message to get message_id
         status_msg_obj = await bot.send_message(chat_id, "🚀 Initializing Enterprise System...")
@@ -2033,15 +2462,154 @@ async def run_member_adder_matrix(event) -> None:
         result_text = await adder_engine.execute_adding_pipeline(
             target_group_link=target_group_link,
             update_callback=dummy_callback,
-            adder_state=adder_state
+            adder_state=adder_state,
+            requested_workers=requested_workers,
         )
 
-        # 5. Send final summary report
-        await bot.send_message(chat_id, result_text)
+        # 5. Send final summary report (shutdown-safe: bot may be disconnecting)
+        try:
+            await bot.send_message(chat_id, result_text)
+        except Exception as send_err:
+            logger.error(f"Could not deliver adder result (bot shutting down?): {send_err}")
 
     except Exception as e:
         logger.error(f"Adder error: {e}")
-        await event.reply(f"❌ **Adder System Exception:** `{str(e)[:200]}`")
+        try:
+            await event.reply(f"❌ **Adder System Exception:** `{str(e)[:200]}`")
+        except Exception as reply_err:
+            logger.error(f"Could not deliver adder error reply: {reply_err}")
+
+
+# ──────────────────────────────────────────────
+# 22b. FLOODCHECK — forensic single-account invite test
+# ──────────────────────────────────────────────
+
+async def _floodcheck_single(acc_doc: dict, group_link: str) -> str:
+    """Run ONE account through the full invite pipeline step-by-step and
+    return a short verdict string. Every step is timed and logged."""
+    phone = normalize_phone(str(acc_doc.get("phone", "")))
+    clean_phone = phone
+    is_private, token = adder_engine.scraper_helper.resolve_group_link(group_link)
+    t0 = time.monotonic()
+
+    async with session_manager.acquire(
+        clean_phone,
+        module="floodcheck",
+        worker_id=f"floodcheck:{clean_phone}",
+        auto_release=True,
+        timeout=60.0,
+    ) as lease:
+        if lease is None:
+            return "no_lease"
+        client = lease.client
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            audit_logger.info(f"[FloodCheck] +{phone} UNAUTHORIZED")
+            return "unauthorized"
+        audit_logger.info(
+            f"[FloodCheck] +{phone} step1 connect+auth OK ({time.monotonic() - t0:.1f}s) proxy_node={lease.proxy_id}"
+        )
+
+        # Step 2: resolve target group
+        try:
+            if is_private:
+                invite_info = await client(CheckChatInviteRequest(token))
+                if type(invite_info).__name__ == "ChatInviteAlready":
+                    target_entity = invite_info.chat
+                else:
+                    updates = await client(ImportChatInviteRequest(token))
+                    target_entity = updates.chats[0] if getattr(updates, "chats", None) else None
+            else:
+                try:
+                    await client(JoinChannelRequest(token))
+                except UserAlreadyParticipantError:
+                    pass
+                target_entity = await client.get_entity(token)
+            if target_entity is None or not hasattr(target_entity, "access_hash"):
+                return "target_failed"
+            audit_logger.info(f"[FloodCheck] +{phone} step2 target resolved OK")
+        except Exception as exc:
+            audit_logger.info(f"[FloodCheck] +{phone} step2 target FAILED: {type(exc).__name__}")
+            return f"target:{type(exc).__name__}"
+
+        # Step 3: pick one unprocessed member
+        page = await db.fetch_unprocessed_scraped_pool_paginated(0, 1)
+        if not page:
+            return "no_members"
+        member = page[0]
+        uname = str(member.get("username", "") or "").strip()
+        uid = str(member.get("user_id", "") or "").strip()
+        access_hash = str(member.get("access_hash", "0") or "0").strip()
+        try:
+            if uname and uname.lower() != "none":
+                target_user = await client.get_input_entity(uname)
+            elif uid and access_hash != "0":
+                target_user = InputPeerUser(int(uid), int(access_hash))
+            else:
+                return "no_valid_member"
+        except Exception as exc:
+            return f"member:{type(exc).__name__}"
+        audit_logger.info(f"[FloodCheck] +{phone} step3 member resolved OK ({uname or uid})")
+
+        # Step 4: THE TEST — one invite attempt
+        peer = InputPeerChannel(target_entity.id, target_entity.access_hash)
+        try:
+            await client(InviteToChannelRequest(peer, [target_user]))
+            await db.log_addition_state(uid, uname, "success_added")
+            audit_logger.info(f"[FloodCheck] +{phone} step4 INVITE SUCCESS")
+            return "OK"
+        except UserAlreadyParticipantError:
+            return "AlreadyMember"
+        except UserPrivacyRestrictedError:
+            # Telegram processed the invite to the privacy stage — the account
+            # CAN perform invites; this member is just restricted.
+            return "PrivacyOK"
+        except PeerFloodError:
+            audit_logger.info(f"[FloodCheck] +{phone} step4 PEER_FLOOD")
+            return "PeerFlood"
+        except FloodWaitError as fw:
+            return f"FloodWait{fw.seconds}s"
+        except Exception as exc:
+            return f"invite:{type(exc).__name__}"
+
+
+@bot.on(events.NewMessage(pattern=r'^/floodcheck\s+(.+)'))
+async def flood_check_cmd(event) -> None:
+    if not is_admin(event.sender_id):
+        return
+    raw = event.pattern_match.group(1).strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
+    link = raw.split()[0]
+    status = await event.reply("🔬 **FloodCheck** — testing accounts one by one...")
+    try:
+        accounts = await db.get_active_target_sessions()
+        if not accounts:
+            await status.edit("❌ No active accounts in DB.")
+            return
+        results = []
+        for acc in accounts[:3]:
+            phone = normalize_phone(str(acc.get("phone", "")))
+            try:
+                verdict = await _floodcheck_single(acc, link)
+            except Exception as exc:
+                verdict = f"error:{type(exc).__name__}"
+            results.append((phone, verdict))
+            if verdict not in ("PeerFlood", "no_lease", "unauthorized"):
+                break  # found a working signal — no need to burn more
+
+        lines = [f"{'🚫' if v == 'PeerFlood' else '✅' if v in ('OK', 'AlreadyMember', 'PrivacyOK') else '❌'} `+{p}` → {v}" for p, v in results]
+        all_flood = all(v == "PeerFlood" for _, v in results)
+        if all_flood:
+            summary = "🚫 **All tested accounts are invite-limited by Telegram (PeerFlood)**\n⏳ Wait 12–24h, then try again"
+        else:
+            summary = "✅ At least one account CAN invite — run `/addmembers` normally"
+        await status.edit(summary + "\n" + "\n".join(lines))
+    except Exception as e:
+        logger.error(f"FloodCheck error: {e}")
+        try:
+            await status.edit(f"❌ FloodCheck failed: `{str(e)[:150]}`")
+        except Exception:
+            pass
 
 
 # ──────────────────────────────────────────────
@@ -2180,11 +2748,63 @@ def should_start_recovery() -> bool:
     return bool(CONFIG.get("ENABLE_AUTO_RECOVERY", True))
 
 
+# ── 🔥 AUDITOR & RECOVERY CONTROLLER: full stop/resume around operations ──
+_auditor_task: Optional[asyncio.Task] = None
+_recovery_task: Optional[asyncio.Task] = None
+
+
+def stop_auditor() -> None:
+    """Completely stop the background auditor AND auto-recovery (cancel tasks).
+    Called when dmsender / adder / videochat operations start, or when the
+    admin explicitly pauses health checks, so the operation owns the proxy
+    pool with zero background churn."""
+    global _auditor_task, _recovery_task
+    if _auditor_task is not None and not _auditor_task.done():
+        _auditor_task.cancel()
+        logger.info("🛑 Auditor STOPPED — background health checks cancelled.")
+    _auditor_task = None
+    if _recovery_task is not None and not _recovery_task.done():
+        _recovery_task.cancel()
+        logger.info("🛑 Recovery STOPPED — background recovery cancelled.")
+    _recovery_task = None
+    GLOBAL.update_auditor_state(phase="paused")
+
+
+def start_auditor() -> None:
+    """Resume the background auditor and auto-recovery if enabled, not running,
+    and no operation currently owns the proxy pool."""
+    global _auditor_task, _recovery_task
+    # Never resume while an active operation still owns the proxy pool. The
+    # operation's own finally block will call start_auditor again when it ends.
+    if adder_engine.is_running or dm_engine.is_running or voice_engine.is_running:
+        logger.info("⏸ Auditor resume deferred — an operation still owns the proxy pool.")
+        return
+    if should_start_auditor():
+        if _auditor_task is None or _auditor_task.done():
+            _auditor_task = asyncio.create_task(
+                _run_with_bounded_restarts("auditor", continuous_session_auditor)
+            )
+            GLOBAL.register_task(_auditor_task)
+            logger.info("✅ Auditor RESUMED — background health checks restarted.")
+    if should_start_recovery():
+        if _recovery_task is None or _recovery_task.done():
+            _recovery_task = asyncio.create_task(
+                _run_with_bounded_restarts("recovery", auto_health_recovery_loop)
+            )
+            GLOBAL.register_task(_recovery_task)
+            logger.info("✅ Recovery RESUMED — background recovery restarted.")
+
+
 def _normalize_check_time(account_doc: dict) -> float:
     """Epoch used for LRU ordering. Missing/invalid values sort to the front."""
     val = account_doc.get("last_checked_time") or account_doc.get("last_updated")
     if val is None:
         return 0.0
+    if isinstance(val, datetime):
+        # Mongo returns naive UTC datetimes; treat naive values as UTC.
+        if val.tzinfo is None:
+            val = val.replace(tzinfo=timezone.utc)
+        return val.timestamp()
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
@@ -2197,9 +2817,21 @@ def _normalize_check_time(account_doc: dict) -> float:
 
 def _auditor_network_capacity() -> int:
     try:
-        return int(proxy_lease_manager.get_available_count())
+        # Reserve-aware: the auditor must not consume the login buffer either.
+        return int(proxy_lease_manager.usable_available_count())
     except Exception:
-        return 0
+        try:
+            return int(proxy_lease_manager.get_available_count())
+        except Exception:
+            return 0
+
+
+def _auditor_pool_size() -> list:
+    """Total tracked proxy nodes (for diagnostics in skip logs)."""
+    try:
+        return list(proxy_lease_manager.proxy_nodes.keys())
+    except Exception:
+        return []
 
 
 def _auditor_effective_capacity(
@@ -2217,90 +2849,159 @@ def _auditor_effective_capacity(
     return max(0, cap)
 
 
-async def _auditor_run_pass(accounts: list, capacity: int) -> tuple:
-    checked = failed = skipped = 0
+async def _auditor_run_pass(accounts: list, capacity: int) -> dict:
+    outcomes = {"ok": 0, "dead": 0, "failed": 0, "busy": 0, "skipped": 0, "no_proxy": 0}
     if not accounts:
-        return 0, 0, 0
+        return outcomes
     if capacity <= 0:
         # No network capacity: no audit clients are created; every account is
         # reported as skipped.
-        return 0, 0, len(accounts)
+        outcomes["skipped"] = len(accounts)
+        return outcomes
 
     sem = asyncio.Semaphore(max(1, capacity))
 
     async def _worker(acc):
         async with sem:
-            # HUMAN-LIKE DELAY: prevents rapid-fire API requests.
-            await asyncio.sleep(random.uniform(10.0, 20.0))
+            phone = normalize_phone(str(acc.get("phone", "")))
+            GLOBAL.mark_audit_account_started(phone)
+            started = time.monotonic()
             try:
-                ok = await _audit_single_account(acc)
-                return ("ok" if ok else "noop",)
-            except SessionAlreadyOwnedError:
-                return ("busy",)
-            except Exception:
-                return ("failed",)
+                # Small micro-jitter only: the real human pacing (3-5 min) comes
+                # from the proxy cooldown window enforced by the lease manager.
+                await asyncio.sleep(random.uniform(2.0, 6.0))
+                try:
+                    ok = await _audit_single_account(acc)
+                    dur = time.monotonic() - started
+                    line = (f"✅ +{phone} connected & authorized • {dur:.1f}s" if ok
+                            else f"🪦 +{phone} DEAD • {dur:.1f}s")
+                except _AuditNoProxy as e:
+                    ok = "skip"
+                    line = f"⏭ +{phone} skipped (proxy: {str(e)[:80]}) • {time.monotonic() - started:.1f}s"
+                except SessionAlreadyOwnedError:
+                    ok = "busy"
+                    line = f"🔒 +{phone} busy (owned by another worker)"
+                except Exception as e:
+                    ok = "error"
+                    line = f"⚠️ +{phone} error: {str(e)[:80]} • {time.monotonic() - started:.1f}s"
+                audit_logger.info(line)
+                GLOBAL.push_live_event(line)
+                if ok is True:
+                    return ("ok",)
+                if ok is False:
+                    return ("dead",)
+                if ok == "busy":
+                    return ("busy",)
+                if ok == "error":
+                    return ("failed",)
+                return ("no_proxy",)
+            finally:
+                GLOBAL.mark_audit_account_finished(phone)
 
     for (outcome,) in await asyncio.gather(*(_worker(a) for a in accounts)):
-        if outcome == "ok":
-            checked += 1
-        elif outcome == "busy":
-            skipped += 1
-        elif outcome == "failed":
-            failed += 1
-    return checked, failed, skipped
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    return outcomes
 
 
 async def continuous_session_auditor() -> None:
     await asyncio.sleep(random.randint(30, 90))
-    audit_logger.info("🚀 Enterprise Anti-Ban Session Auditor v2.0 (Parallel Batch Mode)")
 
     # ── 🔥 BATCH CONFIGURATION (tunable) ──
     BATCH_SIZE = CONFIG.get("AUDITOR_BATCH_SIZE", 10)       # Accounts processed per batch
-    BATCH_STAGGER = CONFIG.get("AUDITOR_BATCH_STAGGER", 15) # Seconds between batches
-    MACRO_COOLDOWN_MIN = CONFIG.get("AUDITOR_COOLDOWN_MIN", 1800)  # 30 min
-    MACRO_COOLDOWN_MAX = CONFIG.get("AUDITOR_COOLDOWN_MAX", 3600)  # 1 hour
+    BATCH_STAGGER = CONFIG.get("AUDITOR_BATCH_STAGGER", 60) # Seconds between batches
+    PASS_GAP_MIN = CONFIG.get("AUDITOR_COOLDOWN_MIN", 300)  # Rest between full passes
+    PASS_GAP_MAX = CONFIG.get("AUDITOR_COOLDOWN_MAX", 600)
+    RECHECK_SECONDS = max(60, int(CONFIG.get("AUDITOR_RECHECK_MINUTES", 720)) * 60)
+    CONCURRENCY = max(1, int(CONFIG.get("AUDITOR_CONCURRENCY", 3)))
+    pass_no = 0
+
+    audit_logger.info(
+        "🚀 Session Auditor online (batch mode) — checking ACTIVE + FAILED accounts, "
+        f"recheck interval={RECHECK_SECONDS // 3600}h, human-paced via the proxy cooldown window."
+    )
 
     while True:
         try:
             # 🔥 AUTO-PAUSE: Automatically skip auditor cycles if heavy campaigns are running
             if not await GLOBAL.is_health_check_active() or adder_engine.is_running or dm_engine.is_running or voice_engine.is_running:
+                GLOBAL.update_auditor_state(phase="paused")
                 await asyncio.sleep(30)
                 continue
 
-            active_accounts = await db.get_active_target_sessions()
-            if not active_accounts:
-                await asyncio.sleep(random.randint(600, 1200))
+            all_accounts = await db.get_all_accounts_raw()
+            # Auditor pool: ACTIVE accounts (session still alive?) plus FAILED
+            # accounts. BANNED, RESTRICTED and REVOKED accounts are never
+            # touched by the scanner.
+            audit_pool = [
+                acc for acc in all_accounts
+                if str(acc.get("status", "")).lower() in (
+                    AccountStatus.ACTIVE, AccountStatus.FAILED,
+                ) and safe_session_str(acc)
+            ]
+            if not audit_pool:
+                await asyncio.sleep(random.randint(300, 600))
                 continue
-            active_accounts.sort(key=_normalize_check_time)
+            audit_pool.sort(key=_normalize_check_time)
 
             capacity = _auditor_effective_capacity(
-                len(active_accounts),
+                len(audit_pool),
                 _auditor_network_capacity(),
-                int(CONFIG.get("AUDITOR_CONCURRENCY", 2)),
+                CONCURRENCY,
             )
             if capacity <= 0:
                 audit_logger.warning(
-                    "Auditor cycle skipped: no network capacity available. "
-                    "No audit clients were created."
+                    f"Auditor pass skipped: 0 of {len(_auditor_pool_size())} proxies free "
+                    "(resting in 3-5 min cooldown after last use)."
                 )
-                await asyncio.sleep(random.randint(600, 1200))
+                GLOBAL.update_auditor_state(phase="waiting_proxy")
+                await asyncio.sleep(random.randint(60, 120))
                 continue
 
-            accounts_checked = 0
-            accounts_failed = 0
-            accounts_skipped = 0
+            now = time.time()
+            due = [acc for acc in audit_pool
+                   if (now - _normalize_check_time(acc)) >= RECHECK_SECONDS]
+            if not due:
+                audit_logger.info(
+                    f"Auditor: all {len(audit_pool)} accounts checked within the last "
+                    f"{RECHECK_SECONDS // 3600}h; nothing due. Sleeping."
+                )
+                GLOBAL.update_auditor_state(
+                    phase="resting", due=0, batch=0, batches=0,
+                    next_batch_at=None, next_pass_at=time.time() + 300)
+                await asyncio.sleep(random.randint(300, 600))
+                continue
+
+            pass_no += 1
+            total_batches = (len(due) + BATCH_SIZE - 1) // BATCH_SIZE
+            audit_logger.info(
+                f"🔍 Audit pass starting: {len(due)} due of {len(audit_pool)} "
+                f"(active+failed pool), concurrency={capacity}, recheck={RECHECK_SECONDS // 3600}h."
+            )
+            GLOBAL.update_auditor_state(
+                phase="scanning", pass_no=pass_no, pool=len(audit_pool), due=len(due),
+                batch=0, batches=total_batches, current={},
+                ok=0, dead=0, busy=0, no_proxy=0, errors=0, skipped=0,
+                next_batch_at=None,
+            )
+
+            counts = {"ok": 0, "dead": 0, "failed": 0, "busy": 0, "skipped": 0, "no_proxy": 0}
 
             # ── 🔥 BOUNDED CONCURRENCY WITHIN BATCHES ──
-            for i in range(0, len(active_accounts), BATCH_SIZE):
+            for i in range(0, len(due), BATCH_SIZE):
                 if not await GLOBAL.is_health_check_active():
                     break
-                batch = active_accounts[i:i + BATCH_SIZE]
-                c, f, s = await _auditor_run_pass(batch, capacity)
-                accounts_checked += c
-                accounts_failed += f
-                accounts_skipped += s
-
-                # Stagger between batches (much shorter than per-account)
+                batch = due[i:i + BATCH_SIZE]
+                batch_counts = await _auditor_run_pass(batch, capacity)
+                for k, v in batch_counts.items():
+                    counts[k] = counts.get(k, 0) + v
+                GLOBAL.update_auditor_state(
+                    batch=i // BATCH_SIZE + 1,
+                    ok=counts["ok"], dead=counts["dead"], busy=counts["busy"],
+                    no_proxy=counts["no_proxy"], errors=counts["failed"],
+                    skipped=counts["skipped"],
+                    next_batch_at=time.time() + BATCH_STAGGER,
+                )
+                # Stagger between batches
                 await asyncio.sleep(BATCH_STAGGER)
                 # Trigger GC more often to free objects
                 if random.random() < 0.5:
@@ -2310,17 +3011,17 @@ async def continuous_session_auditor() -> None:
             if stale_auth:
                 audit_logger.info(f"🧹 Cleaned {stale_auth} stale auth states.")
 
-            # Force GC periodically
-            if random.random() < 0.1:
-                gc.collect()
-                audit_logger.debug("GC triggered.")
-
             audit_logger.info(
-                f"🏁 Auditor batch complete: {accounts_checked} ok, "
-                f"{accounts_failed} errors, {accounts_skipped} busy/skipped. "
-                f"Next macro cycle in ~{round(MACRO_COOLDOWN_MIN/60, 1)}-{round(MACRO_COOLDOWN_MAX/60, 1)} min."
+                f"🏁 Audit pass done: {counts.get('ok', 0)} ok, {counts.get('dead', 0)} dead, "
+                f"{counts.get('busy', 0)} busy, {counts.get('no_proxy', 0)} no-proxy, "
+                f"{counts.get('failed', 0)} errors, {counts.get('skipped', 0)} skipped. "
+                f"Next pass in {PASS_GAP_MIN // 60}-{PASS_GAP_MAX // 60} min."
             )
-            await asyncio.sleep(random.uniform(MACRO_COOLDOWN_MIN, MACRO_COOLDOWN_MAX))
+            gap = random.uniform(PASS_GAP_MIN, PASS_GAP_MAX)
+            GLOBAL.update_auditor_state(
+                phase="resting", next_pass_at=time.time() + gap,
+                next_batch_at=None, current={})
+            await asyncio.sleep(gap)
 
         except Exception as e:
             audit_logger.error(f"Auditor loop error: {e}", exc_info=True)
@@ -2388,6 +3089,26 @@ async def check_session_authorization(client, phone_display: str = "") -> tuple:
         return False, "unknown"
 
 
+# Raised when no proxy could be leased for an audit attempt. Treated as a
+# skip (never as an account failure): the proxy pool is just cooling down.
+class _AuditNoProxy(Exception):
+    pass
+
+
+async def _promote_authorized_failed(account_doc: dict, client, clean_phone: str) -> None:
+    """A FAILED account whose session verifies as authorized is promoted back
+    to ACTIVE (with a fresh session string) so the console reflects reality."""
+    if str(account_doc.get("status", "")).lower() != AccountStatus.FAILED:
+        return
+    try:
+        await db.update_session_status_async(
+            clean_phone, AccountStatus.ACTIVE, client.session.save())
+        audit_logger.info(f"🟢 +{clean_phone} authorized → promoted FAILED → ACTIVE")
+        GLOBAL.push_live_event(f"🟢 +{clean_phone} FAILED → ACTIVE (verified)")
+    except Exception as e:
+        audit_logger.error(f"Promotion failed for +{clean_phone}: {e}")
+
+
 async def _audit_single_account(account_doc: dict) -> bool:
     phone = account_doc.get("phone")
     clean_phone = normalize_phone(str(phone)) if phone else ""
@@ -2424,8 +3145,10 @@ async def _audit_single_account(account_doc: dict) -> bool:
                 try:
                     await asyncio.wait_for(client.connect(), timeout=15.0)
                 except Exception as conn_err:
-                    audit_logger.debug(f"[SessionCheck] +{clean_phone} reconnect failed: {conn_err}")
-                    return True  # Transient, skip permanent marking
+                    # Most common cause: no proxy leaseable right now (pool
+                    # resting). Skip without marking anything.
+                    audit_logger.debug(f"[SessionCheck] +{clean_phone} connect failed: {conn_err}")
+                    raise _AuditNoProxy(f"connect failed: {conn_err}")
 
             # Step 1: Lightweight authorization check
             authorized, reason = await check_session_authorization(client, clean_phone)
@@ -2433,6 +3156,8 @@ async def _audit_single_account(account_doc: dict) -> bool:
             if authorized:
                 # Account is healthy/authorized - cache timestamp
                 _last_auth_check[clean_phone] = time.time()
+                await _promote_authorized_failed(account_doc, client, clean_phone)
+                await db.mark_account_checked_async(clean_phone)
                 return True
 
             # Step 2: Handle specific failure reasons
@@ -2451,6 +3176,8 @@ async def _audit_single_account(account_doc: dict) -> bool:
                     if me:
                         # Deep check passed - account is actually healthy
                         _last_auth_check[clean_phone] = time.time()
+                        await _promote_authorized_failed(account_doc, client, clean_phone)
+                        await db.mark_account_checked_async(clean_phone)
                         return True
                     else:
                         reason_failed = "Deep identity verification failed"
@@ -2483,8 +3210,19 @@ async def _audit_single_account(account_doc: dict) -> bool:
 
     except (UserDeactivatedError, UserDeactivatedBanError) as e:
         reason_failed = f"Account Terminated: {e}"
-    except (asyncio.TimeoutError, OSError, ConnectionError, ssl.SSLError):
+    except _AuditNoProxy:
+        raise  # No proxy available: skip, never mark the account.
+    except ConnectionError as e:
+        # managed_client raises "No eligible session" when no proxy could be
+        # leased (pool resting) — skip without advancing the check timestamp.
+        if "No eligible session" in str(e):
+            raise _AuditNoProxy(str(e))
         audit_logger.debug(f"🌐 Transient network error for +{clean_phone}")
+        await db.mark_account_checked_async(clean_phone)
+        return True
+    except (asyncio.TimeoutError, OSError, ssl.SSLError):
+        audit_logger.debug(f"🌐 Transient network error for +{clean_phone}")
+        await db.mark_account_checked_async(clean_phone)
         return True  # Not permanently dead, skip
     except Exception as e:
         err_txt = str(e).lower()
@@ -2493,12 +3231,14 @@ async def _audit_single_account(account_doc: dict) -> bool:
             reason_failed = f"Structural handshake failure: {e}"
         else:
             audit_logger.debug(f"Transient operational error for +{clean_phone}: {e}")
+            await db.mark_account_checked_async(clean_phone)
             return True  # Transient, skip
 
     if reason_failed:
         audit_logger.critical(f"❌ Session +{clean_phone} is dead: {reason_failed}")
         if not is_duplicate:
             db.mark_account_revoked(clean_phone, reason_failed)
+        await db.mark_account_checked_async(clean_phone)
 
         ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
         now_str = ist_time.strftime("%d-%m-%Y | %H:%M:%S")
@@ -2511,9 +3251,9 @@ async def _audit_single_account(account_doc: dict) -> bool:
             f"⚙️ *System Action: Account isolated from active worker rotation pools.*"
         )
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
                 response = await client.get(
-                    "https://bluecoys.com/api/telegram-disconnected",
+                    "https://www.bluecoys.com/api/telegram-disconnected",
                     params={"phone_number": clean_phone})
                 response.raise_for_status()
         except Exception as e:
@@ -2592,26 +3332,22 @@ async def lifespan(app: FastAPI):
     logger.info("Starting AccountLeaseManager (Lease Expiration Reaper active)...")
     await account_lease_manager.start()
 
-    # 3. Register background auditor task (gated by AUDITOR_ENABLED). Idle
-    #    startup: the auditor sleeps 30-90s before doing any account work, and
-    #    no user-session clients are created at startup.
+    # 3. Register background auditor task via the controller (gated by
+    #    AUDITOR_ENABLED). Engines fully stop/resume the auditor around
+    #    operations through the registered hooks.
+    register_auditor_hooks(stop_auditor, start_auditor)
     auditor_task = None
+    # start_auditor() already starts auditor AND recovery when those gates
+    # are on. Do not create a second recovery task here — that left an
+    # orphaned loop that kept running after stop_auditor() and double-swept
+    # failed accounts (two "Auto-Recovery Background Engine Started" logs).
+    start_auditor()
+    auditor_task = _auditor_task
     if should_start_auditor():
-        auditor_task = asyncio.create_task(
-            _run_with_bounded_restarts("auditor", continuous_session_auditor)
-        )
-        GLOBAL.register_task(auditor_task)
         logger.info("AUDITOR: enabled - background audit task started.")
     else:
         logger.info("AUDITOR: disabled (AUDITOR_ENABLED=false) - no audit task, no auditor workers/session acquisition.")
-
-    # 4. Register auto-recovery loop task (gated by ENABLE_AUTO_RECOVERY)
-    recovery_task = None
     if should_start_recovery():
-        recovery_task = asyncio.create_task(
-            _run_with_bounded_restarts("recovery", auto_health_recovery_loop)
-        )
-        GLOBAL.register_task(recovery_task)
         logger.info("AUTO_RECOVERY: enabled - background recovery loop started.")
     else:
         logger.info("AUTO_RECOVERY: disabled (ENABLE_AUTO_RECOVERY=false) - no recovery loop started.")
@@ -2644,8 +3380,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to stop voice engine during shutdown: {exc}")
 
     # 2) STOP AUDITOR + RECOVERY, THEN WAIT FOR THE TASKS
+    #    (_auditor_task may differ from the startup reference if engines
+    #    stopped/resumed it during the session.)
     pending = []
-    for task in (auditor_task, recovery_task):
+    for task in (auditor_task, _auditor_task, _recovery_task):
         if task is not None:
             task.cancel()
             pending.append(task)
@@ -2680,6 +3418,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Enterprise Telegram Suite API", lifespan=lifespan)
 app.include_router(console_router, prefix="/console")
+# The dashboard frontend calls /api/console/...; keep /console/api/console/... for existing tests.
+app.include_router(console_router, include_in_schema=False)
 
 # Initialize web_console with db and session_manager references
 init_console_db(db)
@@ -2687,7 +3427,12 @@ init_console_session_manager(session_manager)
 
 @app.get("/")
 async def root_health_check():
-    return {"status": "online", "service": "Telegram Bot Suite", "console": "/console"}
+    return {
+        "status": "online",
+        "service": "Telegram Bot Suite",
+        "console": "/console",
+        "dashboard": "/dashboard/",
+    }
 
 @app.get("/health")
 async def health_check():
@@ -2699,11 +3444,14 @@ async def health_check():
 
 async def _recover_failed_accounts(failed_accounts: list) -> int:
     recovered = 0
-    for acc in failed_accounts:
+    semaphore = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 3))))
+    acc_delay = CONFIG.get("RECOVERY_ACCOUNT_DELAY", (180, 360))
+
+    async def _recover_one(acc) -> bool:
         phone = normalize_phone(str(acc.get("phone", "")))
         session_str = safe_session_str(acc)
         if not session_str:
-            continue
+            return False
 
         # 1) Never attempt terminal accounts (revoked/banned/deactivated/
         #    invalid/auth_key_duplicated/permanently_failed/quarantined).
@@ -2712,34 +3460,39 @@ async def _recover_failed_accounts(failed_accounts: list) -> int:
             audit_logger.debug(
                 f"RECOVERY_SKIP | +{phone} | terminal status={db_status}"
             )
-            continue
+            return False
         # 2) Never operate on an account currently owned by another worker
         #    (DM/adder/scraper/videochat).
         if await account_lease_manager.is_busy(phone):
             audit_logger.debug(
                 f"RECOVERY_SKIP | +{phone} | account is busy/owned by a worker"
             )
-            continue
+            return False
         # 3) Never operate on an account in a login/OTP/2FA reservation or
         #    otherwise actively leased through SessionManager.
         if await session_manager.is_owned(phone):
             audit_logger.debug(
                 f"RECOVERY_SKIP | +{phone} | login/active reservation in progress"
             )
-            continue
+            return False
         try:
-            async with managed_client(acc) as client:
-                if await client.is_user_authorized():
-                    await client.get_me()
-                    await client.send_message("SpamBot", "/start")
-                    db.update_session_status(phone, AccountStatus.ACTIVE, client.session.save())
-                    recovered += 1
-                else:
-                    # Retry/terminal classification via managed_client;
-                    # managed_client also refuses to bypass an owned session.
-                    audit_logger.debug(
-                        f"RECOVERY_SKIP | +{phone} | client not authorized"
-                    )
+            async with semaphore:
+                # Human pacing between account recovery attempts.
+                await asyncio.sleep(random.uniform(float(acc_delay[0]), float(acc_delay[1])))
+                async with managed_client(acc) as client:
+                    if await client.is_user_authorized():
+                        await client.get_me()
+                        await client.send_message("SpamBot", "/start")
+                        await db.update_session_status_async(
+                            phone, AccountStatus.ACTIVE, client.session.save())
+                        audit_logger.info(f"🟢 Recovered +{phone} (spam mute lifted).")
+                        return True
+                    else:
+                        # Retry/terminal classification via managed_client;
+                        # managed_client also refuses to bypass an owned session.
+                        audit_logger.debug(
+                            f"RECOVERY_SKIP | +{phone} | client not authorized"
+                        )
         except SessionAlreadyOwnedError:
             # Acquire race: account became owned by a worker or login.
             # Skip - never escalate into an account failure.
@@ -2748,13 +3501,21 @@ async def _recover_failed_accounts(failed_accounts: list) -> int:
             )
         except Exception as e:
             audit_logger.error(f"Auto-recovery failed for {phone}: {e}")
+        return False
+
+    results = await asyncio.gather(*(_recover_one(acc) for acc in failed_accounts))
+    recovered = sum(1 for ok in results if ok)
     return recovered
 
 
 async def auto_health_recovery_loop() -> None:
-    """Auto-recovery engine: checks and recovers muted accounts every 12 hours."""
-    await asyncio.sleep(3600)  # 1 hour initial delay
+    """Auto-recovery engine: re-checks and recovers muted accounts with
+    human-paced delays (3-6 min per account + micro-jitter)."""
+    await asyncio.sleep(max(60, int(CONFIG.get("RECOVERY_INITIAL_DELAY", 600))))
     audit_logger.info("🏥 Auto-Recovery Background Engine Started.")
+
+    sweep_interval = max(3600, int(CONFIG.get("RECOVERY_INTERVAL", 21600)))
+    GLOBAL.update_recovery_state(phase="idle", next_sweep_in=sweep_interval)
 
     while True:
         if not await GLOBAL.is_health_check_active() or adder_engine.is_running or dm_engine.is_running or voice_engine.is_running:
@@ -2763,24 +3524,449 @@ async def auto_health_recovery_loop() -> None:
 
         try:
             all_accounts = await db.get_all_accounts_raw()
-            failed_accounts = [acc for acc in all_accounts if acc.get("status") in (
-                AccountStatus.FAILED, AccountStatus.BANNED, AccountStatus.RESTRICTED)]
+            # Recovery sweep touches FAILED accounts only — banned, restricted
+            # and revoked accounts are never operated on.
+            failed_accounts = [acc for acc in all_accounts if acc.get("status") == AccountStatus.FAILED]
 
             if failed_accounts:
+                audit_logger.info(
+                    f"🏥 Recovery sweep starting: {len(failed_accounts)} failed/muted accounts, "
+                    f"human-paced {CONFIG.get('RECOVERY_ACCOUNT_DELAY', (180, 360))[0]}-"
+                    f"{CONFIG.get('RECOVERY_ACCOUNT_DELAY', (180, 360))[1]}s per account."
+                )
+                GLOBAL.update_recovery_state(phase="sweeping", total=len(failed_accounts))
                 recovered = await _recover_failed_accounts(failed_accounts)
+                GLOBAL.update_recovery_state(
+                    phase="idle", last_recovered=recovered, next_sweep_in=sweep_interval)
                 if recovered:
                     audit_logger.info(f"Auto-recovery pass recovered {recovered} accounts.")
 
         except Exception as e:
+            GLOBAL.update_recovery_state(phase="idle", next_sweep_in=sweep_interval)
             audit_logger.error(f"Recovery loop error: {e}")
-        
-        await asyncio.sleep(43200) # Check every 12 hours
+
+        await asyncio.sleep(sweep_interval)
+
+
+
+class _AuthBotAdapter:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self.sessions: Dict[str, TelegramClient] = {}
+        self.pending_codes: Dict[str, dict] = {}
+
+    def create_user_client(self, phone: str):
+        clean_phone = normalize_phone(phone)
+        existing = db.get_session_by_phone(clean_phone) or {}
+        device = get_device_profile(existing) if existing else (
+            random.choice(DEVICE_PROFILES) if DEVICE_PROFILES else {}
+        )
+        return session_manager.create_client(
+            session_str=StringSession().save(),
+            api_id=CONFIG["API_ID"],
+            api_hash=CONFIG["API_HASH"],
+            device=device,
+            proxy=None,
+        )
+
+    def save_account_metadata(self, phone: str):
+        clean_phone = normalize_phone(phone)
+        client = self.sessions.get(clean_phone)
+        if not client:
+            return
+        existing = db.get_session_by_phone(clean_phone) or {}
+        db.save_authorized_session(
+            clean_phone,
+            client.session.save(),
+            AccountStatus.ACTIVE,
+            get_device_profile(existing),
+            two_fa_password=None,
+        )
+
+    def save_twofa_password(self, phone: str, password: str):
+        clean_phone = normalize_phone(phone)
+        existing = db.get_session_by_phone(clean_phone) or {}
+        db.save_authorized_session(
+            clean_phone,
+            existing.get("session_string") or existing.get("session") or StringSession().save(),
+            AccountStatus.ACTIVE,
+            get_device_profile(existing),
+            two_fa_password=password,
+        )
+
+
+auth_bot = _AuthBotAdapter()
+
+
+class LoginReq(BaseModel):
+    phone: str
+
+class VerifyReq(BaseModel):
+    phone: str
+    code: str
+
+class Verify2FAReq(BaseModel):
+    phone: str
+    password: str
+
+class BulkLoginReq(BaseModel):
+    phones: list[str]
+
+
+@app.post("/login")
+async def api_login(req: LoginReq):
+    phone = req.phone
+    phone_key = normalize_phone(phone)
+    login_owner = f"login:{phone_key}"
+    client = None
+
+    try:
+        login_result = await shared_login_process(phone, login_owner)
+        client = login_result["client"]
+        code_hash = login_result["code_hash"]
+
+        async with auth_bot._lock:
+            auth_bot.pending_codes[phone_key] = {
+                "client": client,
+                "phone_code_hash": code_hash,
+                "timeout": 120,
+            }
+
+        return {
+            "status": "code_sent",
+            "phone": phone,
+            "message": "OTP successfully sent to device. Use /verify to confirm code."
+        }
+
+    except FloodWaitError as e:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise HTTPException(429, f"Rate limited. Wait {e.seconds}s")
+    except asyncio.TimeoutError:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise HTTPException(408, "Request timeout: Could not connect to Telegram or send code")
+    except HTTPException:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise
+    except Exception as e:
+        if client:
+            try:
+                await client.disconnect()
+            except:
+                pass
+        raise HTTPException(400, str(e))
+
+
+@app.post("/verify")
+async def api_verify(req: VerifyReq):
+    phone, code = req.phone, req.code
+    phone_key = normalize_phone(phone)
+
+    async with auth_bot._lock:
+        if phone_key not in auth_bot.pending_codes:
+            raise HTTPException(404, "No pending login for this number. Call /login first.")
+        pending = auth_bot.pending_codes[phone_key]
+        client = pending["client"]
+
+    try:
+        await client.sign_in(phone=phone, code=code, phone_code_hash=pending["phone_code_hash"])
+        async with auth_bot._lock:
+            auth_bot.sessions[phone_key] = client
+            del auth_bot.pending_codes[phone_key]
+        auth_bot.save_account_metadata(phone_key)
+
+        me = await client.get_me()
+        return {"status": "ok", "phone": phone, "name": f"{me.first_name} {me.last_name or ''}".strip(), "username": me.username, "id": me.id}
+
+    except SessionPasswordNeededError:
+        return {"status": "2fa_required", "phone": phone}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/verify_2fa")
+async def api_verify_2fa(req: Verify2FAReq):
+    phone = req.phone
+    phone_key = normalize_phone(phone)
+
+    async with auth_bot._lock:
+        if phone_key not in auth_bot.pending_codes:
+            raise HTTPException(404, "No pending login for this number. Call /login first.")
+        client = auth_bot.pending_codes[phone_key]["client"]
+    try:
+        await client.sign_in(password=req.password)
+        async with auth_bot._lock:
+            auth_bot.sessions[phone_key] = client
+            del auth_bot.pending_codes[phone_key]
+        auth_bot.save_account_metadata(phone_key)
+        auth_bot.save_twofa_password(phone_key, req.password)
+
+        me = await client.get_me()
+        return {"status": "ok", "phone": phone, "name": f"{me.first_name} {me.last_name or ''}".strip(), "username": me.username, "id": me.id}
+
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/sessions")
+async def api_sessions():
+    async with auth_bot._lock:
+        return {
+            "active": list(auth_bot.sessions.keys()),
+            "pending": list(auth_bot.pending_codes.keys()),
+        }
+
+
+@app.get(
+    "/otp/{phone}",
+    summary="Fetch OTP messages",
+    description=(
+        "Returns recent messages from Telegram's OTP sender (777000) for the given phone number. "
+        "Use `since_seconds` to restrict to messages received in the last N seconds (default 300 = last 5 min). "
+        "Use `limit` to control how many messages to return (default 5)."
+    ),
+)
+async def get_otp(
+    phone: str,
+    limit: int = 5,
+    since_seconds: int = 300,
+):
+    phone_key = normalize_phone(phone)
+    async with auth_bot._lock:
+        if phone_key not in auth_bot.sessions:
+            raise HTTPException(404, "No active session for this number. Login first via /login.")
+        client = auth_bot.sessions[phone_key]
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=since_seconds)
+        messages = await client.get_messages(777000, limit=limit)
+        results = []
+        for msg in messages:
+            if msg.date < cutoff:
+                continue
+            ist = msg.date + timedelta(hours=5, minutes=30)
+            results.append({
+                "id": msg.id,
+                "text": msg.message,
+                "received_at_ist": ist.strftime("%d-%m-%Y %H:%M:%S"),
+                "received_at_utc": msg.date.strftime("%d-%m-%Y %H:%M:%S"),
+            })
+        return {"phone": phone, "count": len(results), "messages": results}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/session/{phone}")
+async def api_check(phone: str):
+    phone_key = normalize_phone(phone)
+    async with auth_bot._lock:
+        if phone_key in auth_bot.sessions:
+            try:
+                me = await auth_bot.sessions[phone_key].get_me()
+                return {"status": "active", "name": f"{me.first_name} {me.last_name or ''}".strip(), "username": me.username}
+            except Exception:
+                return {"status": "expired"}
+        if phone_key in auth_bot.pending_codes:
+            return {"status": "pending_otp"}
+    raise HTTPException(404, "No session found")
+
+
+@app.delete("/session/{phone}")
+async def api_logout(phone: str):
+    phone_key = normalize_phone(phone)
+    async with auth_bot._lock:
+        if phone_key in auth_bot.sessions:
+            try:
+                await auth_bot.sessions[phone_key].log_out()
+            except Exception:
+                pass
+            try:
+                await auth_bot.sessions[phone_key].disconnect()
+            except Exception:
+                pass
+            del auth_bot.sessions[phone_key]
+            return {"status": "logged_out"}
+        if phone_key in auth_bot.pending_codes:
+            try:
+                await auth_bot.pending_codes[phone_key]["client"].disconnect()
+            except Exception:
+                pass
+            del auth_bot.pending_codes[phone_key]
+            return {"status": "cancelled"}
+    raise HTTPException(404, "No session found")
+
+
+@app.post("/bulk_login")
+async def api_bulk_login(req: BulkLoginReq):
+    results = {"sent": [], "already": [], "failed": {}}
+    for phone in req.phones:
+        try:
+            phone_key = normalize_phone(phone)
+            async with auth_bot._lock:
+                if phone_key in auth_bot.sessions:
+                    results["already"].append(phone)
+                    continue
+
+            client = auth_bot.create_user_client(phone_key)
+            await client.connect()
+            if await client.is_user_authorized():
+                async with auth_bot._lock:
+                    auth_bot.sessions[phone_key] = client
+                results["already"].append(phone)
+                continue
+            sent = await client.send_code_request(phone)
+            async with auth_bot._lock:
+                auth_bot.pending_codes[phone_key] = {"client": client, "phone_code_hash": sent.phone_code_hash, "timeout": sent.timeout}
+            results["sent"].append(phone)
+            await asyncio.sleep(3)
+        except Exception as e:
+            results["failed"][phone] = str(e)
+    return results
+
+
+# === File Browser ===
+BASE_DIR = Path(__file__).resolve().parent
+WEB_VIEW_DIR = BASE_DIR / "frontend" / "dist"
+
+
+def _dir_listing(directory: Path, url_path: str) -> HTMLResponse:
+    entries = sorted(directory.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    rows = ""
+    if url_path.strip("/"):
+        parent = "/" + "/".join(url_path.strip("/").split("/")[:-1])
+        rows += f'<tr><td><a href="/files{parent}">.. (up)</a></td><td></td></tr>'
+    for entry in entries:
+        entry_url = f"/files/{url_path.strip('/')}/{entry.name}".replace("//", "/")
+        size = f"{entry.stat().st_size:,} B" if entry.is_file() else "—"
+        icon = "📄" if entry.is_file() else "📁"
+        rows += f'<tr><td><a href="{entry_url}">{icon} {entry.name}</a></td><td>{size}</td></tr>'
+    html = f"""<!DOCTYPE html>
+<html><head><title>/{url_path}</title>
+<style>body{{font-family:monospace;padding:20px}}table{{border-collapse:collapse;width:100%}}
+td{{padding:6px 12px;border-bottom:1px solid #eee}}a{{text-decoration:none;color:#0066cc}}a:hover{{text-decoration:underline}}</style>
+</head><body>
+<h2>/{url_path}</h2><hr>
+<table><tr><th align=left>Name</th><th align=left>Size</th></tr>{rows}</table>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/files", response_class=HTMLResponse)
+@app.get("/files/{file_path:path}")
+async def browse(file_path: str = ""):
+    target = (BASE_DIR / file_path).resolve()
+    base_resolved = BASE_DIR.resolve()
+
+    # Strict path validation to prevent directory traversal and symlink attacks
+    try:
+        target.relative_to(base_resolved)
+    except ValueError:
+        raise HTTPException(403, "Access denied")
+
+    if not target.exists():
+        raise HTTPException(404, "Not found")
+    if target.is_dir():
+        return _dir_listing(target, file_path)
+    return FileResponse(target, filename=target.name)
+
+
+@app.get("/web-config.js", include_in_schema=False)
+@app.get("/dashboard/config.js", include_in_schema=False)
+async def dashboard_config_js():
+    """Give the same-origin dashboard the process token so account APIs succeed."""
+    token = _ensure_web_api_token()
+    return Response(
+        f"window.__WEB_API_TOKEN__={json.dumps(token)};",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-store"},
+    )
+
+# Serve the Vite dashboard from frontend/dist at /dashboard/.
+# Mount last so it cannot shadow API routes.
+if WEB_VIEW_DIR.is_dir():
+    app.mount("/dashboard", StaticFiles(directory=str(WEB_VIEW_DIR), html=True), name="dashboard")
+else:
+    logger.warning("frontend/dist is missing — run npm run build in frontend/, or /dashboard will 404")
 
 # ──────────────────────────────────────────────
 # 29. SERVER LAUNCHER (MUST BE AT THE VERY END)
 # ──────────────────────────────────────────────
+def _pids_listening_on(port: int) -> list:
+    """Return PIDs whose *local* socket is LISTENING on ``port``."""
+    pids = []
+    suffix = f":{port}"
+    try:
+        out = subprocess.check_output(["netstat", "-ano"], text=True, errors="replace")
+    except Exception:
+        return pids
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[-2].upper() != "LISTENING":
+            continue
+        local_addr = parts[1]
+        if not (local_addr.endswith(suffix) or local_addr.endswith("]" + suffix)):
+            continue
+        if parts[-1].isdigit():
+            pids.append(int(parts[-1]))
+    return list(dict.fromkeys(pids))
+
+
+def _process_image_name(pid: int) -> str:
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            text=True,
+            errors="replace",
+        )
+        return out.split(",")[0].strip().strip('"').lower()
+    except Exception:
+        return ""
+
+
+def _claim_port(port: int) -> None:
+    """Stop a leftover python listener on PORT so this `python main_bot.py` can bind."""
+    me = os.getpid()
+    for pid in _pids_listening_on(port):
+        if pid == me:
+            continue
+        name = _process_image_name(pid)
+        if name and "python" not in name and "uvicorn" not in name:
+            logger.error("Port %s is held by %s (pid %s); not reclaiming.", port, name, pid)
+            continue
+        logger.info("Port %s is in use by pid %s — stopping it so this process can serve the dashboard.", port, pid)
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True)
+        time.sleep(1.5)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    _ensure_web_api_token()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("0.0.0.0", port))
+    except OSError:
+        probe.close()
+        probe = None
+        _claim_port(port)
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("0.0.0.0", port))
+        except OSError:
+            logger.error(f"Port {port} is still in use after reclaim. Choose another PORT.")
+            sys.exit(1)
+    finally:
+        if probe is not None:
+            probe.close()
     logger.info(f"🌐 Binding Web Service to host 0.0.0.0 on port {port}...")
     uvicorn.run(
         app,

@@ -34,6 +34,20 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 
+try:
+    # USER_BANNED_IN_CHANNEL: temporary spam restriction ("You're banned from
+    # sending messages in supergroups/channels") — NOT account termination.
+    from telethon.errors import UserBannedInChannelError
+except ImportError:  # older Telethon
+    UserBannedInChannelError = None
+
+try:
+    # CHANNEL_PRIVATE: banned from / removed from ONE specific chat — the
+    # account is fine everywhere else.
+    from telethon.errors import ChannelPrivateError
+except ImportError:  # older Telethon
+    ChannelPrivateError = None
+
 logger = logging.getLogger("ExceptionClassifier")
 
 
@@ -49,6 +63,12 @@ class ErrorCategory(enum.Enum):
     USER_BLOCKED = "user_blocked"
     ALREADY_PARTICIPANT = "already_participant"
     CHAT_ADMIN_REQUIRED = "chat_admin_required"
+    # Temporary Telegram spam restriction (USER_BANNED_IN_CHANNEL): the account
+    # stays alive; writes in supergroups/channels are blocked until it lifts.
+    ACCOUNT_RESTRICTED = "account_restricted"
+    # Target-specific failure (e.g. CHANNEL_PRIVATE): this account is banned
+    # from / removed from ONE chat — never an account-wide termination.
+    TARGET_UNAVAILABLE = "target_unavailable"
     PHONE_CODE_INVALID = "phone_code_invalid"
     PHONE_CODE_EXPIRED = "phone_code_expired"
     PASSWORD_INVALID = "password_invalid"
@@ -196,6 +216,32 @@ def classify_exception(exc: BaseException) -> ConnectionResult:
             original_exception=exc,
         )
 
+    # 🔥 TEMPORARY SPAM RESTRICTION — never quarantinable. Telegram blocks
+    # supergroup/channel writes for a while; the account itself stays alive
+    # and reads keep working. Killing it in the DB would be permanent damage
+    # for a restriction that lifts itself.
+    if UserBannedInChannelError is not None and isinstance(exc, UserBannedInChannelError):
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.ACCOUNT_RESTRICTED,
+            retryable=False,
+            terminal=False,
+            reason="Temporarily banned from sending in supergroups/channels (Telegram spam restriction)",
+            original_exception=exc,
+        )
+
+    # 🔥 TARGET-SPECIFIC BAN — this chat is private or the account was banned
+    # from THIS chat only. Never an account-wide termination.
+    if ChannelPrivateError is not None and isinstance(exc, ChannelPrivateError):
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.TARGET_UNAVAILABLE,
+            retryable=False,
+            terminal=False,
+            reason="Target chat is private or this account is banned from it (chat-specific)",
+            original_exception=exc,
+        )
+
     if isinstance(exc, (PhoneCodeInvalidError,)):
         return ConnectionResult(
             success=False,
@@ -259,7 +305,7 @@ def classify_exception(exc: BaseException) -> ConnectionResult:
             original_exception=exc,
         )
 
-    if any(k in err_str for k in ("authkeyunregistered", "sessionrevoked", "expired", "unauthorized")):
+    if any(k in err_str for k in ("authkeyunregistered", "sessionrevoked", "unauthorized")):
         return ConnectionResult(
             success=False,
             category=ErrorCategory.AUTH_KEY_UNREGISTERED,
@@ -269,7 +315,37 @@ def classify_exception(exc: BaseException) -> ConnectionResult:
             original_exception=exc,
         )
 
-    if any(k in err_str for k in ("userdeactivated", "banned", "disabled", "blocked", "revoked")):
+    # 🔥 Temporary spam restriction signature (USER_BANNED_IN_CHANNEL) —
+    # never terminal, never quarantinable.
+    if "user_banned_in_channel" in err_str or "supergroups/channels" in err_str:
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.ACCOUNT_RESTRICTED,
+            retryable=False,
+            terminal=False,
+            reason="Temporarily banned from sending in supergroups/channels (Telegram spam restriction)",
+            original_exception=exc,
+        )
+
+    # 🔥 Chat-specific ban signature (CHANNEL_PRIVATE) — not account-wide.
+    if "channel_private" in err_str or "channel specified is private" in err_str:
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.TARGET_UNAVAILABLE,
+            retryable=False,
+            terminal=False,
+            reason="Target chat is private or this account is banned from it (chat-specific)",
+            original_exception=exc,
+        )
+
+    # 🔥 ACCOUNT-LEVEL termination ONLY. The old broad keyword list
+    # ("banned", "blocked", "revoked", "disabled") misclassified temporary
+    # spam restrictions (USER_BANNED_IN_CHANNEL) and chat-specific bans
+    # (CHANNEL_PRIVATE) as permanent account termination, destroying the
+    # whole pool in one run. Genuine account-level terminations are matched
+    # by isinstance above (PhoneNumberBannedError, UserDeactivated*); these
+    # strings only catch variants whose exception classes were unavailable.
+    if any(k in err_str for k in ("userdeactivated", "phonenumberbanned", "phone_number_banned", "phone number is banned")):
         return ConnectionResult(
             success=False,
             category=ErrorCategory.ACCOUNT_BANNED,

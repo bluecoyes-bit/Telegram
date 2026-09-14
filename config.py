@@ -89,8 +89,10 @@ class AuditorConfig:
     """Background session auditor tuning."""
     batch_size: int = field(default_factory=lambda: _env_int("AUDITOR_BATCH_SIZE", 10, 1, 100))
     batch_stagger: int = field(default_factory=lambda: _env_int("AUDITOR_BATCH_STAGGER", 15, 5, 120))
-    cooldown_min: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MIN", 43200, 300, 86400))
-    cooldown_max: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MAX", 86400, 600, 172800))
+    cooldown_min: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MIN", 300, 60, 3600))
+    cooldown_max: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MAX", 600, 120, 7200))
+    recheck_minutes: int = field(default_factory=lambda: _env_int("AUDITOR_RECHECK_MINUTES", 720, 30, 2880))
+    concurrency: int = field(default_factory=lambda: _env_int("AUDITOR_CONCURRENCY", 3, 1, 10))
     enabled: bool = field(default_factory=lambda: _env_bool("AUDITOR_ENABLED", True))
 
 @dataclass
@@ -98,7 +100,7 @@ class AdderConfig:
     """Member adder rate-limit & burst protection."""
     max_workers: int = field(default_factory=lambda: _env_int("ADDER_MAX_WORKERS", 20, 1, 50))
     max_worker_sessions: int = field(default_factory=lambda: _env_int("ADDER_MAX_WORKER_SESSIONS", 10, 1, 30))
-    human_add_interval: Tuple[int, int] = (8, 14)
+    human_add_interval: Tuple[int, int] = (25, 45)
     burst_add_limit: int = field(default_factory=lambda: _env_int("ADDER_BURST_ADD_LIMIT", 6, 1, 20))
     burst_cooldown: Tuple[int, int] = (30, 50)
     progress_interval: int = field(default_factory=lambda: _env_int("ADDER_PROGRESS_UPDATE_INTERVAL", 8, 2, 30))
@@ -168,14 +170,19 @@ CONFIG: Dict[str, Any] = {
     # ── Auditor ──
     "AUDITOR_BATCH_SIZE": _env_int("AUDITOR_BATCH_SIZE", 10, 1, 100),
     "AUDITOR_BATCH_STAGGER": _env_int("AUDITOR_BATCH_STAGGER", 60, 35, 220),
-    "AUDITOR_COOLDOWN_MIN": _env_int("AUDITOR_COOLDOWN_MIN", 43200, 3600, 86400),
-    "AUDITOR_COOLDOWN_MAX": _env_int("AUDITOR_COOLDOWN_MAX", 86400, 7200, 172800),
+    # Pass gap between auditor sweeps (per-account recheck cadence is
+    # AUDITOR_RECHECK_MINUTES below). The 3-5 min proxy rest window lives in
+    # resource_manager and paces individual checks on top of this.
+    "AUDITOR_COOLDOWN_MIN": _env_int("AUDITOR_COOLDOWN_MIN", 300, 60, 3600),
+    "AUDITOR_COOLDOWN_MAX": _env_int("AUDITOR_COOLDOWN_MAX", 600, 120, 7200),
+    "AUDITOR_RECHECK_MINUTES": _env_int("AUDITOR_RECHECK_MINUTES", 720, 30, 2880),
+    "AUDITOR_CONCURRENCY": _env_int("AUDITOR_CONCURRENCY", 3, 1, 10),
     "AUDITOR_ENABLED": _env_bool("AUDITOR_ENABLED", True),
 
     # ── Adder ──
     "ADDER_MAX_WORKERS": _env_int("ADDER_MAX_WORKERS", 20, 1, 50),
     "ADDER_MAX_WORKER_SESSIONS": _env_int("ADDER_MAX_WORKER_SESSIONS", 10, 1, 30),
-    "ADDER_HUMAN_ADD_INTERVAL": (8, 14),
+    "ADDER_HUMAN_ADD_INTERVAL": (25, 45),
     "ADDER_BURST_ADD_LIMIT": _env_int("ADDER_BURST_ADD_LIMIT", 6, 1, 20),
     "ADDER_BURST_COOLDOWN_TIME": (30, 50),
     "ADDER_PROGRESS_UPDATE_INTERVAL": _env_int("ADDER_PROGRESS_UPDATE_INTERVAL", 8, 2, 30),
@@ -194,6 +201,15 @@ CONFIG: Dict[str, Any] = {
 
     # ── Feature Flags ──
     "ENABLE_AUTO_RECOVERY": _env_bool("ENABLE_AUTO_RECOVERY", True),
+
+    # ── Auto-Recovery / Health Scan ──
+    # Human-paced sweep of failed/muted accounts: initial delay before the first
+    # sweep, interval between sweeps, and the 3-6 minute per-account delay
+    # (micro-jitter is added in code).
+    "RECOVERY_INITIAL_DELAY": _env_int("RECOVERY_INITIAL_DELAY", 600, 60, 3600),
+    "RECOVERY_INTERVAL": _env_int("RECOVERY_INTERVAL", 21600, 3600, 86400),
+    "RECOVERY_ACCOUNT_DELAY": (180, 360),
+    "HEALTH_SCAN_CONCURRENCY": _env_int("HEALTH_SCAN_CONCURRENCY", 3, 1, 10),
     "ENABLE_CONTACT_SCRAPER": _env_bool("ENABLE_CONTACT_SCRAPER", True),
     "ENABLE_VOICE_CHAT": _env_bool("ENABLE_VOICE_CHAT", True),
     "ENABLE_HEALTH_CHECK": _env_bool("ENABLE_HEALTH_CHECK", True),

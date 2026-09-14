@@ -39,6 +39,37 @@ from exception_classifier import ErrorCategory, classify_exception
 logger = logging.getLogger("ResourceManager")
 
 # ────────────────────────────────────────────────────────────────
+# OPERATION → AUDITOR LIFECYCLE HOOKS
+# main_bot registers stop/start hooks at startup; engines call the notify
+# helpers when an operation begins/ends so the auditor is FULLY stopped
+# (task cancelled, zero proxy churn) while campaigns run.
+# ────────────────────────────────────────────────────────────────
+_operation_hooks: Dict[str, Callable[[], Any]] = {}
+
+
+def register_auditor_hooks(stop_hook: Callable[[], Any], start_hook: Callable[[], Any]) -> None:
+    _operation_hooks["stop"] = stop_hook
+    _operation_hooks["start"] = start_hook
+
+
+def notify_auditor_stop() -> None:
+    hook = _operation_hooks.get("stop")
+    if hook is not None:
+        try:
+            hook()
+        except Exception as exc:
+            logger.warning(f"Auditor stop hook failed: {exc}")
+
+
+def notify_auditor_resume() -> None:
+    hook = _operation_hooks.get("start")
+    if hook is not None:
+        try:
+            hook()
+        except Exception as exc:
+            logger.warning(f"Auditor resume hook failed: {exc}")
+
+# ────────────────────────────────────────────────────────────────
 # 0. SHARED UTILITIES & UNIFIED CONSTANTS
 # ────────────────────────────────────────────────────────────────
 def compute_session_fingerprint(session_str: str, api_id: int) -> str:
@@ -68,11 +99,23 @@ MIN_WORKING_PROXIES_TO_START: int = 1
 TEST_BATCH_SIZE: int = 50
 MAX_WORKERS_DEFAULT: int = 30
 CONNECTION_POOL_SIZE: int = 20
-PROXY_COOLDOWN_SECONDS: int = 600
+PROXY_COOLDOWN_SECONDS: int = 600  # legacy default, superseded by the humanized window below
+PROXY_COOLDOWN_MIN_SECONDS: float = 180.0   # human rest window after every disconnect: 3-5 min
+PROXY_COOLDOWN_MAX_SECONDS: float = 300.0
+PROXY_MICRO_JITTER_SECONDS: Tuple[float, float] = (2.0, 8.0)  # micro delay on top of the rest window
 ACCOUNT_COOLDOWN_SECONDS: int = 900
 COOLDOWN_CHECK_INTERVAL: float = 5.0
+PROXY_LEASE_STALE_TTL: float = 900.0  # orphaned leases (no live session) reaped after this
 PROXY_PROVIDER: str = os.environ.get("PROXY_PROVIDER", "file").lower()
-PROXY_ACQUIRE_TIMEOUT: float = 30.0
+PROXY_ACQUIRE_TIMEOUT: float = 330.0  # wait up to one full cooldown window for a free proxy
+# Keep N proxies free for NEW LOGINS: normal operations (campaigns, auditor)
+# may never lease into this reserve, so a login is always possible.
+LOGIN_RESERVED_PROXIES: int = int(os.environ.get("LOGIN_RESERVED_PROXIES", "2"))
+
+
+def humanized_proxy_cooldown() -> float:
+    """3-5 minute proxy rest window plus a few seconds of micro-jitter."""
+    return random.uniform(PROXY_COOLDOWN_MIN_SECONDS, PROXY_COOLDOWN_MAX_SECONDS) + random.uniform(*PROXY_MICRO_JITTER_SECONDS)
 
 try:
     from colorama import Fore, Style
@@ -139,10 +182,14 @@ class ProxyNode:
         self.lease_id = None
         self.lease_time = 0.0
 
-    def put_in_cooldown(self, duration_seconds: int = PROXY_COOLDOWN_SECONDS) -> None:
+    def put_in_cooldown(self, duration_seconds: Optional[float] = None) -> None:
         self.release()
-        self.cooldown_until = time.time() + duration_seconds
+        self.cooldown_until = time.time() + (duration_seconds if duration_seconds is not None else humanized_proxy_cooldown())
         self.failure_count += 1
+
+    def start_cooldown(self, duration_seconds: Optional[float] = None) -> None:
+        """Rest the proxy without counting it as a failure (normal human pacing)."""
+        self.cooldown_until = time.time() + (duration_seconds if duration_seconds is not None else humanized_proxy_cooldown())
 
     def safe_label(self) -> str:
         return f"{self.host}:{self.port}"
@@ -202,21 +249,132 @@ class DecodoProxyProvider(ProxyProvider):
         self.password = os.environ.get("DECODO_PASSWORD", "")
         self.endpoint = os.environ.get("DECODO_HOST", "dc.decodo.com")
         self.port = int(os.environ.get("DECODO_PORT", "10001"))
-        self.proxy_count = int(os.environ.get("DECODO_PROXY_COUNT", "10"))
+        self.proxy_count = max(1, int(os.environ.get("DECODO_PROXY_COUNT", "10")))
+
+    def _node_username(self) -> str:
+        """Base username with Decodo's mandatory 'user-' prefix when parameters
+        are appended (docs: 'you need to add user- prefix before specifying
+        your username'). Never double-wraps credentials that already carry
+        advanced parameters."""
+        if self.username.startswith("user-") or "-session-" in self.username or "-ip-" in self.username:
+            return self.username
+        return f"user-{self.username}"
+
+    def _build_node(self, proxy_id: str, username: str, port: Optional[int] = None) -> ProxyNode:
+        from urllib.parse import quote
+        enc_user = quote(username, safe="")
+        enc_pass = quote(self.password, safe="")
+        use_port = port or self.port
+        return ProxyNode(
+            proxy_id=proxy_id, host=self.endpoint, port=use_port, protocol="http",
+            username=username, password=self.password,
+            url=f"http://{enc_user}:{enc_pass}@{self.endpoint}:{use_port}",
+            provider=self.name,
+        )
+
+    # ── Mode A: dedicated IP list from the dashboard API URL ──
+    # Decodo docs (Pay/IP): target a purchased dedicated IP with the direct
+    # 'ip' parameter -> user-<username>-ip-x.x.x.x
+    def _load_from_list_api(self, list_url: str) -> List[ProxyNode]:
+        import json as _json
+        try:
+            resp = requests.get(list_url, timeout=20)
+            if resp.status_code in (401, 403):
+                # Some dashboard API URLs require basic auth with proxy creds.
+                resp = requests.get(list_url, timeout=20, auth=(self.username, self.password))
+            resp.raise_for_status()
+            text = resp.text.strip()
+        except Exception as exc:
+            logger.error(f"Decodo proxy-list API fetch failed: {exc}")
+            return []
+        if not text:
+            return []
+
+        entries: List[Tuple[str, Optional[int]]] = []
+        try:
+            payload = _json.loads(text)
+            items = payload if isinstance(payload, list) else (
+                payload.get("data") or payload.get("proxies") or payload.get("ips") or []
+            )
+            for item in items:
+                if isinstance(item, dict):
+                    host = str(item.get("ip") or item.get("host") or item.get("address") or item.get("proxy") or "")
+                    port = item.get("port")
+                else:
+                    host, port = str(item), None
+                if ":" in host and port is None:
+                    host, _, maybe_port = host.partition(":")
+                    port = maybe_port
+                if host:
+                    entries.append((host, int(port) if str(port).isdigit() else None))
+        except (ValueError, TypeError, AttributeError):
+            # Plain-text list: one "ip:port" or "ip" per line.
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("{"):
+                    continue
+                host, _, maybe_port = line.partition(":")
+                if host:
+                    entries.append((host, int(maybe_port) if maybe_port.isdigit() else None))
+
+        base_user = self._node_username()
+        nodes = []
+        for ip, port in entries:
+            nodes.append(self._build_node(
+                proxy_id=f"decodo_ip_{ip}_{port or self.port}",
+                username=f"{base_user}-ip-{ip}",
+                port=port,
+            ))
+        return nodes
+
     def load(self) -> List[ProxyNode]:
         if not self.username or not self.password:
             logger.warning("DecodoProxyProvider: DECODO_USERNAME/DECODO_PASSWORD not set")
             return []
-        from urllib.parse import quote
-        enc_pass = quote(self.password, safe="")
-        enc_user = quote(self.username, safe="")
+
+        # ── Mode A: dedicated IP list via the dashboard API URL (preferred) ──
+        list_url = (os.environ.get("DECODO_PROXY_LIST_URL")
+                    or os.environ.get("DECODO_API_URL") or "").strip()
+        if list_url:
+            nodes = self._load_from_list_api(list_url)
+            if nodes:
+                logger.info(
+                    f"DecodoProxyProvider fetched {len(nodes)} dedicated IPs from the API list"
+                )
+                return nodes
+            logger.warning(
+                "DECODO_PROXY_LIST_URL set but returned no proxies — "
+                "falling back to sticky-session mode."
+            )
+
+        # ── Mode B: sticky-session nodes over the gateway endpoint ──
+        # Every node gets a UNIQUE session so the gateway maps it to a
+        # distinct IP from the purchased pool (identical credentials on the
+        # sticky port would collapse every node onto ONE IP).
+        # Deterministic session ids keep node N on the same IP across restarts.
+        base_user = self._node_username()
+        # sessionduration is a gate.decodo.com (residential/mobile) parameter.
+        # Datacenter (dc.decodo.com) rejects usernames containing it with
+        # "400 Bad request" — so only apply it on the gateway endpoint.
+        duration = os.environ.get("DECODO_SESSION_DURATION", "").strip()
+        if duration and "gate.decodo.com" not in self.endpoint:
+            logger.warning(
+                "DECODO_SESSION_DURATION ignored — 'sessionduration' is only supported "
+                "on gate.decodo.com (residential/mobile). Datacenter endpoints use "
+                "static sessions on port 10001 already."
+            )
+            duration = ""
         nodes = []
-        for _ in range(self.proxy_count):
-            sid = random.randint(100000, 999999)
-            nodes.append(ProxyNode(proxy_id=f"decodo_{sid}", host=self.endpoint, port=self.port,
-                                   protocol="http", username=self.username, password=self.password,
-                                   url=f"http://{enc_user}:{enc_pass}@{self.endpoint}:{self.port}", provider=self.name))
-        logger.info(f"DecodoProxyProvider loaded {len(nodes)} rotating proxies")
+        for i in range(self.proxy_count):
+            sid = f"bot{i:04d}"
+            node_user = f"{base_user}-session-{sid}"
+            if duration:
+                node_user += f"-sessionduration-{duration}"
+            nodes.append(self._build_node(proxy_id=f"decodo_{sid}", username=node_user))
+        logger.info(
+            f"DecodoProxyProvider generated {len(nodes)} sticky-session proxies "
+            f"from {self.endpoint}:{self.port}"
+        )
         return nodes
 
 class WebshareProxyProvider(ProxyProvider):
@@ -270,6 +428,21 @@ class ProxyManager:
 
     def _load_proxies(self) -> None:
         nodes = self.provider.load()
+
+        # 🔥 HYBRID MERGE: a populated proxies.txt must NEVER be silently
+        # ignored just because a remote provider (decodo/webshare) is selected.
+        # File entries are merged with provider nodes (deduped by proxy_id).
+        if self.provider.name != "file" and os.path.exists(self.proxy_file):
+            file_nodes = FileProxyProvider(self.proxy_file).load()
+            if file_nodes:
+                seen_ids = {n.proxy_id for n in nodes}
+                merged = [n for n in file_nodes if n.proxy_id not in seen_ids]
+                logger.info(
+                    f"Hybrid merge: +{len(merged)} proxies from {self.proxy_file} "
+                    f"onto {len(nodes)} from the {self.provider.name} provider"
+                )
+                nodes = nodes + merged
+
         self.proxies = [{"addr": n.host, "host": n.host, "port": n.port, "proxy_type": n.protocol,
                          "type": n.protocol, "username": n.username, "password": n.password,
                          "url": n.url, "added_at": n.added_at, "proxy_id": n.proxy_id, "latency": n.latency} for n in nodes]
@@ -485,7 +658,13 @@ class ProxyLeaseManager:
         self.account_cooldown: Dict[str, float] = {}
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
-        self.stats: Dict[str, int] = {"total_acquires": 0, "total_releases": 0, "cooldown_activations": 0, "current_active_leases": 0}
+        self._liveness_check: Optional[Callable[[str, Optional[str], Optional[str]], Any]] = None
+        self.stats: Dict[str, int] = {"total_acquires": 0, "total_releases": 0, "cooldown_activations": 0, "current_active_leases": 0, "stale_leases_reaped": 0}
+
+    def set_liveness_check(self, hook: Callable[[str, Optional[str], Optional[str]], Any]) -> None:
+        """Register an async hook(leased_to, proxy_id, lease_id) -> bool used by the
+        reaper to decide whether a long-held lease still backs a live session."""
+        self._liveness_check = hook
 
     def _proxy_id_from_record(self, proxy_dict: Dict[str, Any]) -> Optional[str]:
         proxy_id = proxy_dict.get("proxy_id")
@@ -540,20 +719,51 @@ class ProxyLeaseManager:
         while self._is_running:
             try:
                 await asyncio.sleep(COOLDOWN_CHECK_INTERVAL)
+                # Refresh the node pool continuously: start() snapshots BEFORE
+                # background proxy testing has found anything, so without this
+                # the pool stays empty until some consumer calls acquire_proxy.
+                await self._sync_proxies()
                 now = time.time()
                 expired_proxies = [pid for pid in list(self.proxy_cooldown) if not self.proxy_nodes.get(pid) or not self.proxy_nodes[pid].is_in_cooldown()]
                 expired_accounts = [ph for ph, cu in list(self.account_cooldown.items()) if now >= cu]
-                if expired_proxies or expired_accounts:
+                # Snapshot stale-lease candidates under the lock, verify liveness
+                # outside it (the hook takes SessionManager's lock).
+                stale_candidates: List[Tuple[ProxyNode, str, float]] = []
+                async with self._condition:
+                    for node in self.proxy_nodes.values():
+                        if node.is_leased and node.lease_time and (now - node.lease_time) > PROXY_LEASE_STALE_TTL:
+                            stale_candidates.append((node, node.lease_id or "", now - node.lease_time))
+                    for pid in expired_proxies: self.proxy_cooldown.discard(pid)
+                    for ph in expired_accounts: self.account_cooldown.pop(ph, None)
+                    self._condition.notify_all()
+                for node, snapshot_lease_id, lease_age in stale_candidates:
+                    live = True
+                    if self._liveness_check is not None:
+                        try:
+                            live = bool(await self._liveness_check(node.leased_to or "", node.proxy_id, node.lease_id or ""))
+                        except Exception:
+                            live = True  # cannot verify: never force-release on hook failure
+                    if live:
+                        continue
                     async with self._condition:
-                        for pid in expired_proxies: self.proxy_cooldown.discard(pid)
-                        for ph in expired_accounts: self.account_cooldown.pop(ph, None)
+                        # Re-verify: only reap if the SAME lease is still held.
+                        if not node.is_leased or node.lease_id != snapshot_lease_id:
+                            continue
+                        held_by = node.leased_to
+                        node.release()
+                        self.stats["current_active_leases"] = max(0, self.stats["current_active_leases"] - 1)
+                        self.stats["stale_leases_reaped"] += 1
                         self._condition.notify_all()
+                    logger.warning(
+                        "PROXY_LEASE_REAPED | proxy=%s | held_by=%s | lease=%s | age=%.0fs | no live session",
+                        node.safe_label(), held_by or "?", snapshot_lease_id or "?", lease_age,
+                    )
             except asyncio.CancelledError: break
             except Exception as e:
                 logger.error(f"Auto-Reaper error: {e}")
                 await asyncio.sleep(COOLDOWN_CHECK_INTERVAL)
 
-    async def acquire_proxy(self, phone: str, timeout: float = 10.0) -> Optional[Dict[str, Any]]:
+    async def acquire_proxy(self, phone: str, timeout: float = 10.0, allow_reserved: bool = False) -> Optional[Dict[str, Any]]:
         if not self._is_running: return None
         await self._sync_proxies()
         deadline = time.monotonic() + max(0.0, timeout)
@@ -570,6 +780,16 @@ class ProxyLeaseManager:
                             if time.monotonic() >= deadline: return None
                             continue
                     else: self.account_cooldown.pop(phone, None)
+                # LOGIN RESERVE: normal operations may never lease into the
+                # buffer kept for new logins (logins pass allow_reserved=True).
+                reserve = 0 if allow_reserved else self.login_reserve_limit()
+                if not allow_reserved and self.get_available_count() <= reserve:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0: return None
+                    try: await asyncio.wait_for(self._condition.wait(), timeout=min(remaining, 5.0))
+                    except asyncio.TimeoutError:
+                        if time.monotonic() >= deadline: return None
+                    continue
                 for pid, node in self.proxy_nodes.items():
                     if pid in self.proxy_cooldown or node.is_in_cooldown() or node.is_leased: continue
                     lease_id = uuid.uuid4().hex[:16]
@@ -580,6 +800,9 @@ class ProxyLeaseManager:
                     if proxy is None:
                         node.release(); self.stats["current_active_leases"] = max(0, self.stats["current_active_leases"] - 1)
                         continue
+                    # Expose the URL so lifecycle logs show which proxy was
+                    # actually leased (Telethon ignores the extra key).
+                    proxy["url"] = node.url
                     proxy["__proxy_id"] = pid; proxy["__lease_id"] = lease_id
                     return proxy
                 remaining = deadline - time.monotonic()
@@ -588,6 +811,11 @@ class ProxyLeaseManager:
                 except asyncio.TimeoutError:
                     if time.monotonic() >= deadline: return None
         return None
+
+    async def clear_account_cooldown(self, phone: str) -> None:
+        async with self._condition:
+            self.account_cooldown.pop(phone, None)
+            self._condition.notify_all()
 
     async def release_proxy(self, *, proxy_url: Optional[str], phone: str, proxy_id: Optional[str] = None, lease_id: Optional[str] = None, should_cooldown: bool = False, cooldown_reason: str = "") -> None:
         async with self._condition:
@@ -599,16 +827,44 @@ class ProxyLeaseManager:
             if not node.is_leased or node.leased_to != phone: return
             if lease_id is not None and node.lease_id != lease_id: return
             if should_cooldown:
-                node.put_in_cooldown(); self.proxy_cooldown.add(node.proxy_id)
+                # Error path: rest the proxy AND hold the account back so it is
+                # not hammered again immediately.
+                node.put_in_cooldown(duration_seconds=humanized_proxy_cooldown())
+                self.proxy_cooldown.add(node.proxy_id)
                 self.account_cooldown[phone] = time.time() + ACCOUNT_COOLDOWN_SECONDS
                 self.stats["cooldown_activations"] += 1
+                self.stats["current_active_leases"] = max(0, self.stats["current_active_leases"] - 1)
             else:
-                node.release(); self.stats["total_releases"] += 1
+                # Normal disconnect: free the lease, then give the proxy its
+                # human rest window (3-5 min + micro-jitter) before it may
+                # serve another account.
+                node.release()
+                node.start_cooldown(duration_seconds=humanized_proxy_cooldown())
+                self.proxy_cooldown.add(node.proxy_id)
+                self.stats["total_releases"] += 1
                 self.stats["current_active_leases"] = max(0, self.stats["current_active_leases"] - 1)
             self._condition.notify_all()
 
     def get_available_count(self) -> int:
         return sum(1 for n in self.proxy_nodes.values() if not n.is_leased and not n.is_in_cooldown() and n.proxy_id not in self.proxy_cooldown)
+
+    def login_reserve_limit(self) -> int:
+        """How many proxies are held back for new logins. Scaled down on small
+        pools so normal work is never fully starved: 10+ nodes -> 2 reserved,
+        3-4 nodes -> 1, fewer -> 0."""
+        total = len(self.proxy_nodes)
+        if total >= 5:
+            return max(0, min(LOGIN_RESERVED_PROXIES, total - 2))
+        if total >= 3:
+            return 1
+        return 0
+
+    def usable_available_count(self) -> int:
+        """Proxies normal operations may actually consume (login reserve excluded)."""
+        return max(0, self.get_available_count() - self.login_reserve_limit())
+
+    async def get_usable_count_async(self) -> int:
+        async with self._condition: return self.usable_available_count()
 
     async def get_available_count_async(self) -> int:
         async with self._condition: return self.get_available_count()
@@ -732,7 +988,7 @@ class AccountLeaseManager:
                        ErrorCategory.SESSION_REVOKED: "revoked", ErrorCategory.ACCOUNT_BANNED: "banned",
                        ErrorCategory.ACCOUNT_FLOOD: "failed", ErrorCategory.NETWORK_TIMEOUT: "failed", ErrorCategory.PROXY_ERROR: "failed"}
         db_status = db_mappings.get(category, "failed")
-        try: await asyncio.to_thread(lambda: self.db.update_session_status(phone, db_status, None))
+        try: await asyncio.to_thread(lambda: self.db.update_session_status(phone, db_status, reason=reason))
         except Exception as e: logger.error(f"DB status update failed in fail_account: {e}")
 
     async def get_state(self, phone: str) -> AccountState:
@@ -784,6 +1040,26 @@ class SessionManager:
         self._lock = asyncio.Lock(); self._sessions: Dict[str, SessionInfo] = {}
         self._max_active_clients = max_active_clients; self._active_count = 0
         self._closed = False; self._session_idle_ttl = session_idle_ttl
+        if self.proxy_lease_manager is not None:
+            set_liveness_check = getattr(self.proxy_lease_manager, "set_liveness_check", None)
+            if callable(set_liveness_check):
+                set_liveness_check(self._is_proxy_lease_live)
+
+    async def _is_proxy_lease_live(self, phone: str, proxy_id: Optional[str], lease_id: Optional[str]) -> bool:
+        """True while the phone still owns a live session that may be using this proxy lease."""
+        async with self._lock:
+            info = self._sessions.get(self._session_key(phone))
+            if not info:
+                return False
+            owning = (SessionLifecycleState.BUSY, SessionLifecycleState.RESERVED,
+                      SessionLifecycleState.LOGIN_PENDING, SessionLifecycleState.OTP_WAITING,
+                      SessionLifecycleState.TWOFA_WAITING)
+            if info.lifecycle not in owning:
+                return False
+            if (info.lifecycle == SessionLifecycleState.BUSY and lease_id
+                    and info.proxy_lease_id and info.proxy_lease_id != lease_id):
+                return False
+            return True
 
     @staticmethod
     def _safe_proxy_label(proxy_url: Optional[str]) -> str:
@@ -798,11 +1074,11 @@ class SessionManager:
     def _session_key(self, phone: str) -> str: return self.normalize_phone(phone)
 
     async def _log_lifecycle(self, event: str, *, phone: str = "", session_fp: str = "", module: str = "", worker_id: str = "", client_id: str = "", proxy_url: str = "", error: str = "", **extra: Any) -> None:
-        logger.info("SESSION_LIFECYCLE | event=%s | phone=%s | session_fp=%s | module=%s | worker=%s | client_id=%s | proxy=%s | error=%s | extra=%s",
-                    event, phone, session_fp, module, worker_id, client_id, proxy_url, error, extra)
+        logger.debug("SESSION_LIFECYCLE | event=%s | phone=%s | session_fp=%s | module=%s | worker=%s | client_id=%s | proxy=%s | error=%s | extra=%s",
+                     event, phone, session_fp, module, worker_id, client_id, proxy_url, error, extra)
 
     @asynccontextmanager
-    async def acquire(self, phone: str, *, module: str = "unknown", worker_id: Optional[str] = None, proxy_provider: Optional[Callable] = None, timeout: float = 30.0, auto_release: bool = True) -> AsyncIterator[Optional[SessionLease]]:
+    async def acquire(self, phone: str, *, module: str = "unknown", worker_id: Optional[str] = None, proxy_provider: Optional[Callable] = None, timeout: Optional[float] = None, auto_release: bool = True) -> AsyncIterator[Optional[SessionLease]]:
         if self._closed: raise RuntimeError("SessionManager is closed")
         clean_phone = self._session_key(phone)
         lease_owner_key = f"{module}:{worker_id or uuid.uuid4().hex[:8]}"
@@ -849,8 +1125,12 @@ class SessionManager:
             fingerprint = compute_session_fingerprint(session_str, api_id)
             device = record.get("device_metadata") or random.choice(DEVICE_PROFILES)
 
+            # Honor the caller's timeout for the proxy-wait phase (dmsender
+            # passes a short bound so workers stay responsive); callers that
+            # omit it wait up to one full cooldown window.
+            proxy_wait = PROXY_ACQUIRE_TIMEOUT if timeout is None else max(1.0, min(float(timeout), PROXY_ACQUIRE_TIMEOUT))
             if proxy_provider is not None: proxy_record = await proxy_provider(clean_phone)
-            elif self.proxy_lease_manager is not None: proxy_record = await self.proxy_lease_manager.acquire_proxy(clean_phone, timeout=PROXY_ACQUIRE_TIMEOUT)
+            elif self.proxy_lease_manager is not None: proxy_record = await self.proxy_lease_manager.acquire_proxy(clean_phone, timeout=proxy_wait)
             if self.proxy_lease_manager is not None and proxy_record is None:
                 await self._log_lifecycle("SESSION_WAITING_FOR_PROXY", phone=clean_phone, session_fp=fingerprint, module=module, worker_id=worker_id or "", error="proxy acquisition returned no lease")
                 await self._rollback_reservation(clean_phone, lease_owner_key, reservation_id)
@@ -938,7 +1218,9 @@ class SessionManager:
             info.client_building = True
         client: Optional[Any] = None; proxy_record = proxy
         try:
-            if proxy_record is None and self.proxy_lease_manager is not None: proxy_record = await self.proxy_lease_manager.acquire_proxy(clean_phone, timeout=PROXY_ACQUIRE_TIMEOUT)
+            if proxy_record is None and self.proxy_lease_manager is not None:
+                # Logins may dip into the reserved proxy buffer.
+                proxy_record = await self.proxy_lease_manager.acquire_proxy(clean_phone, timeout=PROXY_ACQUIRE_TIMEOUT, allow_reserved=True)
             if proxy_record is None: return None
             client = self._create_client(session_str=session_str, api_id=api_id, api_hash=api_hash, device=device, proxy=proxy_record)
             async with self._lock:
@@ -968,6 +1250,52 @@ class SessionManager:
             if not info: return False
             return info.lifecycle in (SessionLifecycleState.BUSY, SessionLifecycleState.RESERVED, SessionLifecycleState.LOGIN_PENDING, SessionLifecycleState.OTP_WAITING, SessionLifecycleState.TWOFA_WAITING)
 
+    async def peek_session(self, phone: str) -> Dict[str, Any]:
+        owning = (
+            SessionLifecycleState.BUSY, SessionLifecycleState.RESERVED,
+            SessionLifecycleState.LOGIN_PENDING, SessionLifecycleState.OTP_WAITING,
+            SessionLifecycleState.TWOFA_WAITING,
+        )
+        async with self._lock:
+            info = self._sessions.get(self._session_key(phone))
+            if not info:
+                return {"owned": False, "owner": None, "lifecycle": None, "has_client": False, "worker_id": None}
+            return {
+                "owned": info.lifecycle in owning,
+                "owner": info.owner,
+                "lifecycle": info.lifecycle.value if info.lifecycle else None,
+                "has_client": info.client is not None,
+                "worker_id": info.worker_id,
+            }
+
+    async def snapshot_lease(self, phone: str) -> Optional[SessionLease]:
+        """Return a lease handle for an already-owned live client without re-acquiring."""
+        async with self._lock:
+            info = self._sessions.get(self._session_key(phone))
+            if not info or info.client is None or not info.owner:
+                return None
+            if info.lifecycle != SessionLifecycleState.BUSY:
+                return None
+            return SessionLease(
+                phone=self._session_key(phone),
+                session_fingerprint=info.session_fingerprint or "",
+                client=info.client,
+                proxy_url=info.proxy_url,
+                proxy_id=info.proxy_id,
+                proxy_lease_id=info.proxy_lease_id,
+                owner=info.owner,
+                worker_id=info.worker_id,
+                lease_id=info.lease_id or "",
+            )
+
+    async def clear_account_cooldown(self, phone: str) -> None:
+        plm = self.proxy_lease_manager
+        if plm is None:
+            return
+        cleaner = getattr(plm, "clear_account_cooldown", None)
+        if callable(cleaner):
+            await cleaner(self._session_key(phone))
+
     async def _rollback_reservation(self, clean_phone: str, owner_key: str, reservation_id: Optional[str] = None) -> None:
         async with self._lock:
             info = self._sessions.get(clean_phone)
@@ -989,10 +1317,10 @@ class SessionManager:
             if was_counted: self._active_count = max(0, self._active_count - 1)
         if client is not None: await self._safe_disconnect_client(client)
         if proxy_record and self.proxy_lease_manager is not None:
-            try: await self.proxy_lease_manager.release_proxy(proxy_url=proxy_record.get("url"), proxy_id=proxy_record.get("__proxy_id"), lease_id=proxy_record.get("__lease_id"), phone=clean_phone)
+            try: await self.proxy_lease_manager.release_proxy(proxy_url=proxy_record.get("url"), proxy_id=proxy_record.get("__proxy_id"), lease_id=proxy_record.get("__lease_id"), phone=clean_phone, should_cooldown=True, cooldown_reason="acquire_failure")
             except Exception as exc: logger.error("ACQUIRE_ROLLBACK_PROXY_RELEASE_FAILED | phone=%s | error=%s", clean_phone, exc)
 
-    async def _release_lease(self, phone_key: str, owner_key: str, lease_id: Optional[str] = None) -> None:
+    async def _release_lease(self, phone_key: str, owner_key: str, lease_id: Optional[str] = None, should_cooldown: bool = False) -> None:
         client_to_disconnect: Optional[Any] = None; proxy_url: Optional[str] = None; proxy_id: Optional[str] = None; proxy_lease_id: Optional[str] = None
         lifecycle_after_release = SessionLifecycleState.AVAILABLE; client_was_active = False
         async with self._lock:
@@ -1009,9 +1337,9 @@ class SessionManager:
             info.lifecycle = lifecycle_after_release
         if client_to_disconnect is not None: await self._safe_disconnect_client(client_to_disconnect)
         if (proxy_url or proxy_id) and self.proxy_lease_manager is not None:
-            try: await self.proxy_lease_manager.release_proxy(proxy_url=proxy_url, proxy_id=proxy_id, lease_id=proxy_lease_id, phone=phone_key)
+            try: await self.proxy_lease_manager.release_proxy(proxy_url=proxy_url, proxy_id=proxy_id, lease_id=proxy_lease_id, phone=phone_key, should_cooldown=should_cooldown)
             except Exception as exc: logger.error("SESSION_PROXY_RELEASE_FAILED | phone=%s | proxy=%s | error=%s", phone_key, self._safe_proxy_label(proxy_url), exc)
-        await self._log_lifecycle("SESSION_RELEASED", phone=phone_key, module=owner_key, client_id="", proxy_url=proxy_url or "", extra={"client_was_active": client_was_active, "active_count": self._active_count})
+        await self._log_lifecycle("SESSION_RELEASED", phone=phone_key, module=owner_key, client_id="", proxy_url=proxy_url or "", extra={"client_was_active": client_was_active, "active_count": self._active_count, "should_cooldown": should_cooldown})
 
     async def release_lease(self, lease: Optional[SessionLease]) -> None:
         if lease is None: return
@@ -1023,7 +1351,7 @@ class SessionManager:
             if info.owner != lease.owner: return
             if lease.lease_id is not None and info.lease_id != lease.lease_id: return
             lease.released = True
-        await self._release_lease(phone_key, lease.owner, lease.lease_id)
+        await self._release_lease(phone_key, lease.owner, lease.lease_id, should_cooldown=lease.proxy_should_cooldown)
 
     async def mark_quarantined(self, phone: str, reason: str, category: ErrorCategory) -> None:
         clean_phone = self._session_key(phone); client_to_disconnect: Optional[Any] = None; proxy_url: Optional[str] = None
@@ -1040,12 +1368,29 @@ class SessionManager:
                 if had_client: self._active_count = max(0, self._active_count - 1)
         if client_to_disconnect is not None: await self._safe_disconnect_client(client_to_disconnect)
         if (proxy_url or proxy_id) and self.proxy_lease_manager is not None:
-            try: await self.proxy_lease_manager.release_proxy(proxy_url=proxy_url, proxy_id=proxy_id, lease_id=proxy_lease_id, phone=clean_phone)
+            try: await self.proxy_lease_manager.release_proxy(proxy_url=proxy_url, proxy_id=proxy_id, lease_id=proxy_lease_id, phone=clean_phone, should_cooldown=True, cooldown_reason="quarantine")
             except Exception as exc: logger.error("QUARANTINE_PROXY_RELEASE_FAILED | phone=%s | error=%s", clean_phone, exc)
+        # Never quarantine non-terminal categories (temporary spam restriction,
+        # target-private, flood, privacy, etc.). If one reaches here, just log
+        # and release the lease without touching the DB status.
+        quarantinable_categories = {
+            ErrorCategory.AUTH_KEY_DUPLICATED, ErrorCategory.SESSION_REVOKED,
+            ErrorCategory.AUTH_KEY_UNREGISTERED, ErrorCategory.ACCOUNT_BANNED,
+            ErrorCategory.UNAUTHORIZED,
+        }
+        if category not in quarantinable_categories:
+            logger.warning(
+                "QUARANTINE_SKIPPED_NON_TERMINAL | phone=%s | category=%s | reason=%s",
+                clean_phone, category.value, reason[:80],
+            )
+            return
+
         db_status = {ErrorCategory.AUTH_KEY_DUPLICATED: "auth_key_duplicated", ErrorCategory.SESSION_REVOKED: "revoked",
                      ErrorCategory.AUTH_KEY_UNREGISTERED: "revoked", ErrorCategory.ACCOUNT_BANNED: "banned",
                      ErrorCategory.UNAUTHORIZED: "revoked"}.get(category, "permanently_failed")
-        try: await asyncio.to_thread(lambda: self.db.update_session_status(clean_phone, db_status, reason))
+        # `reason` goes to revocation_reason — NEVER to the session_str slot
+        # (that would overwrite the stored session with the reason text).
+        try: await asyncio.to_thread(lambda: self.db.update_session_status(clean_phone, db_status, reason=reason))
         except Exception as exc: logger.error("QUARANTINE_DB_UPDATE_FAILED | phone=%s | error=%s", clean_phone, exc)
         await self._log_lifecycle("SESSION_QUARANTINED", phone=clean_phone, session_fp=session_fp, module="session_manager", error=f"category={category.value}; reason={reason}")
 
@@ -1073,9 +1418,17 @@ class SessionManager:
     def _create_client(self, *, session_str: str, api_id: int, api_hash: str, device: dict, proxy: Optional[dict] = None) -> Any:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
+        # Telethon unpacks the proxy dict as **kwargs into Connection._parse_proxy,
+        # so ONLY the six documented keys may be present. Lease metadata keys
+        # (__proxy_id/__lease_id/url) raise TypeError instantly otherwise.
+        clean_proxy: Optional[dict] = None
+        if proxy:
+            clean_proxy = {k: proxy[k] for k in
+                           ("proxy_type", "addr", "port", "rdns", "username", "password")
+                           if k in proxy}
         return TelegramClient(StringSession(session_str), api_id=api_id, api_hash=api_hash,
                               device_model=device.get("device_model", "PC 64bit"), system_version=device.get("system_version", "Windows 11"),
-                              app_version=device.get("app_version", "4.8.4"), proxy=proxy, entity_cache_limit=100,
+                              app_version=device.get("app_version", "4.8.4"), proxy=clean_proxy, entity_cache_limit=100,
                               sequential_updates=False, receive_updates=False, timeout=10.0, connection_retries=1, request_retries=1)
 
     async def _safe_disconnect_client(self, client: Optional[Any]) -> None:

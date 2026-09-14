@@ -29,6 +29,8 @@ node_modules/
 # Build artifacts
 dist/
 build/
+!frontend/dist/
+!frontend/dist/**
 *.o
 *.obj
 *.so
@@ -40,4 +42,5 @@ build/
 *.session
 *.session-journal
 *.session-journal-*
+.web_api_token
 ```

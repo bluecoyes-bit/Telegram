@@ -315,6 +315,22 @@ def test_update_session_status_never_reactivates_terminal():
     assert db.src_accounts.by_phone("1")["status"] == "revoked"
 
 
+def test_restore_session_from_backup_explicitly_reactivates_terminal_record():
+    db = make_db(src_docs=[{
+        "phone": "1", "status": "permanently_failed", "session_string": "old-sess",
+    }])
+
+    assert db.restore_session_from_backup(
+        "1", "backup-sess", "spam restriction restore"
+    ) is True
+
+    doc = db.src_accounts.by_phone("1")
+    assert doc["status"] == "failed"
+    assert doc["session_string"] == "backup-sess"
+    assert doc["session"] == "backup-sess"
+    assert doc["revocation_reason"] == "spam restriction restore"
+
+
 # ---------------------------------------------------------------------------
 # 2. Thread-safe TTL cache
 # ---------------------------------------------------------------------------

@@ -32,6 +32,8 @@ from resource_manager import (
     SessionAlreadyOwnedError,
     SessionLifecycleState,
     SessionLease,
+    notify_auditor_stop,
+    notify_auditor_resume,
 )
 
 logger = logging.getLogger("VideoChatEngineFallback")
@@ -864,40 +866,55 @@ class CloudVoiceChatEngine:
         self.is_running = True
         self._last_status.clear()
 
-        # 🔍 Database core pool extraction grid
-        active_pool = await self.db.get_active_target_sessions()
+        # Fully stop the background auditor/recovery while the voice cluster owns the pool.
+        try:
+            notify_auditor_stop()
+        except Exception:
+            pass
 
-        if not active_pool:
-            self.is_running = False
-            return "❌ **Operation Failed:** Source DB me active session nahi mila."
+        try:
+            # 🔍 Database core pool extraction grid
+            active_pool = await self.db.get_active_target_sessions()
 
-        total_fetched = len(active_pool)
-        print(f"[VOICECHAT] Total Active Inventory Fetched from DB: {total_fetched} accounts.", flush=True)
-        print(f"[VOICECHAT] Desired Target Stream Cap Set to: `{desired_count}` accounts.", flush=True)
+            if not active_pool:
+                self.is_running = False
+                return "❌ **Operation Failed:** Source DB me active session nahi mila."
 
-        random.shuffle(active_pool)
+            total_fetched = len(active_pool)
+            print(f"[VOICECHAT] Total Active Inventory Fetched from DB: {total_fetched} accounts.", flush=True)
+            print(f"[VOICECHAT] Desired Target Stream Cap Set to: `{desired_count}` accounts.", flush=True)
 
-        actual_target = min(desired_count, total_fetched)
+            random.shuffle(active_pool)
 
-        initial_deploy_batch = active_pool[:actual_target]
-        backup_accounts_pool = active_pool[actual_target:]
+            actual_target = min(desired_count, total_fetched)
 
-        replacement_queue = asyncio.Queue()
-        for backup_doc in backup_accounts_pool:
-            await replacement_queue.put(backup_doc)
+            initial_deploy_batch = active_pool[:actual_target]
+            backup_accounts_pool = active_pool[actual_target:]
 
-        # 🔥 OPTIMIZATION: Staggered launch with semaphore
-        launch_tasks = []
-        for acc in initial_deploy_batch:
-            if not self.is_running:
-                break
-            task = asyncio.create_task(self._execute_single_stream(acc, group_link, audio_file, replacement_queue))
-            self._register_voice_task(str(acc.get("phone", "")).strip(), task)
-            launch_tasks.append(task)
-            # 🔥 OPTIMIZATION: Reduced launch delay (3-5 seconds instead of CONFIG delay)
-            await self._sleep(random.uniform(*self._launch_stagger))
+            replacement_queue = asyncio.Queue()
+            for backup_doc in backup_accounts_pool:
+                await replacement_queue.put(backup_doc)
 
-        return f"🚀 **Voice Chat Cluster Active Matrix Initiated:** Target set to `{actual_target}` (Total Available: `{total_fetched}`). Active connections are streaming. Backups loaded in queue: `{replacement_queue.qsize()}` accounts."
+            # 🔥 OPTIMIZATION: Staggered launch with semaphore
+            launch_tasks = []
+            for acc in initial_deploy_batch:
+                if not self.is_running:
+                    break
+                task = asyncio.create_task(self._execute_single_stream(acc, group_link, audio_file, replacement_queue))
+                self._register_voice_task(str(acc.get("phone", "")).strip(), task)
+                launch_tasks.append(task)
+                # 🔥 OPTIMIZATION: Reduced launch delay (3-5 seconds instead of CONFIG delay)
+                await self._sleep(random.uniform(*self._launch_stagger))
+
+            return f"🚀 **Voice Chat Cluster Active Matrix Initiated:** Target set to `{actual_target}` (Total Available: `{total_fetched}`). Active connections are streaming. Backups loaded in queue: `{replacement_queue.qsize()}` accounts."
+        finally:
+            # If we bailed out before spawning any persistent cluster tasks,
+            # resume the auditor/recovery immediately so they are not left paused.
+            if not self._cluster_tasks:
+                try:
+                    notify_auditor_resume()
+                except Exception:
+                    pass
 
     async def terminate_voice_cluster(self) -> str:
         """
@@ -930,6 +947,12 @@ class CloudVoiceChatEngine:
         self._cluster_tasks.clear()
         self._takeover_events.clear()
         self._last_status.clear()
+
+        # Background auditor/recovery can resume now that the voice cluster is offline.
+        try:
+            notify_auditor_resume()
+        except Exception:
+            pass
 
         print("✅ [VOICECHAT MASTER] All accounts cleanly disconnected. Cluster is offline.", flush=True)
         return "OK: cluster terminated."

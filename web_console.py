@@ -266,15 +266,18 @@ def shutdown_background_tasks() -> None:
     _background_tasks.clear()
     for t in pending:
         t.cancel()
-    if pending:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            if pending:
                 loop.create_task(_wait_background_tasks(pending))
-            else:
+            loop.create_task(_close_all_web_holds())
+        else:
+            if pending:
                 loop.run_until_complete(_wait_background_tasks(pending))
-        except RuntimeError:
-            pass
+            loop.run_until_complete(_close_all_web_holds())
+    except RuntimeError:
+        pass
 
 
 async def _wait_background_tasks(tasks) -> None:
@@ -338,38 +341,299 @@ def setup_console_routes(db_instance):
 # =====================================================================
 # 📋 SESSION-ROUTED CLIENT ACCESS (via SessionManager)
 # =====================================================================
+# Dashboard traffic used to acquire+disconnect a Telegram client on every
+# HTTP call. That caused SessionAlreadyOwnedError/409, empty entity caches
+# (PeerUser ValueError), and ping fighting profile/dialogs. Keep one live
+# client per phone and serialize work on that client instead.
+
+WEB_HOLD_IDLE_SECONDS = 90.0
+WEB_ACQUIRE_TIMEOUT = 25.0
+WEB_MODULE = "web_console"
+WEB_WORKER = "dashboard"
+
+
+class _WebHold:
+    __slots__ = ("cm", "lease", "client", "last_used")
+
+    def __init__(self, cm, lease, client):
+        self.cm = cm
+        self.lease = lease
+        self.client = client
+        self.last_used = time.time()
+
+
+_web_holds: Dict[str, _WebHold] = {}
+_web_phone_locks: Dict[str, asyncio.Lock] = {}
+_web_reaper_started = False
+
+
+def _lock_for_phone(phone: str) -> asyncio.Lock:
+    return _web_phone_locks.setdefault(phone, asyncio.Lock())
+
+
+def _is_web_owner(owner: Optional[str], worker_id: Optional[str] = None) -> bool:
+    if not owner:
+        return False
+    if owner == f"{WEB_MODULE}:{WEB_WORKER}":
+        return True
+    return str(owner).startswith(f"{WEB_MODULE}:")
+
+
+class _AdoptedHoldCM:
+    """Release an already-owned SessionManager lease when the web hold is dropped."""
+
+    __slots__ = ("_sm", "_lease")
+
+    def __init__(self, session_manager, lease):
+        self._sm = session_manager
+        self._lease = lease
+
+    async def __aexit__(self, exc_type, exc, tb):
+        lease = self._lease
+        self._lease = None
+        if lease is not None:
+            await self._sm.release_lease(lease)
+
+
+def _ensure_web_hold_reaper() -> None:
+    global _web_reaper_started
+    if _web_reaper_started:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _web_reaper_started = True
+    task = loop.create_task(_web_hold_reaper())
+    _register_task(task, "web-hold-reaper", {"action": "reaper"})
+
+
+async def _close_web_hold(phone: str, hold: Optional[_WebHold] = None) -> None:
+    current = _web_holds.get(phone)
+    if hold is None:
+        hold = current
+    if hold is None:
+        return
+    if current is hold:
+        _web_holds.pop(phone, None)
+    try:
+        await hold.cm.__aexit__(None, None, None)
+    except Exception:
+        logger.debug("WEB_HOLD_RELEASE_FAILED phone=%s", phone, exc_info=True)
+
+
+async def _close_all_web_holds() -> None:
+    for phone in list(_web_holds.keys()):
+        await _close_web_hold(phone)
+
+
+async def _evict_other_web_holds(keep_phone: str) -> None:
+    """Dashboard uses one account at a time — drop other held clients."""
+    for phone in list(_web_holds.keys()):
+        if phone == keep_phone:
+            continue
+        async with _lock_for_phone(phone):
+            hold = _web_holds.get(phone)
+            if hold is not None:
+                await _close_web_hold(phone, hold)
+
+
+async def _web_hold_reaper() -> None:
+    try:
+        while True:
+            await asyncio.sleep(15)
+            now = time.time()
+            idle = [
+                phone for phone, hold in list(_web_holds.items())
+                if now - hold.last_used >= WEB_HOLD_IDLE_SECONDS
+            ]
+            for phone in idle:
+                lock = _lock_for_phone(phone)
+                if lock.locked():
+                    continue
+                async with lock:
+                    hold = _web_holds.get(phone)
+                    if hold and time.time() - hold.last_used >= WEB_HOLD_IDLE_SECONDS:
+                        await _close_web_hold(phone, hold)
+    except asyncio.CancelledError:
+        await _close_all_web_holds()
+        raise
+
+
+async def _ensure_connected(client, clean_phone: str) -> None:
+    try:
+        if client is not None and not client.is_connected():
+            await client.connect()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Telegram session offline for +{clean_phone}",
+        )
+
+
+async def _adopt_existing_web_client(clean_phone: str) -> Optional[_WebHold]:
+    peek = await _session_manager.peek_session(clean_phone)
+    if not peek.get("has_client") or not _is_web_owner(peek.get("owner"), peek.get("worker_id")):
+        return None
+    lease = await _session_manager.snapshot_lease(clean_phone)
+    if lease is None or lease.client is None:
+        return None
+    hold = _WebHold(_AdoptedHoldCM(_session_manager, lease), lease, lease.client)
+    _web_holds[clean_phone] = hold
+    logger.info("WEB_HOLD_ADOPTED phone=%s owner=%s", clean_phone, peek.get("owner"))
+    return hold
+
 
 @asynccontextmanager
 async def managed_web_session(phone: str):
-    """
-    Context manager: acquires a managed session lease from SessionManager,
-    yields (client, lease), and releases the lease on exit.
+    """Yield a connected Telethon client for dashboard work.
 
-    Usage:
-        async with managed_web_session(phone) as (client, lease):
-            await client.send_message(...)
+    Production SessionManager: reuse one live lease per phone (entity cache
+    survives profile → dialogs → chat-history). Test fakes keep acquire/release
+    per call so existing collision tests stay valid.
     """
     if not _session_manager:
         raise RuntimeError("SessionManager not initialized for web console")
     clean_phone = validate_phone(phone)
-    async with _session_manager.acquire(
-        clean_phone,
-        module="web_console",
-        auto_release=True,
-    ) as lease:
-        if not lease:
+
+    if not isinstance(_session_manager, SessionManager):
+        try:
+            async with _session_manager.acquire(
+                clean_phone,
+                module="web_console",
+                auto_release=True,
+            ) as lease:
+                if not lease:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Session unavailable for +{clean_phone} (busy or terminal)",
+                    )
+                yield lease.client, lease
+        except HTTPException:
+            raise
+        except SessionAlreadyOwnedError:
             raise HTTPException(
                 status_code=409,
-                detail=f"Session unavailable for +{clean_phone} (busy or terminal)"
+                detail=f"Session busy for +{clean_phone}",
             )
+        return
+
+    _ensure_web_hold_reaper()
+    if any(p != clean_phone for p in list(_web_holds.keys())):
+        await _evict_other_web_holds(clean_phone)
+    lock = _lock_for_phone(clean_phone)
+    async with lock:
+        hold = _web_holds.get(clean_phone)
+        if hold is not None and hold.client is None:
+            await _close_web_hold(clean_phone, hold)
+            hold = None
+
+        if hold is not None:
+            try:
+                await _ensure_connected(hold.client, clean_phone)
+            except HTTPException:
+                await _close_web_hold(clean_phone, hold)
+                hold = None
+
+        if hold is None:
+            hold = await _adopt_existing_web_client(clean_phone)
+
+        if hold is None:
+            last_detail = f"Session unavailable for +{clean_phone}"
+            for attempt in range(8):
+                await _session_manager.clear_account_cooldown(clean_phone)
+                peek = await _session_manager.peek_session(clean_phone)
+                if peek.get("has_client") and _is_web_owner(peek.get("owner"), peek.get("worker_id")):
+                    hold = await _adopt_existing_web_client(clean_phone)
+                    if hold is not None:
+                        break
+                if peek.get("owned") and not _is_web_owner(peek.get("owner"), peek.get("worker_id")):
+                    last_detail = f"Session busy for +{clean_phone} (owner={peek.get('owner')})"
+                    logger.warning(
+                        "WEB_SESSION_WAIT phone=%s owner=%s lifecycle=%s attempt=%s",
+                        clean_phone, peek.get("owner"), peek.get("lifecycle"), attempt + 1,
+                    )
+                    await asyncio.sleep(min(1.2 * (attempt + 1), 6.0))
+                    continue
+                cm = _session_manager.acquire(
+                    clean_phone,
+                    module=WEB_MODULE,
+                    worker_id=WEB_WORKER,
+                    timeout=WEB_ACQUIRE_TIMEOUT,
+                    auto_release=False,
+                )
+                try:
+                    lease = await cm.__aenter__()
+                except SessionAlreadyOwnedError:
+                    peek = await _session_manager.peek_session(clean_phone)
+                    last_detail = f"Session busy for +{clean_phone} (owner={peek.get('owner')})"
+                    logger.warning(
+                        "WEB_SESSION_OWNED phone=%s owner=%s lifecycle=%s attempt=%s",
+                        clean_phone, peek.get("owner"), peek.get("lifecycle"), attempt + 1,
+                    )
+                    if peek.get("has_client") and _is_web_owner(peek.get("owner"), peek.get("worker_id")):
+                        hold = await _adopt_existing_web_client(clean_phone)
+                        if hold is not None:
+                            break
+                    await asyncio.sleep(min(1.2 * (attempt + 1), 6.0))
+                    continue
+                if not lease or lease.client is None:
+                    last_detail = f"Session unavailable for +{clean_phone} (busy or terminal)"
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        logger.debug("WEB_HOLD_EMPTY_LEASE_EXIT phone=%s", clean_phone, exc_info=True)
+                    if peek.get("lifecycle") in ("terminal", "quarantined"):
+                        break
+                    await asyncio.sleep(0.8 * (attempt + 1))
+                    continue
+                try:
+                    await _ensure_connected(lease.client, clean_phone)
+                except BaseException:
+                    try:
+                        await cm.__aexit__(None, None, None)
+                    except Exception:
+                        logger.debug("WEB_HOLD_ROLLBACK_FAILED phone=%s", clean_phone, exc_info=True)
+                    raise
+                hold = _WebHold(cm, lease, lease.client)
+                _web_holds[clean_phone] = hold
+                break
+            if hold is None:
+                raise HTTPException(status_code=409, detail=last_detail)
+
+        hold.last_used = time.time()
         try:
-            yield lease.client, lease
+            yield hold.client, hold.lease
         finally:
-            pass  # auto_release=True handles cleanup
+            hold.last_used = time.time()
 
 # Helper to safely parse chat IDs (handles negative IDs for groups/channels)
 def parse_chat_id(chat_id_str: str):
     return int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
+
+
+async def resolve_peer(client, chat_id_str):
+    """Resolve a dialog id/username to a Telethon entity.
+
+    Each web request uses a fresh client, so access hashes from a previous
+    get_dialogs() call are not in cache. Fall back to scanning dialogs.
+    """
+    parsed = parse_chat_id(chat_id_str)
+    try:
+        return await client.get_entity(parsed)
+    except (ValueError, TypeError):
+        pass
+    dialogs = await client.get_dialogs(limit=200)
+    if isinstance(parsed, int):
+        for dialog in dialogs:
+            if dialog.id == parsed:
+                return dialog.entity
+    try:
+        return await client.get_entity(parsed)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Chat not found")
 
 
 def _audit_log(endpoint: str, operation_id: str, action: str, target: str, result: str, duration: float, error_category: Optional[str] = None) -> None:
@@ -395,19 +659,26 @@ async def api_console_accounts(
         raise HTTPException(status_code=503, detail="Database uninitialized")
     try:
         accounts = await _db.get_all_suite_sessions()
-        total = len(accounts)
-        paginated = accounts[offset:offset + limit]
         catalog = []
-        for acc in paginated:
+        for acc in accounts:
+            phone = "".join(c for c in str(acc.get("phone") or "") if c.isdigit())
+            if not phone:
+                continue
+            session_token = str(acc.get("session_string") or acc.get("session") or "").strip()
             catalog.append({
-                "phone": acc.get("phone"),
-                "first_name": acc.get("first_name", acc.get("device_model", "Identity Node")),
-                "status": acc.get("status", "pending"),
-                "is_restricted": acc.get("is_restricted", False),
-                "dc_id": acc.get("dc_id", None)
+                "phone": phone,
+                "first_name": acc.get("first_name") or acc.get("username") or acc.get("device_model") or f"Session {phone[-4:]}",
+                "username": acc.get("username") or "",
+                "status": str(acc.get("status") or "pending").lower(),
+                "is_restricted": bool(acc.get("is_restricted", False)),
+                "dc_id": acc.get("dc_id", None),
+                "has_session": len(session_token) > 10,
             })
-        _audit_log("/api/console/accounts", operation_id, "list_accounts", f"{len(catalog)}/{total}", "success", time.time() - start)
-        return {"accounts": catalog, "total": total, "limit": limit, "offset": offset}
+        catalog.sort(key=lambda a: (0 if a["status"] == "active" else 1, a["first_name"].lower(), a["phone"]))
+        total = len(catalog)
+        paginated = catalog[offset:offset + limit]
+        _audit_log("/api/console/accounts", operation_id, "list_accounts", f"{len(paginated)}/{total}", "success", time.time() - start)
+        return {"accounts": paginated, "total": total, "limit": limit, "offset": offset}
     except Exception as e:
         _audit_log("/api/console/accounts", operation_id, "list_accounts", "all", "error", time.time() - start, (classify_exception(e).category.name if isinstance(classify_exception(e), ConnectionResult) else type(e).__name__))
         logger.exception("Failed to list accounts")
@@ -466,7 +737,7 @@ async def api_console_send_message(req: SendMessageRequest):
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            target_id = parse_chat_id(req.chat_id)
+            target_id = await resolve_peer(client, req.chat_id)
             content = (req.message or req.text or "").strip()
             if not content:
                 _audit_log("/api/console/send", operation_id, "send_message", clean_phone, "error_empty_message", time.time() - start, "VALIDATION_ERROR")
@@ -586,49 +857,77 @@ async def api_console_dialogs(
     try:
         async with managed_web_session(clean_phone) as (client, _):
             me = await client.get_me()
-            my_id = me.id
-            dialogs = await client.get_dialogs(limit=limit + offset)
+            my_id = me.id if me else 0
+            collected = []
+            fetch_limit = min(max(limit + offset, 1), MAX_PAGE_LIMIT)
+            for folder in (0, 1):
+                try:
+                    collected.extend(await client.get_dialogs(limit=fetch_limit, folder=folder))
+                except Exception:
+                    logger.debug("get_dialogs folder=%s failed phone=%s", folder, clean_phone, exc_info=True)
+            if not collected:
+                try:
+                    collected = list(await client.get_dialogs(limit=fetch_limit))
+                except Exception:
+                    logger.exception("get_dialogs failed phone=%s", clean_phone)
+                    collected = []
+        seen = set()
+        dialogs = []
+        for chat in collected:
+            cid = getattr(chat, "id", None)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            dialogs.append(chat)
         dialogs_payload = []
         
         for chat in dialogs[offset:offset + limit]:
-            title = chat.name or "Private Chat Space"
-            last_msg = str(chat.message.message or "").strip() if chat.message else ""
-            
-            chat_type = "private"
-            if chat.is_group:
-                chat_type = "group"
-            elif chat.is_channel:
-                chat_type = "channel"
-            elif getattr(chat.entity, 'bot', False):
-                chat_type = "bot"
-            
-            is_saved_messages = False
-            is_telegram_service = False
-            
-            if chat.id == my_id:
-                title = "Saved Messages"
-                chat_type = "saved"
-                is_saved_messages = True
-            elif chat.id == 777000:
-                title = "Telegram"
-                chat_type = "service"
-                is_telegram_service = True
+            try:
+                title = chat.name or "Private Chat Space"
+                last_msg = str(chat.message.message or "").strip() if chat.message else ""
                 
-            if not last_msg and chat.message and chat.message.media:
-                last_msg = "[Attachment/Media File]"
+                chat_type = "private"
+                entity = getattr(chat, "entity", None)
+                if chat.is_group:
+                    chat_type = "group"
+                elif chat.is_channel:
+                    chat_type = "channel"
+                elif getattr(entity, "bot", False):
+                    chat_type = "bot"
                 
-            dialogs_payload.append({
-                "id": str(chat.id),
-                "title": title,
-                "type": chat_type,
-                "last_message": last_msg[:45] + "..." if len(last_msg) > 45 else (last_msg or "No messages"),
-                "last_date": int(chat.date.timestamp()) if chat.date else 0,
-                "unread_count": getattr(chat, "unread_count", 0) or 0,
-                "pinned": bool(getattr(chat, "pinned", False)),
-                "muted": bool(getattr(chat, "muted", False)),
-                "is_saved": is_saved_messages,
-                "is_service": is_telegram_service
-            })
+                is_saved_messages = False
+                is_telegram_service = False
+                
+                if chat.id == my_id:
+                    title = "Saved Messages"
+                    chat_type = "saved"
+                    is_saved_messages = True
+                elif chat.id == 777000:
+                    title = "Telegram"
+                    chat_type = "service"
+                    is_telegram_service = True
+                    
+                if not last_msg and chat.message and chat.message.media:
+                    last_msg = "[Attachment/Media File]"
+
+                archived = bool(getattr(chat, "archived", False) or getattr(chat, "folder_id", 0) == 1)
+                    
+                dialogs_payload.append({
+                    "id": str(chat.id),
+                    "title": title,
+                    "username": getattr(entity, "username", None) or "",
+                    "type": chat_type,
+                    "last_message": last_msg[:80] + "..." if len(last_msg) > 80 else (last_msg or "No messages"),
+                    "last_date": int(chat.date.timestamp()) if chat.date else 0,
+                    "unread_count": getattr(chat, "unread_count", 0) or 0,
+                    "pinned": bool(getattr(chat, "pinned", False)),
+                    "muted": bool(getattr(chat, "muted", False)),
+                    "archived": archived,
+                    "is_saved": is_saved_messages,
+                    "is_service": is_telegram_service
+                })
+            except Exception:
+                logger.debug("dialog serialize failed phone=%s", clean_phone, exc_info=True)
         _audit_log("/api/console/dialogs", operation_id, "get_dialogs", clean_phone, "success", time.time() - start)
         return {"status": "success", "phone": clean_phone, "dialogs": dialogs_payload, "limit": limit, "offset": offset}
     except HTTPException:
@@ -660,8 +959,7 @@ async def api_console_messages(
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            target_entity = parse_chat_id(chat_id)
-            resolved_peer = await client.get_entity(target_entity)
+            resolved_peer = await resolve_peer(client, chat_id)
             messages = await client.get_messages(resolved_peer, limit=limit + offset)
             messages_payload = []
             
@@ -746,10 +1044,11 @@ async def api_console_messages(
                     # --- WEB PAGE / LINK PREVIEW ---
                     elif isinstance(msg.media, MessageMediaWebPage):
                         media_type = "link"
+                        page = getattr(msg.media, "webpage", None)
                         media_data = {
                             "type": "link",
-                            "url": msg.media.webpage.url if msg.media.webpage else None,
-                            "title": msg.media.webpage.title if msg.media.webpage else None
+                            "url": getattr(page, "url", None),
+                            "title": getattr(page, "title", None),
                         }
 
                     # --- OTHER MEDIA TYPES ---
@@ -986,8 +1285,7 @@ async def api_console_chat_info(
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            target_entity = parse_chat_id(chat_id)
-            entity = await client.get_entity(target_entity)
+            entity = await resolve_peer(client, chat_id)
             is_user = hasattr(entity, 'first_name')
             
             about_text = "No description"
@@ -1102,8 +1400,7 @@ async def api_console_chat_members(
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            target_entity = parse_chat_id(chat_id)
-            entity = await client.get_entity(target_entity)
+            entity = await resolve_peer(client, chat_id)
             is_user = hasattr(entity, 'first_name')
             
             members_list = []
@@ -1152,12 +1449,23 @@ async def api_console_ping(phone: str):
         raise HTTPException(status_code=503, detail="Database uninitialized")
     clean_phone = validate_phone(phone)
     try:
-        async with managed_web_session(clean_phone) as (client, _):
-            if client.is_connected() and await client.is_user_authorized():
-                _audit_log("/api/console/ping", operation_id, "ping", clean_phone, "success", time.time() - start)
-                return {"status": "success", "connected": True}
-            _audit_log("/api/console/ping", operation_id, "ping", clean_phone, "error_not_connected", time.time() - start)
-            return {"status": "error", "reason": "Not connected"}
+        hold = _web_holds.get(clean_phone)
+        connected = False
+        if hold is not None and hold.client is not None:
+            try:
+                connected = bool(hold.client.is_connected())
+            except Exception:
+                connected = False
+        if not connected and _db:
+            record = _db.get_session_by_phone(clean_phone)
+            connected = bool(record) and str(record.get("status", "")).lower() == "active"
+        logger.debug(
+            "WEB_PING phone=%s connected=%s duration_ms=%.2f",
+            clean_phone,
+            connected,
+            (time.time() - start) * 1000,
+        )
+        return {"status": "success", "connected": connected}
     except HTTPException:
         raise
     except PermissionError as e:
@@ -1238,8 +1546,7 @@ async def api_console_chat_media(
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            target_entity = parse_chat_id(chat_id)
-            resolved_peer = await client.get_entity(target_entity)
+            resolved_peer = await resolve_peer(client, chat_id)
             messages = await client.get_messages(resolved_peer, limit=limit + offset)
             extracted_items = []
             
@@ -1432,8 +1739,7 @@ async def api_console_chat_photo(phone: str, chat_id: str):
     
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            target_entity = parse_chat_id(chat_id)
-            entity = await client.get_entity(target_entity)
+            entity = await resolve_peer(client, chat_id)
             photo_buffer = io.BytesIO()
             await client.download_profile_photo(entity, file=photo_buffer, download_big=False)
             if photo_buffer.getvalue():
@@ -1464,8 +1770,8 @@ async def api_console_forward_message(req: ForwardMessageRequest):
     clean_phone = req.phone  # Already validated by Pydantic
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            from_peer = parse_chat_id(req.from_chat_id)
-            to_peer = parse_chat_id(req.to_chat_id)
+            from_peer = await resolve_peer(client, req.from_chat_id)
+            to_peer = await resolve_peer(client, req.to_chat_id)
             await client.forward_messages(to_peer, req.msg_id, from_peer)
             _audit_log("/api/console/forward", operation_id, "forward_message", clean_phone, "success", time.time() - start)
             return {"status": "success", "message": "Message forwarded successfully"}
@@ -1491,7 +1797,7 @@ async def api_console_delete_message(req: DeleteMessageRequest):
     clean_phone = req.phone  # Already validated by Pydantic
     try:
         async with managed_web_session(clean_phone) as (client, _):
-            target_peer = parse_chat_id(req.chat_id)
+            target_peer = await resolve_peer(client, req.chat_id)
             await client.delete_messages(target_peer, [req.msg_id], revoke=req.delete_for_everyone)
             _audit_log("/api/console/delete-message", operation_id, "delete_message", clean_phone, "success", time.time() - start)
             return {"status": "success", "message": "Message deleted successfully"}

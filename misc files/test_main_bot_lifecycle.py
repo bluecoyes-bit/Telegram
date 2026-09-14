@@ -411,6 +411,14 @@ def test_should_start_recovery_disabled(monkeypatch):
     assert main_bot.should_start_recovery() is False
 
 
+def test_lifespan_does_not_spawn_a_second_recovery_loop():
+    """start_auditor() already owns recovery; lifespan must not create another."""
+    import inspect
+    src = inspect.getsource(main_bot.lifespan)
+    assert "auto_health_recovery_loop" not in src
+    assert "auto_health_recovery_loop" in inspect.getsource(main_bot.start_auditor)
+
+
 @pytest.mark.asyncio
 async def test_recover_skips_terminal_account(patch_deps):
     acc = {"phone": "+919999999991", "status": "auth_key_duplicated",

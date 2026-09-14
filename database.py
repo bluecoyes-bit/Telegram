@@ -6,8 +6,6 @@ Filename: database.py
 import time
 import re
 import os
-import time
-import re
 import pickle
 import random
 import pathlib
@@ -17,6 +15,7 @@ import asyncio
 import hashlib
 import threading
 import functools
+import importlib
 from functools import partial
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Generator, Union, Collection
@@ -47,7 +46,8 @@ MAX_PROJECTION_FIELDS = {      # Always fetch only what's needed
     "device_model": 1, "system_version": 1, "app_version": 1,
     "api_id": 1, "api_hash": 1, "device_metadata": 1,
     "last_updated": 1, "last_checked_time": 1, "timestamp": 1,
-    "authenticated_at": 1, "first_name": 1, "account_sequence_index": 1,
+    "authenticated_at": 1, "first_name": 1, "username": 1,
+    "account_sequence_index": 1, "dc_id": 1, "is_restricted": 1,
     "2fa_password": 1, "revocation_reason": 1, "last_error": 1,
     "proxy": 1, "proxy_updated_at": 1,
 }
@@ -758,7 +758,8 @@ class SuiteDatabase:
         try:
             return await self._run_sync(fetch)
         except Exception:
-            return []
+            logger.exception("get_all_suite_sessions failed")
+            raise
     
     async def get_all_accounts_raw(self) -> list:
         """Alias for fetch_source_accounts. Returns all raw docs."""
@@ -1001,7 +1002,7 @@ class SuiteDatabase:
             device, two_fa_password,
         )
 
-    def update_session_status(self, phone: str, status: str, session_str: Optional[str] = None):
+    def update_session_status(self, phone: str, status: str, session_str: Optional[str] = None, reason: Optional[str] = None):
         """
         Set/refresh account status.
 
@@ -1009,6 +1010,9 @@ class SuiteDatabase:
         is never written over an existing terminal status (revoked, banned,
         auth_key_duplicated, ...). This prevents a stale worker from
         reactivating a terminal account through the plain update path.
+
+        `reason` is stored in revocation_reason — it must NEVER be passed as
+        session_str (that would overwrite the session string with text).
         """
         clean_phone = self._normalize(phone)
         if not clean_phone:
@@ -1026,6 +1030,8 @@ class SuiteDatabase:
         if session_str:
             update_data["session"] = session_str
             update_data["session_string"] = session_str
+        if reason:
+            update_data["revocation_reason"] = str(reason)[:500]
         try:
             result = self.src_accounts.update_one(query, {"$set": update_data})
             if (target_status not in TERMINAL_DB_STATUSES
@@ -1044,11 +1050,52 @@ class SuiteDatabase:
             )
 
     async def update_session_status_async(
-        self, phone: str, status: str, session_str: Optional[str] = None
+        self, phone: str, status: str, session_str: Optional[str] = None,
+        reason: Optional[str] = None,
     ) -> None:
         """Async-safe status refresh."""
         return await self._run_sync(
-            self.update_session_status, phone, status, session_str,
+            self.update_session_status, phone, status, session_str, reason,
+        )
+
+    def restore_session_from_backup(
+        self, phone: str, session_str: str, reason: Optional[str] = None
+    ) -> bool:
+        """Restore a known-good session after an intentional terminal override."""
+        clean_phone = self._normalize(phone)
+        if not clean_phone or not str(session_str).strip():
+            return False
+        self._check_open()
+        update_data = {
+            "status": self._status_value("failed"),
+            "session": str(session_str),
+            "session_string": str(session_str),
+            "last_updated": datetime.now(timezone.utc),
+        }
+        if reason:
+            update_data["revocation_reason"] = str(reason)[:500]
+        try:
+            result = self.src_accounts.update_one(
+                {"phone": clean_phone, "status": {"$in": list(TERMINAL_DB_STATUSES)}},
+                {"$set": update_data},
+            )
+            if result.matched_count:
+                self._session_cache.invalidate(f"session:{clean_phone}")
+                self._stats_cache.invalidate("status_bar")
+                return True
+        except Exception as e:
+            logger.error(
+                f"restore_session_from_backup failed for {clean_phone} "
+                f"({type(e).__name__}): {e}"
+            )
+        return False
+
+    async def restore_session_from_backup_async(
+        self, phone: str, session_str: str, reason: Optional[str] = None
+    ) -> bool:
+        """Async-safe explicit terminal-account restore."""
+        return await self._run_sync(
+            self.restore_session_from_backup, phone, session_str, reason,
         )
 
     def save_migrated_session(
@@ -1120,6 +1167,23 @@ class SuiteDatabase:
         except Exception as e:
             logger.error(f"mark_account_failed error: {e}")
     
+    def mark_account_checked(self, phone: str) -> None:
+        """Persist last_checked_time=now so the auditor's LRU rotation survives restarts."""
+        clean_phone = self._normalize(phone)
+        if not clean_phone:
+            return
+        self._check_open()
+        try:
+            self.src_accounts.update_one(
+                {"phone": clean_phone},
+                {"$set": {"last_checked_time": datetime.now(timezone.utc)}}
+            )
+        except Exception as e:
+            logger.error(f"mark_account_checked error for {clean_phone}: {e}")
+
+    async def mark_account_checked_async(self, phone: str) -> None:
+        return await self._run_sync(self.mark_account_checked, phone)
+
     def mark_account_revoked(self, phone: str, system_reason: str) -> None:
         """Mark account as permanently revoked/dead."""
         clean_phone = self._normalize(phone)
@@ -1427,7 +1491,16 @@ class SuiteDatabase:
         vars_path: str = "vars.txt",
         json_2fa_path: str = "twofa_passwords.json"
     ) -> dict:
-        from session_migration import migrate_local_sessions
+        try:
+            migration_mod = importlib.import_module("session_migration")  # pyright: ignore[reportMissingImports]
+            migrate_local_sessions = getattr(migration_mod, "migrate_local_sessions")
+        except (ImportError, AttributeError):
+            # session_migration module was removed in the resource_manager
+            # consolidation; report gracefully instead of crashing.
+            return {
+                "staged": 0, "migrated": 0, "failed": 0, "skipped": 0,
+                "errors": ["session_migration module not found — local reload is disabled"],
+            }
 
         return await migrate_local_sessions(
             db=self,

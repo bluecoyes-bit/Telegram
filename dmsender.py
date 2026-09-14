@@ -26,6 +26,8 @@ from resource_manager import (
     SessionAlreadyOwnedError,
     SessionLifecycleState,
     SessionLease,
+    notify_auditor_stop,
+    notify_auditor_resume,
 )
 from exception_classifier import ErrorCategory, classify_exception
 
@@ -191,9 +193,12 @@ class EnterpriseDMSender:
     # ──────────────────────────────────────────────
 
     async def _get_available_proxies(self) -> int:
-        """Read-only proxy capacity snapshot. Never mutates proxy state."""
+        """Read-only proxy capacity snapshot (login-reserve aware)."""
         if self.proxy_lease_manager is None:
             return 0
+        usable = getattr(self.proxy_lease_manager, "get_usable_count_async", None)
+        if usable is not None:
+            return int(await usable())
         async_cap = getattr(self.proxy_lease_manager, "get_available_count_async", None)
         if async_cap is not None:
             return int(await async_cap())
@@ -567,43 +572,54 @@ class EnterpriseDMSender:
             self.active_task.cancel()
 
     async def execute_dm_campaign(self, target_list: list, message_text: str, media_path: str, limit: int, ui_callback):
-     
+
         self.is_running = True
         self._campaign_halted = False
         self.reset_stats()
         self._campaign_start_time = time.time()
         self._attempt_counts = {}
         self._used_phones = set()
-        self._emit("campaign_start", detail=f"targets={len(target_list) if limit > 0 else len(target_list)}")
+        self._emit("campaign_start", detail=f"targets={len(target_list)}")
+        # Fully stop the background auditor/recovery while the campaign owns the pool.
+        try:
+            notify_auditor_stop()
+        except Exception:
+            pass
+        try:
+            final_text = str(message_text).strip() if message_text else ""
+            if final_text.lower() == "skip" or not final_text:
+                final_text = None
 
-        final_text = str(message_text).strip() if message_text else ""
-        if final_text.lower() == "skip" or not final_text:
-            final_text = None
+            if not final_text and (not media_path or not os.path.exists(str(media_path))):
+                await ui_callback("❌ **Campaign Aborted:** Both Text and Media payload cannot be empty. Setup aborted.")
+                return
 
-        if not final_text and (not media_path or not os.path.exists(str(media_path))):
-            await ui_callback("❌ **Campaign Aborted:** Both Text and Media payload cannot be empty. Setup aborted.")
-            self.is_running = False
-            return
+            all_accounts = await self.db.get_active_target_sessions()
+            if not all_accounts:
+                await ui_callback("❌ **Campaign Aborted:** Koi active verified session nahi mila.")
+                return
 
-        all_accounts = await self.db.get_active_target_sessions()
-        if not all_accounts:
-            await ui_callback("❌ **Campaign Aborted:** Koi active verified session nahi mila.")
-            self.is_running = False
-            return
+            # PATCH 5: terminal accounts never reach worker acquisition.
+            candidate_accounts = self._filter_eligible_accounts(all_accounts)
+            if not candidate_accounts:
+                await ui_callback(
+                    "❌ **Campaign Aborted:** Koi eligible active session nahi mila "
+                    "(all accounts terminal/filtered)."
+                )
+                return
 
-        # PATCH 5: terminal accounts never reach worker acquisition.
-        candidate_accounts = self._filter_eligible_accounts(all_accounts)
-        if not candidate_accounts:
-            await ui_callback(
-                "❌ **Campaign Aborted:** Koi eligible active session nahi mila "
-                "(all accounts terminal/filtered)."
+            return await self._dynamic_rolling_worker(
+                target_list, final_text, media_path, limit, ui_callback, candidate_accounts
             )
+        finally:
+            # Always reset, even on unexpected exceptions — otherwise the
+            # engine reports "Occupied" forever.
             self.is_running = False
-            return
-
-        return await self._dynamic_rolling_worker(
-            target_list, final_text, media_path, limit, ui_callback, candidate_accounts
-        )
+            # Background auditor/recovery can resume now that the campaign is done.
+            try:
+                notify_auditor_resume()
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────
     # Core engine
@@ -770,7 +786,9 @@ class EnterpriseDMSender:
             final_msg = "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
         await ui_callback(final_msg + await self._generate_live_status())
 
-        if media_path and os.path.exists(str(media_path)):
+        # Only clean up the media file when the campaign finished cleanly —
+        # a halted campaign may still need it on resume.
+        if remaining == 0 and not self._campaign_halted and media_path and os.path.exists(str(media_path)):
             try:
                 os.remove(str(media_path))
             except Exception:
@@ -933,14 +951,16 @@ class EnterpriseDMSender:
             access_hash = target.get("access_hash")
             username = target.get("username")
 
-            if username and str(username).strip() and str(username).lower() != "none":
-                u_str = str(username).strip()
-                entity = u_str if u_str.startswith("@") else f"@{u_str}"
-            elif user_id and access_hash and str(access_hash) != "0":
+            # Prefer the pre-resolved InputPeerUser: no extra API call, less
+            # flood exposure. Username is the fallback.
+            if user_id and access_hash and str(access_hash) != "0":
                 try:
                     entity = InputPeerUser(int(user_id), int(access_hash))
                 except Exception:
                     entity = None
+            if not entity and username and str(username).strip() and str(username).lower() != "none":
+                u_str = str(username).strip()
+                entity = u_str if u_str.startswith("@") else f"@{u_str}"
             if not entity and user_id:
                 entity = int(user_id)
         else:
@@ -1035,6 +1055,9 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
         step = state["step"]
 
         if step == "AWAITING_TARGET_SELECTION":
+            if not event.text:
+                await event.reply("❌ Text message chahiye. Group ka naam ya @username type karein.")
+                return
             inp = event.text.strip()
             extracted_targets = []
 
@@ -1069,6 +1092,9 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
                 )
 
         elif step == "AWAITING_LIMIT":
+            if not event.text:
+                await event.reply("❌ Number me type karein ya 'all' likhein.")
+                return
             inp = event.text.strip().lower()
             if inp == "all":
                 limit = len(state['targets'])
