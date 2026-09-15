@@ -1,0 +1,14 @@
+.git
+.kilo
+.venv
+venv
+__pycache__
+.pytest_cache
+node_modules
+frontend/node_modules
+frontend/src
+*.pyc
+*.session
+.web_api_token
+.env
+*.log

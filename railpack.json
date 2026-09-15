@@ -1,11 +1,10 @@
 {
   "$schema": "https://schema.railpack.com",
-  "build": {
-    "provider": "python"
+  "provider": "python",
+  "packages": {
+    "python": "3.11"
   },
   "deploy": {
-    "startCommand": "python main_bot.py",
-    "healthcheckPath": "/health",
-    "healthcheckTimeout": 300
+    "startCommand": "python main_bot.py"
   }
 }
