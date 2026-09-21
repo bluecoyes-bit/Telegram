@@ -346,7 +346,11 @@ def classify_exception(exc: BaseException) -> ConnectionResult:
     # String-based fallbacks for errors not covered by Telethon exception types
     err_str = str(exc).lower()
 
-    if "auth_key_duplicated" in err_str or "duplicated" in err_str:
+    if (
+        "auth_key_duplicated" in err_str
+        or "authkeyduplicated" in err_str
+        or ("authorization key" in err_str and "two different ip" in err_str)
+    ):
         return ConnectionResult(
             success=False,
             category=ErrorCategory.AUTH_KEY_DUPLICATED,
@@ -406,7 +410,7 @@ def classify_exception(exc: BaseException) -> ConnectionResult:
             original_exception=exc,
         )
 
-    if any(k in err_str for k in ("flood", "rate limit", "too many", "spam")):
+    if any(k in err_str for k in ("flood", "rate limit", "too many requests")):
         return ConnectionResult(
             success=False,
             category=ErrorCategory.ACCOUNT_FLOOD,

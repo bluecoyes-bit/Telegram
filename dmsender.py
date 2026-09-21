@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple, Set
 
 from telethon import TelegramClient, events
-from telethon.tl.types import DocumentAttributeAudio, InputPeerUser
+from telethon.tl.types import DocumentAttributeAudio
 from telethon.errors import (
     FloodWaitError, PeerFloodError, SessionRevokedError, AuthKeyDuplicatedError,
 )
@@ -35,27 +35,11 @@ from resource_manager import (
     SessionLease,
     notify_auditor_stop,
     notify_auditor_resume,
+    PROXY_ACQUIRE_TIMEOUT,
 )
 from exception_classifier import ErrorCategory, classify_exception
 
 logger = logging.getLogger("DMSenderEngine")
-
-# #region agent log
-def _agent_dbg(hypothesis_id: str, location: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
-    try:
-        import json as _json
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-b0b96b.log"), "a", encoding="utf-8") as _f:
-            _f.write(_json.dumps({
-                "sessionId": "b0b96b",
-                "hypothesisId": hypothesis_id,
-                "location": location,
-                "message": message,
-                "data": data or {},
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-# #endregion
 
 # Priority Override: ADMIN_ID mapped to environment variable as per system rules
 ADMIN_ID = os.environ.get("ADMIN_ID")
@@ -569,14 +553,6 @@ class EnterpriseDMSender:
             type(exc).__name__,
             category.value,
         )
-        # #region agent log
-        _agent_dbg("H4", "dmsender.py:_handle_operation_error", "classified send error", {
-            "exc_type": type(exc).__name__,
-            "category": category.value,
-            "retryable": bool(result.retryable),
-            "quarantinable": bool(result.is_quarantinable),
-        })
-        # #endregion
         if result.is_quarantinable:
             self._set_worker_state(worker_id, "TERMINAL_ACCOUNT",
                                    phone=phone, detail=category.value)
@@ -598,13 +574,6 @@ class EnterpriseDMSender:
                 if category == ErrorCategory.PEER_FLOOD:
                     await self._park_module_rest(phone, result.reason)
                 self._drop_candidate(phone, candidate_accounts)
-                # #region agent log
-                _agent_dbg("H4", "dmsender.py:_handle_operation_error", "long park dropped candidate", {
-                    "category": category.value,
-                    "park_seconds": park_seconds,
-                    "spam_park": category == ErrorCategory.PEER_FLOOD,
-                })
-                # #endregion
             self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
                                    phone=phone, detail=category.value)
             if self._maybe_requeue(worker_id, phone, target, consume_attempt=False):
@@ -1101,7 +1070,7 @@ class EnterpriseDMSender:
                         module="dmsender",
                         worker_id=f"dm:{clean_phone}",
                         auto_release=True,
-                        timeout=10.0,
+                        timeout=PROXY_ACQUIRE_TIMEOUT,
                     ) as lease:
                         if lease is None:
                             if await self._proxies_exhausted():
@@ -1160,6 +1129,7 @@ class EnterpriseDMSender:
                                         "DM_RESTRICT_RETRY | account=%s | err=%s | retrying this send once",
                                         clean_phone, err_name,
                                     )
+                                    await asyncio.sleep(self._human_delay())
                                     pending_retry = target
                                     continue
                                 _requeue(target)
@@ -1425,183 +1395,7 @@ class EnterpriseDMSender:
         self.worker_states.clear()
         return final_msg
 
-    # ──────────────────────────────────────────────
-    # Single-target processing
-    # ──────────────────────────────────────────────
-
-    async def _handle_target(
-        self,
-        worker_id: int,
-        target: Any,
-        final_text: Optional[str],
-        media_path: str,
-        candidate_accounts: list,
-        busy_accounts: Dict[str, float],
-        rr: Dict[str, int],
-        rr_lock: asyncio.Lock,
-        target_queue: asyncio.Queue,
-        counter: dict,
-    ) -> None:
-        """Process one target: select account -> acquire -> connect -> send.
-
-        Resource starvation (SessionAlreadyOwnedError / lease=None) is treated
-        as WAITING_FOR_ACCOUNT / WAITING_FOR_PROXY and never as a target failure.
-        """
-        phone: Optional[str] = None
-        try:
-            account_doc = await self._select_eligible_account(
-                candidate_accounts, busy_accounts, rr, rr_lock,
-            )
-            if account_doc is None:
-                if not candidate_accounts or self._all_accounts_long_parked(
-                    candidate_accounts, busy_accounts
-                ):
-                    # No account could ever serve this target -> loud failure
-                    # instead of an infinite requeue loop.
-                    self._set_worker_state(worker_id, "TARGET_FAILED",
-                                           detail="no eligible accounts remaining")
-                    self.stats["failed"] += 1
-                    if self._campaign_metrics is not None:
-                        self._campaign_metrics["failed"] += 1
-                    self._emit("send_failure", worker=worker_id,
-                               detail="no eligible accounts remaining")
-                    return
-                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
-                                       detail="no eligible account available")
-                await self._bounded_resource_wait()
-                self._requeue_target(target, target_queue, counter)
-                return
-
-            phone = str(account_doc.get("phone", "") or "").strip()
-            clean_phone = phone.replace("+", "")
-            self._set_worker_state(worker_id, "ACCOUNT_SELECTED",
-                                   phone=clean_phone, detail=clean_phone)
-
-            try:
-                async with self.session_manager.acquire(
-                    clean_phone,
-                    module="dmsender",
-                    worker_id=f"dm:{worker_id}",
-                    auto_release=True,
-                    timeout=10.0,
-                ) as lease:
-                    if lease is None:
-                        busy_accounts[clean_phone] = (
-                            time.monotonic() + self._busy_exclusion_seconds
-                        )
-                        if await self._proxies_exhausted():
-                            self._set_worker_state(worker_id, "WAITING_FOR_PROXY",
-                                                   phone=clean_phone, detail="lease=None")
-                        else:
-                            self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
-                                                   phone=clean_phone, detail="lease=None")
-                            self._handle_contended_lease(clean_phone)
-                        await self._bounded_resource_wait()
-                        self._requeue_target(target, target_queue, counter)
-                        return
-
-                    client = lease.client
-                    self._set_worker_state(worker_id, "CONNECTING", phone=clean_phone)
-                    if not client.is_connected():
-                        await client.connect()
-
-                    self._set_worker_state(worker_id, "AUTHORIZED", phone=clean_phone)
-                    if not await client.is_user_authorized():
-                        raise SessionRevokedError(request=None)
-
-                    self._set_worker_state(worker_id, "PROCESSING", phone=clean_phone)
-                    result = await self._process_target(
-                        client, target, final_text, media_path,
-                    )
-                    self._record_result(worker_id, clean_phone, result)
-                    # Hold the lease through the human delay so another worker
-                    # cannot immediately reuse the same account/IP.
-                    await asyncio.sleep(self._human_delay())
-
-            except SessionAlreadyOwnedError:
-                busy_accounts[clean_phone] = time.monotonic() + self._busy_exclusion_seconds
-                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
-                                       phone=clean_phone,
-                                       detail="SessionAlreadyOwnedError")
-                self._handle_contended_lease(clean_phone)
-                await self._bounded_resource_wait()
-                self._requeue_target(target, target_queue, counter)
-
-            except AuthKeyDuplicatedError:
-                # SessionManager owns quarantine + proxy/client cleanup.
-                # The same session is NEVER retried.
-                self._set_worker_state(worker_id, "TERMINAL_ACCOUNT",
-                                       phone=clean_phone, detail="auth_key_duplicated")
-                await self._handle_terminal_account(
-                    worker_id, clean_phone,
-                    "AuthKeyDuplicatedError in dm_worker",
-                    ErrorCategory.AUTH_KEY_DUPLICATED,
-                    candidate_accounts,
-                )
-                busy_accounts[clean_phone] = time.monotonic() + 3600.0
-                if self._maybe_requeue(worker_id, clean_phone, target):
-                    self._requeue_target(target, target_queue, counter)
-
-            except FloodWaitError as exc:
-                seconds = int(getattr(exc, "seconds", 30) or 30)
-                cap = int(getattr(self, "_flood_delay_cap", 60))
-                busy_accounts[clean_phone] = time.monotonic() + max(seconds, 1)
-                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
-                                       phone=clean_phone, detail=f"flood {seconds}s")
-                # #region agent log
-                _agent_dbg("H5", "dmsender.py:_handle_target", "FloodWait parked account", {
-                    "seconds": seconds,
-                    "cap": cap,
-                    "consume_attempt": seconds <= cap,
-                })
-                # #endregion
-                if seconds <= cap:
-                    await asyncio.sleep(max(0, seconds))
-                # Short waits were spent on this target; count them. Long waits
-                # park the account so other workers can serve the target.
-                if self._maybe_requeue(
-                    worker_id, clean_phone, target,
-                    consume_attempt=(seconds <= cap),
-                ):
-                    self._requeue_target(target, target_queue, counter)
-
-            except PeerFloodError:
-                park_hours = float(CONFIG.get("SPAM_RECHECK_HOURS", 24.0) or 24.0)
-                busy_accounts[clean_phone] = time.monotonic() + park_hours * 3600
-                await self._park_module_rest(clean_phone, "PeerFloodError", park_hours)
-                self._drop_candidate(clean_phone, candidate_accounts)
-                # #region agent log
-                _agent_dbg("H4", "dmsender.py:_handle_target", "PeerFlood parked spam_until (not dead)", {
-                    "park_hours": park_hours,
-                    "marked_failed": False,
-                    "dropped_candidate": True,
-                })
-                # #endregion
-                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
-                                       phone=clean_phone, detail="peer_flood")
-                if self._maybe_requeue(worker_id, clean_phone, target, consume_attempt=False):
-                    self._requeue_target(target, target_queue, counter)
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:
-                if UserBannedInChannelError is not None and isinstance(exc, UserBannedInChannelError):
-                    busy_accounts[clean_phone] = time.monotonic() + 6 * 3600
-                    self._drop_candidate(clean_phone, candidate_accounts)
-                    self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
-                                           phone=clean_phone, detail="account_restricted")
-                    if self._maybe_requeue(worker_id, clean_phone, target, consume_attempt=False):
-                        self._requeue_target(target, target_queue, counter)
-                    return
-                await self._handle_operation_error(
-                    worker_id, clean_phone, target, exc,
-                    candidate_accounts, target_queue, counter,
-                    busy_accounts,
-                )
-
-        except asyncio.CancelledError:
-            raise
+    # Single-target send path is _dynamic_rolling_worker / _process_target.
 
     def _handle_contended_lease(self, clean_phone: str) -> None:
         """Emit a structured waiting signal for a contended session/account."""
@@ -1623,15 +1417,6 @@ class EnterpriseDMSender:
         send_kwargs = {"link_preview": False, "parse_mode": None}
         last_exc: Optional[BaseException] = None
         for entity in entities:
-            # #region agent log
-            _agent_dbg("H2", "dmsender.py:_process_target", "entity resolved", {
-                "target_is_dict": isinstance(target, dict),
-                "entity_kind": type(entity).__name__,
-                "used_input_peer": isinstance(entity, InputPeerUser),
-                "used_raw_int_id": isinstance(entity, int),
-                "used_username": isinstance(entity, str),
-            })
-            # #endregion
             try:
                 if media_path and os.path.exists(str(media_path)):
                     is_voice = str(media_path).lower().endswith((".ogg", ".mp3", ".m4a"))
@@ -1793,12 +1578,6 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
             )
 
         elif step == "AWAITING_TEXT":
-            # #region agent log
-            _agent_dbg("H3", "dmsender.py:wizard_steps", "AWAITING_TEXT input", {
-                "text_is_none": event.text is None,
-                "has_media": bool(getattr(event, "media", None)),
-            })
-            # #endregion
             msg_text = event.text.strip()
             state["text"] = msg_text
 

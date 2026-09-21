@@ -1254,9 +1254,8 @@ class SessionManager:
                 except Exception:
                     pass
 
-            # Honor the caller's timeout for the proxy-wait phase (dmsender
-            # passes a short bound so workers stay responsive); callers that
-            # omit it wait up to one full cooldown window.
+            # Honor the caller's timeout for the proxy-wait phase. Callers that
+            # omit it wait up to one full cooldown window (PROXY_ACQUIRE_TIMEOUT).
             proxy_wait = PROXY_ACQUIRE_TIMEOUT if timeout is None else max(1.0, min(float(timeout), PROXY_ACQUIRE_TIMEOUT))
             if proxy_provider is not None: proxy_record = await proxy_provider(clean_phone)
             elif self.proxy_lease_manager is not None: proxy_record = await self.proxy_lease_manager.acquire_proxy(clean_phone, timeout=proxy_wait)
