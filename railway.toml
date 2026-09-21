@@ -1,5 +1,7 @@
 [build]
 builder = "RAILPACK"
+# Must not be python main_bot.py — that starts Uvicorn and hangs the image build.
+buildCommand = "true"
 
 [deploy]
 startCommand = "python main_bot.py"

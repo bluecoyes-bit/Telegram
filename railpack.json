@@ -4,6 +4,11 @@
   "packages": {
     "python": "3.11"
   },
+  "steps": {
+    "build": {
+      "commands": ["true"]
+    }
+  },
   "deploy": {
     "startCommand": "python main_bot.py"
   }
