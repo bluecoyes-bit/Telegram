@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
+"""Enterprise DM sender engine."""
 
 import os
 import time
 import asyncio
 import logging
 import random
-from datetime import datetime
-from typing import Dict, Any, Optional, List, Tuple
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List, Tuple, Set
 
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeAudio, InputPeerUser
 from telethon.errors import (
-    FloodWaitError, SessionRevokedError, AuthKeyDuplicatedError,
+    FloodWaitError, PeerFloodError, SessionRevokedError, AuthKeyDuplicatedError,
 )
+try:
+    from telethon.errors import UserBannedInChannelError
+except ImportError:
+    UserBannedInChannelError = None
 
 from config import CONFIG
+from database import is_spam_park_active, is_module_rest_active
 from resource_manager import (
     ProxyManager,
     ProxyLeaseManager,
@@ -32,6 +39,23 @@ from resource_manager import (
 from exception_classifier import ErrorCategory, classify_exception
 
 logger = logging.getLogger("DMSenderEngine")
+
+# #region agent log
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        import json as _json
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-b0b96b.log"), "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps({
+                "sessionId": "b0b96b",
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data or {},
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 # Priority Override: ADMIN_ID mapped to environment variable as per system rules
 ADMIN_ID = os.environ.get("ADMIN_ID")
@@ -109,6 +133,99 @@ class _WizardStateStore(dict):
         dict.pop(self, key, None)
 
 
+def _interval_pair(key: str, default: Tuple[float, float]) -> Tuple[float, float]:
+    raw = CONFIG.get(key, default)
+    if isinstance(raw, (tuple, list)) and len(raw) >= 2:
+        low, high = float(raw[0]), float(raw[1])
+        if high < low:
+            low, high = high, low
+        return low, high
+    return default
+
+
+_PEER_FALLBACK_ERRORS = frozenset({
+    "PeerIdInvalidError",
+    "UserIdInvalidError",
+    "UsernameInvalidError",
+    "UsernameNotOccupiedError",
+})
+
+
+def _normalized_username(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text or text.lower() in ("none", "null"):
+        return None
+    return text if text.startswith("@") else f"@{text}"
+
+
+def iter_dm_entities(target: Any):
+    """Yield DM peers that work on a *different* account than the scraper.
+
+    Only @username is cross-account. A scraped access_hash is bound to the
+    scraper session; sending it from another account is PEER_ID_INVALID and
+    was the 971-fail blast. Hash-only / hidden-username users are skipped.
+    """
+    if isinstance(target, dict):
+        username = _normalized_username(target.get("username"))
+        if username:
+            yield username
+        return
+    target_str = str(target).strip()
+    if not target_str:
+        return
+    if target_str.isdigit():
+        yield int(target_str)
+        return
+    yield target_str if target_str.startswith("@") else f"@{target_str}"
+
+
+def resolve_dm_entity(target: Any):
+    """Build a Telethon peer without a doomed raw-id or foreign-hash fallback."""
+    for entity in iter_dm_entities(target):
+        return entity
+    raise ValueError("unresolvable_peer: need access_hash or username")
+
+
+def partition_dm_targets(targets: List[Any]) -> Tuple[list, int]:
+    """Split DM-ready (@username) targets from hidden-username skips."""
+    ready: list = []
+    skipped = 0
+    for target in targets or []:
+        if any(True for _ in iter_dm_entities(target)):
+            ready.append(target)
+        else:
+            skipped += 1
+    return ready, skipped
+
+
+if UserBannedInChannelError is not None:
+    DM_RESTRICTION_ERRORS = (PeerFloodError, UserBannedInChannelError)
+else:
+    DM_RESTRICTION_ERRORS = (PeerFloodError,)
+
+
+def _batch_letter(index: int) -> str:
+    n = max(0, int(index)) + 1
+    out = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
+    return out or "A"
+
+
+def plan_dm_accounts(
+    member_count: int,
+    available_accounts: int,
+    members_per_account: int = 30,
+) -> int:
+    """Use ceil(targets/30) accounts — never more than are available."""
+    if member_count <= 0 or available_accounts <= 0:
+        return 0
+    per = max(1, int(members_per_account))
+    needed = (int(member_count) + per - 1) // per
+    return min(int(available_accounts), max(1, needed))
+
+
 def compute_dm_worker_capacity(
     num_accounts: int,
     available_proxies: int,
@@ -140,9 +257,11 @@ class EnterpriseDMSender:
         self.stats = {
             "total_sent": 0,
             "failed": 0,
+            "skipped": 0,
             "accounts_used": 0,
             "accounts_down": 0,
-            "total_targets": 0
+            "total_targets": 0,
+            "fail_reasons": {},
         }
 
         # P0-CLOSEOUT: DM lifecycle instrumentation
@@ -159,6 +278,11 @@ class EnterpriseDMSender:
         self._busy_exclusion_seconds = 2.0      # don't re-select a busy account faster than this
         self._reporter_interval_seconds = 8.0   # live dashboard refresh interval
         self._human_delay_override: Optional[Tuple[float, float]] = None
+        self._account_launch_delay_override: Optional[Tuple[float, float]] = None
+        self._lease_retry_delay: Tuple[float, float] = (15.0, 30.0)
+        self.resting: List[str] = []
+        self.batch_reports: list = []
+        self._batch_index = 0
         self._flood_delay_cap = int(CONFIG.get("DM_MAX_RETRY_DELAY", 60))
         self.max_target_attempts = 5            # Telegram-visible retry budget per target
         self._attempt_counts: Dict[str, int] = {}
@@ -237,14 +361,8 @@ class EnterpriseDMSender:
         if self._human_delay_override is not None:
             low, high = self._human_delay_override
             return random.uniform(low, high)
-        count = 1
-        if self.proxy_lease_manager is not None:
-            try:
-                count = max(1, int(self.proxy_lease_manager.get_available_count()))
-            except Exception:
-                count = 1
-        base = max(0.5, 45.0 / count)
-        return random.uniform(base, base + 1.0)
+        low, high = _interval_pair("DM_HUMAN_INTERVAL", (25.0, 45.0))
+        return random.uniform(low, high)
 
     # ──────────────────────────────────────────────
     # Account eligibility
@@ -255,6 +373,10 @@ class EnterpriseDMSender:
         for doc in account_docs or []:
             status = str(doc.get("status", "") or "").lower()
             if status in TERMINAL_STATUSES:
+                continue
+            if is_spam_park_active(doc):
+                continue
+            if is_module_rest_active(doc, "dmsender"):
                 continue
             phone = str(doc.get("phone", "") or "").strip()
             if not phone:
@@ -295,6 +417,65 @@ class EnterpriseDMSender:
                 return doc
         return None
 
+    def _all_accounts_long_parked(
+        self,
+        candidate_accounts: list,
+        busy_accounts: Dict[str, float],
+        min_remaining: float = 60.0,
+    ) -> bool:
+        """True when every remaining account is parked longer than min_remaining.
+
+        Distinguishes brief contention (2s busy exclusion) from flood/restriction
+        parks (minutes–hours) so the campaign can finish instead of spinning.
+        """
+        if not candidate_accounts:
+            return True
+        now = time.monotonic()
+        remaining = []
+        for doc in candidate_accounts:
+            phone = str(doc.get("phone", "") or "").strip().replace("+", "")
+            if not phone:
+                continue
+            remaining.append(busy_accounts.get(phone, 0) - now)
+        return bool(remaining) and min(remaining) > min_remaining
+
+    def _mark_account_temporarily_failed(self, phone: str, reason: str) -> None:
+        marker = getattr(self.db, "mark_account_failed", None)
+        if not callable(marker):
+            return
+        try:
+            marker(phone, reason[:120])
+        except Exception:
+            logger.debug("DM_MARK_FAILED_SKIP | phone=%s", phone)
+
+    async def _park_module_rest(self, phone: str, reason: str, hours: Optional[float] = None) -> None:
+        """24h rest for dmsender only. Status stays active; adder can still use it."""
+        if hours is None:
+            hours = float(CONFIG.get("SPAM_RECHECK_HOURS", 24.0) or 24.0)
+        park_async = getattr(self.db, "park_module_rest_async", None)
+        try:
+            if callable(park_async):
+                await park_async(phone, "dmsender", reason[:120], hours)
+                return
+            park_sync = getattr(self.db, "park_module_rest", None)
+            if callable(park_sync):
+                await asyncio.to_thread(park_sync, phone, "dmsender", reason[:120], hours)
+                return
+            park_legacy = getattr(self.db, "park_spam_limited_async", None)
+            if callable(park_legacy):
+                await park_legacy(phone, reason[:120], hours)
+        except Exception:
+            logger.debug("DM_PARK_MODULE_SKIP | phone=%s", phone)
+
+    def _drop_candidate(self, phone: str, candidate_accounts: list) -> None:
+        for doc in list(candidate_accounts or []):
+            candidate_phone = str(doc.get("phone", "") or "").strip().replace("+", "")
+            if candidate_phone == phone:
+                try:
+                    candidate_accounts.remove(doc)
+                except ValueError:
+                    pass
+
     # ──────────────────────────────────────────────
     # Target helpers
     # ──────────────────────────────────────────────
@@ -305,7 +486,10 @@ class EnterpriseDMSender:
         if self._campaign_metrics is not None:
             self._campaign_metrics["queued"] = counter["queued"]
 
-    def _maybe_requeue(self, worker_id: int, phone: str, target: Any) -> bool:
+    def _maybe_requeue(self, worker_id: int, phone: str, target: Any,
+                       consume_attempt: bool = True) -> bool:
+        if not consume_attempt:
+            return True
         key = self._target_key(target)
         self._attempt_counts[key] = self._attempt_counts.get(key, 0) + 1
         if self._attempt_counts[key] >= self.max_target_attempts:
@@ -332,6 +516,7 @@ class EnterpriseDMSender:
             self._set_worker_state(worker_id, "SEND_SUCCESS", phone=phone)
         else:
             self.stats["failed"] += 1
+            self._bump_fail_reason(result)
             if self._campaign_metrics is not None:
                 self._campaign_metrics["failed"] += 1
             self._set_worker_state(worker_id, "TARGET_FAILED", phone=phone, detail=result)
@@ -372,6 +557,7 @@ class EnterpriseDMSender:
         candidate_accounts: list,
         target_queue: asyncio.Queue,
         counter: dict,
+        busy_accounts: Optional[Dict[str, float]] = None,
     ) -> None:
         result = classify_exception(exc)
         category = result.category
@@ -383,6 +569,14 @@ class EnterpriseDMSender:
             type(exc).__name__,
             category.value,
         )
+        # #region agent log
+        _agent_dbg("H4", "dmsender.py:_handle_operation_error", "classified send error", {
+            "exc_type": type(exc).__name__,
+            "category": category.value,
+            "retryable": bool(result.retryable),
+            "quarantinable": bool(result.is_quarantinable),
+        })
+        # #endregion
         if result.is_quarantinable:
             self._set_worker_state(worker_id, "TERMINAL_ACCOUNT",
                                    phone=phone, detail=category.value)
@@ -392,17 +586,44 @@ class EnterpriseDMSender:
             if self._maybe_requeue(worker_id, phone or "", target):
                 self._requeue_target(target, target_queue, counter)
             return
+        park_seconds = {
+            ErrorCategory.PEER_FLOOD: 12 * 3600,
+            ErrorCategory.ACCOUNT_RESTRICTED: 6 * 3600,
+            ErrorCategory.ACCOUNT_FLOOD: 15 * 60,
+        }.get(category)
+        if park_seconds and phone:
+            if busy_accounts is not None:
+                busy_accounts[phone] = time.monotonic() + park_seconds
+            if park_seconds >= 3600:
+                if category == ErrorCategory.PEER_FLOOD:
+                    await self._park_module_rest(phone, result.reason)
+                self._drop_candidate(phone, candidate_accounts)
+                # #region agent log
+                _agent_dbg("H4", "dmsender.py:_handle_operation_error", "long park dropped candidate", {
+                    "category": category.value,
+                    "park_seconds": park_seconds,
+                    "spam_park": category == ErrorCategory.PEER_FLOOD,
+                })
+                # #endregion
+            self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
+                                   phone=phone, detail=category.value)
+            if self._maybe_requeue(worker_id, phone, target, consume_attempt=False):
+                self._requeue_target(target, target_queue, counter)
+            return
         if not result.retryable:
-            # Target-level permanent error (privacy/blocked/invalid target, ...).
             self._set_worker_state(worker_id, "TARGET_FAILED",
                                    phone=phone, detail=category.value)
             self.stats["failed"] += 1
+            self._bump_fail_reason(type(exc).__name__)
             if self._campaign_metrics is not None:
                 self._campaign_metrics["failed"] += 1
+            logger.warning(
+                "DM_TARGET_FAIL | account=%s | err=%s | category=%s | %s",
+                phone or "", type(exc).__name__, category.value, result.reason[:80],
+            )
             self._emit("send_failure", worker=worker_id, phone=phone,
                        detail=f"{category.value}: {result.reason[:60]}")
             return
-        # Transient Telegram/network error: bounded retry keeps the failure visible.
         self._set_worker_state(worker_id, "RETRYING", phone=phone, detail=category.value)
         await self._bounded_resource_wait()
         if self._maybe_requeue(worker_id, phone or "", target):
@@ -417,7 +638,7 @@ class EnterpriseDMSender:
         elapsed_min = elapsed / 60
         rate = round(self.stats['total_sent'] / elapsed_min, 1) if elapsed_min > 0.1 else 0
 
-        remaining = max(0, self.stats['total_targets'] - self.stats['total_sent'] - self.stats['failed'])
+        remaining, progress_pct = self._campaign_remaining_and_pct()
         if rate > 0:
             eta_min = round(remaining / rate)
             eta_str = f"{eta_min // 60}h {(eta_min % 60)}m" if eta_min > 60 else f"{eta_min}m"
@@ -449,6 +670,7 @@ class EnterpriseDMSender:
             snapshot = (
                 f"🎛️ **CAMPAIGN RESOURCES**\n"
                 f"   👥 Eligible Accounts: `{metrics.get('eligible_accounts', 0)}`\n"
+                f"   🎯 Needed / unused: `{metrics.get('accounts_needed', 0)}` / `{metrics.get('unused_spares', 0)}`\n"
                 f"   🧮 Effective Workers: `{metrics.get('effective_worker_capacity', 0)}`\n"
                 f"   ⏳ Queued: `{metrics.get('queued', 0)}` | Inflight: `{metrics.get('inflight', 0)}`\n"
             )
@@ -464,11 +686,13 @@ class EnterpriseDMSender:
             f"📊 **LIVE DM CAMPAIGN DASHBOARD**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📨 Sent: `{self.stats['total_sent']}` | Failed: `{self.stats['failed']}`\n"
+            f"{self._skip_line()}"
+            f"{self._fail_reason_line()}"
             f"🎯 Targets: `{self.stats['total_targets']}`\n"
-            f"   Progress: `{round((self.stats['total_sent'] + self.stats['failed']) / max(1, self.stats['total_targets']) * 100, 1)}%`\n"
+            f"   Progress: `{progress_pct}%`\n"
             f"⚡ Rate: `{rate} msgs/min` | Runtime: `{elapsed // 60}m {elapsed % 60}s` | ETA: `{eta_str}`\n"
             f"👷 Active Workers: `{active_workers}` | Waiting: `{waiting}` | Processing: `{processing}`\n"
-            f"👥 Accounts: used=`{self.stats['accounts_used']}` down=`{self.stats['accounts_down']}`\n"
+            f"👥 Accounts: used=`{self.stats['accounts_used']}` down=`{self.stats['accounts_down']}` rest=`{len(self.resting)}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{snapshot}"
             f"{proxy_stats}"
@@ -482,7 +706,7 @@ class EnterpriseDMSender:
         elapsed_min = elapsed / 60
         rate = round(self.stats['total_sent'] / elapsed_min, 1) if elapsed_min > 0.1 else 0
 
-        remaining = max(0, self.stats['total_targets'] - self.stats['total_sent'] - self.stats['failed'])
+        remaining, progress_pct = self._campaign_remaining_and_pct()
         if rate > 0:
             eta_min = round(remaining / rate)
             eta_str = f"{eta_min // 60}h {(eta_min % 60)}m" if eta_min > 60 else f"{eta_min}m"
@@ -532,8 +756,10 @@ class EnterpriseDMSender:
             f"📨 **MESSAGING METRICS**\n"
             f"   ✅ Sent: `{self.stats['total_sent']}`\n"
             f"   ❌ Failed: `{self.stats['failed']}`\n"
+            f"{self._skip_line()}"
+            f"{self._fail_reason_line()}"
             f"   🎯 Total Targets: `{self.stats['total_targets']}`\n"
-            f"   📈 Progress: `{round((self.stats['total_sent'] + self.stats['failed']) / max(1, self.stats['total_targets']) * 100, 1)}%`\n"
+            f"   📈 Progress: `{progress_pct}%`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡ **PERFORMANCE**\n"
             f"   🚀 Rate: `{rate} msgs/min`\n"
@@ -558,10 +784,39 @@ class EnterpriseDMSender:
         self.stats = {
             "total_sent": 0,
             "failed": 0,
+            "skipped": 0,
             "accounts_used": 0,
             "accounts_down": 0,
-            "total_targets": 0
+            "total_targets": 0,
+            "fail_reasons": {},
         }
+
+    def _bump_fail_reason(self, reason: str) -> None:
+        key = str(reason or "unknown")[:48]
+        reasons = self.stats.setdefault("fail_reasons", {})
+        reasons[key] = int(reasons.get(key, 0) or 0) + 1
+
+    def _fail_reason_line(self) -> str:
+        reasons = self.stats.get("fail_reasons") or {}
+        if not reasons:
+            return ""
+        top = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:4]
+        return "   ⚠️ Fails: `" + ", ".join(f"{k}={v}" for k, v in top) + "`\n"
+
+    def _skip_line(self) -> str:
+        n = int(self.stats.get("skipped") or 0)
+        if n <= 0:
+            return ""
+        return f"⏭️ Skipped (no @username): `{n}`\n"
+
+    def _campaign_remaining_and_pct(self) -> Tuple[int, float]:
+        sent = int(self.stats.get("total_sent") or 0)
+        failed = int(self.stats.get("failed") or 0)
+        skipped = int(self.stats.get("skipped") or 0)
+        total = int(self.stats.get("total_targets") or 0)
+        remaining = max(0, total - sent - failed - skipped)
+        pct = round((sent + failed + skipped) / max(1, total) * 100, 1)
+        return remaining, pct
 
     def halt_campaign(self):
         """Stops the DM campaign immediately (resource cleanup is left to the
@@ -629,49 +884,48 @@ class EnterpriseDMSender:
         self, target_list: list, final_text: Optional[str], media_path: str,
         limit: int, ui_callback, candidate_accounts: list
     ):
-        targets = list(target_list[:limit] if limit > 0 else target_list)
+        ready, skipped_n = partition_dm_targets(list(target_list or []))
+        targets = list(ready[:limit] if limit > 0 else ready)
         candidate_accounts = self._filter_eligible_accounts(candidate_accounts)
-        self.stats["total_targets"] = len(targets)
-        self.stats["accounts_used"] = len(candidate_accounts)
+        self.stats["total_targets"] = len(targets) + skipped_n
+        self.stats["skipped"] = skipped_n
+        self.resting = []
+        self.batch_reports = []
+        self._batch_index = 0
+        if skipped_n:
+            logger.warning(
+                "DM_SKIP_NO_USERNAME | skipped=%s | queued=%s | scraper hashes cannot DM from other accounts",
+                skipped_n, len(targets),
+            )
         self._emit("target_queue_created",
-                   detail=f"targets={len(targets)}, accounts={len(candidate_accounts)}")
+                   detail=f"targets={len(targets)}, skipped={skipped_n}, accounts={len(candidate_accounts)}")
+        if not targets:
+            await ui_callback(
+                "❌ **Campaign Aborted:** Koi DM-ready target nahi mila. "
+                "Hidden username / sirf scraper hash se doosre account DM nahi kar sakte. "
+                "Jin users ke paas `@username` ho unhe scrape karke dubara try karein."
+            )
+            return
 
-        await ui_callback(f"🚀 **DM Engine Started (Dynamic Rolling Batch)!**\n"
-                          f"Targets: `{len(targets)}`, Accounts: `{len(candidate_accounts)}`\n"
-                          f"Concurrency dictated by available proxies.")
+        BATCH_SIZE = max(1, int(CONFIG.get("DM_BATCH_SIZE", 10)))
+        MAX_CONCURRENT_BATCHES = max(1, min(2, int(CONFIG.get("DM_MAX_CONCURRENT_BATCHES", 2))))
+        MEMBERS_PER_ACCOUNT = max(1, int(CONFIG.get("DM_MEMBERS_PER_ACCOUNT", 30)))
+        LIVE_CAP = BATCH_SIZE * MAX_CONCURRENT_BATCHES
+        SHORT_FLOOD_WAIT = max(1, int(CONFIG.get("DM_SHORT_FLOOD_WAIT", 30)))
+        if self._account_launch_delay_override is not None:
+            ACCOUNT_LAUNCH_DELAY = self._account_launch_delay_override
+        else:
+            ACCOUNT_LAUNCH_DELAY = _interval_pair("DM_ACCOUNT_LAUNCH_DELAY", (8.0, 15.0))
 
-        # Campaign resource snapshot (PATCH 5).
-        self._campaign_metrics = {
-            "eligible_accounts": len(candidate_accounts),
-            "available_proxies": 0,
-            "available_session_capacity": 0,
-            "effective_worker_capacity": 0,
-            "target_count": len(targets),
-            "queued": len(targets),
-            "inflight": 0,
-            "completed": 0,
-            "failed": 0,
-            "skipped": 0,
-            "cancelled": 0,
-            "unprocessed": 0,
-        }
-
-        target_queue = asyncio.Queue()
-        for t in targets:
-            target_queue.put_nowait(t)
-
-        counter = {"queued": len(targets), "inflight": 0}
-        busy_accounts: Dict[str, float] = {}
-        active_workers: List[asyncio.Task] = []
-        self._active_workers = active_workers
-
-        _rr = {"idx": 0}
-        _rr_lock = asyncio.Lock()
-
+        n_targets = len(targets)
+        accounts_needed = plan_dm_accounts(
+            n_targets, len(candidate_accounts), MEMBERS_PER_ACCOUNT,
+        )
         try:
             _configured_limit = int(CONFIG.get("DM_MAX_WORKERS", 20))
         except (TypeError, ValueError):
             _configured_limit = 20
+        _configured_limit = min(_configured_limit, LIVE_CAP)
         try:
             _available_proxies = await self._get_available_proxies()
         except Exception:
@@ -681,70 +935,441 @@ class EnterpriseDMSender:
         except Exception:
             _session_capacity = _configured_limit
 
-        num_workers = (
-            compute_dm_worker_capacity(
-                num_accounts=len(candidate_accounts),
-                available_proxies=_available_proxies,
-                session_capacity=_session_capacity,
-                configured_limit=_configured_limit,
+        if accounts_needed <= 0:
+            MAX_LIVE_ACCOUNTS = 0
+        elif _available_proxies > 0:
+            MAX_LIVE_ACCOUNTS = max(
+                1,
+                min(accounts_needed, _configured_limit, _available_proxies, _session_capacity),
             )
-            if candidate_accounts else 0
+        else:
+            MAX_LIVE_ACCOUNTS = max(1, min(accounts_needed, _configured_limit, _session_capacity))
+
+        work_accounts = list(candidate_accounts[:accounts_needed])
+        spare_accounts: deque = deque(candidate_accounts[accounts_needed:])
+        remaining_q: deque = deque(work_accounts)
+        batches_required = (
+            (accounts_needed + BATCH_SIZE - 1) // BATCH_SIZE if accounts_needed else 0
         )
-        self._campaign_metrics.update({
+        self.stats["accounts_used"] = accounts_needed
+        self._campaign_metrics = {
+            "eligible_accounts": len(candidate_accounts),
+            "accounts_needed": accounts_needed,
+            "unused_spares": len(spare_accounts),
+            "batches_required": batches_required,
             "available_proxies": _available_proxies,
             "available_session_capacity": _session_capacity,
-            "effective_worker_capacity": num_workers,
-        })
-        self._emit("worker_started",
-                   detail=f"effective_capacity={num_workers} "
-                          f"(accounts={len(candidate_accounts)}, proxies={_available_proxies}, "
-                          f"session_cap={_session_capacity}, limit={_configured_limit})")
+            "effective_worker_capacity": MAX_LIVE_ACCOUNTS,
+            "target_count": n_targets,
+            "queued": n_targets,
+            "inflight": 0,
+            "completed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "cancelled": 0,
+            "unprocessed": 0,
+        }
+        self._emit(
+            "worker_started",
+            detail=(
+                f"effective_capacity={MAX_LIVE_ACCOUNTS} "
+                f"(needed={accounts_needed}/{len(candidate_accounts)}, "
+                f"spares={len(spare_accounts)}, batches={batches_required}, "
+                f"proxies={_available_proxies})"
+            ),
+        )
+        await ui_callback(
+            f"🚀 **DM Engine Started (2-batch pipeline)**\n"
+            f"Targets: `{n_targets}` · Skipped no-username: `{skipped_n}` · "
+            f"Accounts needed: `{accounts_needed}` / "
+            f"`{len(candidate_accounts)}` · Unused: `{len(spare_accounts)}`\n"
+            f"Batch size `{BATCH_SIZE}` · max parallel `{MAX_CONCURRENT_BATCHES}` · "
+            f"live cap `{MAX_LIVE_ACCOUNTS}`"
+        )
 
-        async def dm_worker(worker_id: int) -> None:
-            self._set_worker_state(worker_id, "STARTED")
+        target_queue: asyncio.Queue = asyncio.Queue()
+        for t in targets:
+            target_queue.put_nowait(t)
+        counter = {"queued": n_targets, "inflight": 0}
+        queue_lock = asyncio.Lock()
+        blocked_phones: Set[str] = set()
+        self._active_workers = []
+        self._batch_tasks: List[asyncio.Task] = []
+        accounts_in_flight = 0
+        in_flight_lock = asyncio.Lock()
+
+        def _phone_key(value: Any) -> str:
+            if isinstance(value, dict):
+                value = value.get("clean_phone") or value.get("phone") or ""
+            return str(value).strip().replace(" ", "").replace("+", "")
+
+        def _is_blocked(doc_or_phone: Any) -> bool:
+            key = _phone_key(doc_or_phone)
+            return bool(key) and key in blocked_phones
+
+        async def _block_for_run(phone: str) -> None:
+            key = _phone_key(phone)
+            if not key:
+                return
+            async with queue_lock:
+                blocked_phones.add(key)
+                kept_rem = deque(d for d in remaining_q if _phone_key(d) != key)
+                remaining_q.clear()
+                remaining_q.extend(kept_rem)
+                kept_sp = deque(d for d in spare_accounts if _phone_key(d) != key)
+                spare_accounts.clear()
+                spare_accounts.extend(kept_sp)
+
+        async def _rest_account_24h(phone: str, err_name: str) -> None:
+            await _block_for_run(phone)
+            hours = float(CONFIG.get("SPAM_RECHECK_HOURS", 24.0) or 24.0)
+            await self._park_module_rest(phone, err_name, hours)
+            until_str = (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M")
+            display = f"+{phone} unavailable (24h DM rest) until {until_str} · {err_name}"
+            self.resting.append(display)
+            logger.warning("DM_REST_24H | %s", display)
             try:
-                while True:
-                    # Stop path: let SessionManager contexts unwind; no new work.
-                    if not self.is_running and counter["inflight"] == 0:
-                        break
-                    try:
-                        target = await asyncio.wait_for(
-                            target_queue.get(),
-                            timeout=self._queue_poll_seconds,
-                        )
-                    except asyncio.TimeoutError:
-                        # Queue is temporarily empty. Only exit when nothing is
-                        # queued AND nothing is in flight (no silent stall).
-                        if counter["queued"] == 0 and counter["inflight"] == 0:
-                            break
-                        continue
-                    if target is None:
-                        break
+                await ui_callback(
+                    f"⏸️ Account +{phone} unavailable for DM · 24h rest · "
+                    f"{err_name} · until {until_str}"
+                )
+            except Exception:
+                pass
 
-                    counter["queued"] = max(0, counter["queued"] - 1)
-                    counter["inflight"] += 1
-                    if self._campaign_metrics is not None:
-                        self._campaign_metrics["queued"] = counter["queued"]
-                        self._campaign_metrics["inflight"] = counter["inflight"]
+        def _note_target_fail(reason: str = "unknown") -> None:
+            self.stats["failed"] += 1
+            self._bump_fail_reason(reason)
+            if self._campaign_metrics is not None:
+                self._campaign_metrics["failed"] += 1
+
+        def _requeue(target: Any) -> None:
+            target_queue.put_nowait(target)
+            counter["queued"] += 1
+            if self._campaign_metrics is not None:
+                self._campaign_metrics["queued"] = counter["queued"]
+
+        async def _pending_accounts() -> bool:
+            async with queue_lock:
+                return any(not _is_blocked(d) for d in remaining_q) or any(
+                    not _is_blocked(d) for d in spare_accounts
+                )
+
+        async def _pop_wave(max_n: int) -> List[dict]:
+            async with queue_lock:
+                wave: List[dict] = []
+                while len(wave) < max_n:
+                    doc = None
+                    if remaining_q:
+                        doc = remaining_q.popleft()
+                    else:
+                        break
+                    if _is_blocked(doc):
+                        continue
+                    wave.append(doc)
+                return wave
+
+        async def _take_replacement() -> Optional[dict]:
+            async with queue_lock:
+                while spare_accounts:
+                    doc = spare_accounts.popleft()
+                    if not _is_blocked(doc):
+                        return doc
+                while remaining_q:
+                    doc = remaining_q.popleft()
+                    if not _is_blocked(doc):
+                        return doc
+                return None
+
+        async def run_one_account(account_doc: dict) -> Tuple[int, bool]:
+            sent_here = 0
+            needs_replace = False
+            if not self.is_running:
+                return 0, False
+            if _is_blocked(account_doc):
+                return 0, True
+            phone = str(account_doc.get("phone", "") or "").strip()
+            clean_phone = phone.replace("+", "")
+            if not clean_phone:
+                return 0, True
+
+            while self.is_running:
+                if _is_blocked(clean_phone):
+                    return sent_here, True
+                try:
+                    async with self.session_manager.acquire(
+                        clean_phone,
+                        module="dmsender",
+                        worker_id=f"dm:{clean_phone}",
+                        auto_release=True,
+                        timeout=10.0,
+                    ) as lease:
+                        if lease is None:
+                            if await self._proxies_exhausted():
+                                self._set_worker_state(
+                                    0, "WAITING_FOR_PROXY",
+                                    phone=clean_phone, detail="lease=None",
+                                )
+                            else:
+                                self._set_worker_state(
+                                    0, "WAITING_FOR_ACCOUNT",
+                                    phone=clean_phone, detail="lease=None",
+                                )
+                            self._handle_contended_lease(clean_phone)
+                            await self._bounded_resource_wait()
+                            if not self.is_running:
+                                return sent_here, False
+                            continue
+
+                        client = lease.client
+                        self._set_worker_state(0, "CONNECTING", phone=clean_phone)
+                        if not client.is_connected():
+                            await client.connect()
+                        if not await client.is_user_authorized():
+                            raise SessionRevokedError(request=None)
+
+                        pending_retry = None
+                        while self.is_running:
+                            is_restriction_retry = False
+                            if pending_retry is not None:
+                                target = pending_retry
+                                pending_retry = None
+                                is_restriction_retry = True
+                            else:
+                                try:
+                                    target = target_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    return sent_here, False
+                                counter["queued"] = max(0, counter["queued"] - 1)
+                                counter["inflight"] += 1
+                                if self._campaign_metrics is not None:
+                                    self._campaign_metrics["queued"] = counter["queued"]
+                                    self._campaign_metrics["inflight"] = counter["inflight"]
+
+                            try:
+                                self._set_worker_state(0, "PROCESSING", phone=clean_phone)
+                                result = await self._process_target(
+                                    client, target, final_text, media_path,
+                                )
+                                self._record_result(0, clean_phone, result)
+                                sent_here += 1
+                                await asyncio.sleep(self._human_delay())
+                            except DM_RESTRICTION_ERRORS as fl_err:
+                                err_name = type(fl_err).__name__
+                                if not is_restriction_retry:
+                                    logger.info(
+                                        "DM_RESTRICT_RETRY | account=%s | err=%s | retrying this send once",
+                                        clean_phone, err_name,
+                                    )
+                                    pending_retry = target
+                                    continue
+                                _requeue(target)
+                                needs_replace = True
+                                logger.warning(
+                                    "DM_RESTRICT_STOP | account=%s | err=%s | target requeued, 24h DM rest",
+                                    clean_phone, err_name,
+                                )
+                                await _rest_account_24h(clean_phone, err_name)
+                                return sent_here, True
+                            except FloodWaitError as exc:
+                                seconds = int(getattr(exc, "seconds", 30) or 30)
+                                _requeue(target)
+                                if 0 < seconds <= SHORT_FLOOD_WAIT:
+                                    self._set_worker_state(
+                                        0, "WAITING_FOR_ACCOUNT",
+                                        phone=clean_phone, detail=f"flood {seconds}s",
+                                    )
+                                    await asyncio.sleep(max(0, seconds))
+                                    continue
+                                needs_replace = True
+                                await _block_for_run(clean_phone)
+                                logger.warning(
+                                    "DM_FLOOD_STOP | account=%s | FloodWait(%ss) | parked this run",
+                                    clean_phone, seconds,
+                                )
+                                return sent_here, True
+                            except AuthKeyDuplicatedError:
+                                await self._handle_terminal_account(
+                                    0, clean_phone,
+                                    "AuthKeyDuplicatedError in dm_worker",
+                                    ErrorCategory.AUTH_KEY_DUPLICATED,
+                                    remaining_q,
+                                )
+                                _requeue(target)
+                                await _block_for_run(clean_phone)
+                                return sent_here, True
+                            except asyncio.CancelledError:
+                                _requeue(target)
+                                raise
+                            except Exception as exc:
+                                result = classify_exception(exc)
+                                if result.is_quarantinable:
+                                    await self._handle_terminal_account(
+                                        0, clean_phone, result.reason,
+                                        result.category, remaining_q,
+                                    )
+                                    _requeue(target)
+                                    await _block_for_run(clean_phone)
+                                    return sent_here, True
+                                if not result.retryable:
+                                    err_name = type(exc).__name__
+                                    _note_target_fail(err_name)
+                                    logger.warning(
+                                        "DM_TARGET_FAIL | account=%s | err=%s | category=%s | %s",
+                                        clean_phone, err_name, result.category.value,
+                                        result.reason[:80],
+                                    )
+                                    self._set_worker_state(
+                                        0, "TARGET_FAILED",
+                                        phone=clean_phone, detail=result.category.value,
+                                    )
+                                    self._emit(
+                                        "send_failure", phone=clean_phone,
+                                        detail=f"{result.category.value}: {result.reason[:60]}",
+                                    )
+                                else:
+                                    _requeue(target)
+                                    await self._bounded_resource_wait()
+                            finally:
+                                if not is_restriction_retry:
+                                    counter["inflight"] = max(0, counter["inflight"] - 1)
+                                    if self._campaign_metrics is not None:
+                                        self._campaign_metrics["inflight"] = counter["inflight"]
+                        return sent_here, needs_replace
+                except SessionAlreadyOwnedError:
+                    self._set_worker_state(
+                        0, "WAITING_FOR_ACCOUNT",
+                        phone=clean_phone, detail="SessionAlreadyOwnedError",
+                    )
+                    self._handle_contended_lease(clean_phone)
+                    await self._bounded_resource_wait()
+                    continue
+                except asyncio.CancelledError:
+                    raise
+            return sent_here, needs_replace
+
+        async def run_slot(account_doc: dict) -> int:
+            added = 0
+            current: Optional[dict] = account_doc
+            while current is not None and self.is_running:
+                n, needs_replace = await run_one_account(current)
+                added += n
+                if not needs_replace or not self.is_running:
+                    break
+                if target_queue.empty():
+                    break
+                nxt = await _take_replacement()
+                if nxt is None or _is_blocked(nxt):
+                    break
+                logger.info(
+                    "DM_ACCOUNT_REPLACE | rested=%s | next=%s | targets_left=%s",
+                    str(current.get("phone", "")).strip(),
+                    str(nxt.get("phone", "")).strip(),
+                    target_queue.qsize(),
+                )
+                try:
+                    await ui_callback(
+                        f"🔁 Replaced +{current.get('phone', '')} with "
+                        f"+{nxt.get('phone', '')} (24h DM rest)"
+                    )
+                except Exception:
+                    pass
+                current = nxt
+            return added
+
+        async def run_batch(wave: List[dict], label: str) -> None:
+            logger.info(
+                "📦 DM Batch %s starting | accounts=%s | targets_left=%s",
+                label, len(wave), target_queue.qsize(),
+            )
+            try:
+                await ui_callback(
+                    f"📦 DM Batch {label} started | accounts={len(wave)}"
+                )
+            except Exception:
+                pass
+            tasks = []
+            for i, doc in enumerate(wave):
+                if not self.is_running:
+                    break
+                if i:
+                    delay = random.uniform(*ACCOUNT_LAUNCH_DELAY)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                task = asyncio.create_task(run_slot(doc))
+                tasks.append(task)
+                self._active_workers.append(task)
+            results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+            sent_this = 0
+            for result in results:
+                if isinstance(result, int):
+                    sent_this += result
+            logger.info(
+                "📦 DM Batch %s sent %s (campaign total=%s)",
+                label, sent_this, self.stats["total_sent"],
+            )
+            self.batch_reports.append({
+                "label": label, "sent": sent_this, "accounts": len(wave),
+            })
+            try:
+                await ui_callback(
+                    f"📦 DM Batch {label} sent {sent_this} "
+                    f"(campaign total={self.stats['total_sent']})"
+                )
+            except Exception:
+                pass
+
+        async def dispatch_batches() -> None:
+            nonlocal accounts_in_flight
+            while self.is_running:
+                live = [t for t in self._batch_tasks if not t.done()]
+                self._batch_tasks = live
+                if target_queue.empty() and self._batch_index > 0:
+                    if live:
+                        await asyncio.gather(*live, return_exceptions=True)
+                    break
+                pending = await _pending_accounts()
+                if not pending:
+                    if live:
+                        await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
+                        continue
+                    break
+                at_batch_cap = len(live) >= MAX_CONCURRENT_BATCHES
+                at_proxy_cap = accounts_in_flight >= MAX_LIVE_ACCOUNTS
+                if at_batch_cap or at_proxy_cap:
+                    if not live:
+                        break
+                    await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
+                    continue
+                room = MAX_LIVE_ACCOUNTS - accounts_in_flight
+                wave = await _pop_wave(min(BATCH_SIZE, room))
+                if not wave:
+                    if live:
+                        await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
+                        continue
+                    break
+                label = _batch_letter(self._batch_index)
+                self._batch_index += 1
+                async with in_flight_lock:
+                    accounts_in_flight += len(wave)
+                wave_size = len(wave)
+
+                async def _guarded(_wave=wave, _label=label, _n=wave_size) -> None:
+                    nonlocal accounts_in_flight
                     try:
-                        await self._handle_target(
-                            worker_id, target, final_text, media_path,
-                            candidate_accounts, busy_accounts, _rr, _rr_lock,
-                            target_queue, counter,
-                        )
+                        await run_batch(_wave, _label)
                     finally:
-                        counter["inflight"] = max(0, counter["inflight"] - 1)
-                        if self._campaign_metrics is not None:
-                            self._campaign_metrics["inflight"] = counter["inflight"]
-            except asyncio.CancelledError:
-                raise
-            finally:
-                self.worker_states.pop(worker_id, None)
-                self._emit("worker_exit", worker=worker_id)
+                        async with in_flight_lock:
+                            accounts_in_flight = max(0, accounts_in_flight - _n)
+
+                task = asyncio.create_task(_guarded())
+                self._batch_tasks.append(task)
+                await asyncio.sleep(0)
+
+            leftover = [t for t in self._batch_tasks if not t.done()]
+            if leftover:
+                await asyncio.gather(*leftover, return_exceptions=True)
 
         async def reporter_loop() -> None:
-            """Reporter stays alive for the whole campaign, even while every
-            worker is temporarily waiting for a resource."""
             self._emit("reporter_start", detail="reporter remains alive while campaign runs")
             while self.is_running:
                 try:
@@ -755,19 +1380,20 @@ class EnterpriseDMSender:
                     pass
                 await asyncio.sleep(self._reporter_interval_seconds)
 
-        # PATCH 5: workers are created BEFORE the reporter starts (no race), and
-        # the reporter is driven by self.is_running, never by bool(workers).
-        for i in range(num_workers):
-            task = asyncio.create_task(dm_worker(i))
-            active_workers.append(task)
         reporter_task = asyncio.create_task(reporter_loop())
-
         try:
-            await asyncio.gather(*active_workers)
+            await dispatch_batches()
         except asyncio.CancelledError:
+            pending = [
+                t for t in list(self._active_workers) + list(self._batch_tasks)
+                if t is not None and not t.done()
+            ]
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             if self._campaign_metrics is not None:
                 self._campaign_metrics["cancelled"] += counter["inflight"]
-            pass
         finally:
             self.is_running = False
             reporter_task.cancel()
@@ -776,24 +1402,26 @@ class EnterpriseDMSender:
             except asyncio.CancelledError:
                 pass
 
+        leftover_q = target_queue.qsize()
         if self._campaign_metrics is not None:
-            self._campaign_metrics["unprocessed"] = counter["queued"] + counter["inflight"]
-
-        remaining = counter["queued"] + counter["inflight"]
+            self._campaign_metrics["unprocessed"] = leftover_q + counter["inflight"]
+        remaining = leftover_q + counter["inflight"]
         if remaining == 0 and not self._campaign_halted:
             final_msg = "✅ **DM CAMPAIGN COMPLETED** ✅\n"
         else:
             final_msg = "⚠️ **DM CAMPAIGN HALTED** ⚠️\n"
+            while True:
+                try:
+                    target_queue.get_nowait()
+                    _note_target_fail()
+                except asyncio.QueueEmpty:
+                    break
         await ui_callback(final_msg + await self._generate_live_status())
-
-        # Only clean up the media file when the campaign finished cleanly —
-        # a halted campaign may still need it on resume.
         if remaining == 0 and not self._campaign_halted and media_path and os.path.exists(str(media_path)):
             try:
                 os.remove(str(media_path))
             except Exception:
                 pass
-
         self.worker_states.clear()
         return final_msg
 
@@ -825,7 +1453,9 @@ class EnterpriseDMSender:
                 candidate_accounts, busy_accounts, rr, rr_lock,
             )
             if account_doc is None:
-                if not candidate_accounts:
+                if not candidate_accounts or self._all_accounts_long_parked(
+                    candidate_accounts, busy_accounts
+                ):
                     # No account could ever serve this target -> loud failure
                     # instead of an infinite requeue loop.
                     self._set_worker_state(worker_id, "TARGET_FAILED",
@@ -884,6 +1514,9 @@ class EnterpriseDMSender:
                         client, target, final_text, media_path,
                     )
                     self._record_result(worker_id, clean_phone, result)
+                    # Hold the lease through the human delay so another worker
+                    # cannot immediately reuse the same account/IP.
+                    await asyncio.sleep(self._human_delay())
 
             except SessionAlreadyOwnedError:
                 busy_accounts[clean_phone] = time.monotonic() + self._busy_exclusion_seconds
@@ -911,22 +1544,60 @@ class EnterpriseDMSender:
 
             except FloodWaitError as exc:
                 seconds = int(getattr(exc, "seconds", 30) or 30)
-                delay = min(max(seconds, 1), int(getattr(self, "_flood_delay_cap", 60)))
-                busy_accounts[clean_phone] = time.monotonic() + delay
+                cap = int(getattr(self, "_flood_delay_cap", 60))
+                busy_accounts[clean_phone] = time.monotonic() + max(seconds, 1)
                 self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
                                        phone=clean_phone, detail=f"flood {seconds}s")
-                # SessionManager already released client+proxy on context exit.
-                await asyncio.sleep(max(0, delay))
-                if self._maybe_requeue(worker_id, clean_phone, target):
+                # #region agent log
+                _agent_dbg("H5", "dmsender.py:_handle_target", "FloodWait parked account", {
+                    "seconds": seconds,
+                    "cap": cap,
+                    "consume_attempt": seconds <= cap,
+                })
+                # #endregion
+                if seconds <= cap:
+                    await asyncio.sleep(max(0, seconds))
+                # Short waits were spent on this target; count them. Long waits
+                # park the account so other workers can serve the target.
+                if self._maybe_requeue(
+                    worker_id, clean_phone, target,
+                    consume_attempt=(seconds <= cap),
+                ):
+                    self._requeue_target(target, target_queue, counter)
+
+            except PeerFloodError:
+                park_hours = float(CONFIG.get("SPAM_RECHECK_HOURS", 24.0) or 24.0)
+                busy_accounts[clean_phone] = time.monotonic() + park_hours * 3600
+                await self._park_module_rest(clean_phone, "PeerFloodError", park_hours)
+                self._drop_candidate(clean_phone, candidate_accounts)
+                # #region agent log
+                _agent_dbg("H4", "dmsender.py:_handle_target", "PeerFlood parked spam_until (not dead)", {
+                    "park_hours": park_hours,
+                    "marked_failed": False,
+                    "dropped_candidate": True,
+                })
+                # #endregion
+                self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
+                                       phone=clean_phone, detail="peer_flood")
+                if self._maybe_requeue(worker_id, clean_phone, target, consume_attempt=False):
                     self._requeue_target(target, target_queue, counter)
 
             except asyncio.CancelledError:
                 raise
 
             except Exception as exc:
+                if UserBannedInChannelError is not None and isinstance(exc, UserBannedInChannelError):
+                    busy_accounts[clean_phone] = time.monotonic() + 6 * 3600
+                    self._drop_candidate(clean_phone, candidate_accounts)
+                    self._set_worker_state(worker_id, "WAITING_FOR_ACCOUNT",
+                                           phone=clean_phone, detail="account_restricted")
+                    if self._maybe_requeue(worker_id, clean_phone, target, consume_attempt=False):
+                        self._requeue_target(target, target_queue, counter)
+                    return
                 await self._handle_operation_error(
                     worker_id, clean_phone, target, exc,
                     candidate_accounts, target_queue, counter,
+                    busy_accounts,
                 )
 
         except asyncio.CancelledError:
@@ -945,46 +1616,49 @@ class EnterpriseDMSender:
         media_path: str,
     ) -> str:
         """Resolve the entity and deliver the DM payload. Returns "sent"."""
-        entity = None
-        if isinstance(target, dict):
-            user_id = target.get("user_id")
-            access_hash = target.get("access_hash")
-            username = target.get("username")
+        entities = list(iter_dm_entities(target))
+        if not entities:
+            raise ValueError("unresolvable_peer: need access_hash or username")
 
-            # Prefer the pre-resolved InputPeerUser: no extra API call, less
-            # flood exposure. Username is the fallback.
-            if user_id and access_hash and str(access_hash) != "0":
-                try:
-                    entity = InputPeerUser(int(user_id), int(access_hash))
-                except Exception:
-                    entity = None
-            if not entity and username and str(username).strip() and str(username).lower() != "none":
-                u_str = str(username).strip()
-                entity = u_str if u_str.startswith("@") else f"@{u_str}"
-            if not entity and user_id:
-                entity = int(user_id)
-        else:
-            target_str = str(target).strip()
-            if target_str.isdigit():
-                entity = int(target_str)
-            else:
-                entity = target_str if target_str.startswith("@") else f"@{target_str}"
-
-        if not entity:
-            raise ValueError("Could not construct entity tokens.")
-
-        if media_path and os.path.exists(str(media_path)):
-            is_voice = str(media_path).lower().endswith((".ogg", ".mp3", ".m4a"))
-            attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
-            await client.send_file(
-                entity, str(media_path), caption=final_text,
-                voice_note=is_voice, attributes=attributes,
-            )
-        else:
-            if final_text is None:
-                raise ValueError("Cannot send an empty text message.")
-            await client.send_message(entity, final_text)
-        return "sent"
+        send_kwargs = {"link_preview": False, "parse_mode": None}
+        last_exc: Optional[BaseException] = None
+        for entity in entities:
+            # #region agent log
+            _agent_dbg("H2", "dmsender.py:_process_target", "entity resolved", {
+                "target_is_dict": isinstance(target, dict),
+                "entity_kind": type(entity).__name__,
+                "used_input_peer": isinstance(entity, InputPeerUser),
+                "used_raw_int_id": isinstance(entity, int),
+                "used_username": isinstance(entity, str),
+            })
+            # #endregion
+            try:
+                if media_path and os.path.exists(str(media_path)):
+                    is_voice = str(media_path).lower().endswith((".ogg", ".mp3", ".m4a"))
+                    attributes = [DocumentAttributeAudio(voice=True)] if is_voice else None
+                    await client.send_file(
+                        entity, str(media_path), caption=final_text,
+                        voice_note=is_voice, attributes=attributes,
+                        parse_mode=None,
+                    )
+                else:
+                    if final_text is None:
+                        raise ValueError("Cannot send an empty text message.")
+                    await client.send_message(entity, final_text, **send_kwargs)
+                return "sent"
+            except Exception as exc:
+                if type(exc).__name__ not in _PEER_FALLBACK_ERRORS:
+                    raise
+                last_exc = exc
+                logger.info(
+                    "DM_PEER_FALLBACK | err=%s | tried=%s",
+                    type(exc).__name__,
+                    type(entity).__name__,
+                )
+                continue
+        if last_exc is not None:
+            raise last_exc
+        raise ValueError("unresolvable_peer: need access_hash or username")
 
 
 def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
@@ -1075,10 +1749,13 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
                     await event.reply("❌ Is group me valid schema lines nahi mili. Phir se chunein.")
                     return
 
+                ready, skipped_n = partition_dm_targets(extracted_targets)
                 state["targets"] = extracted_targets
                 state["step"] = "AWAITING_LIMIT"
                 await event.reply(
-                    f"✅ **{len(state['targets'])} Users extracted mapping metadata structural array successfully!**\n\n"
+                    f"✅ **{len(extracted_targets)} users extracted.**\n"
+                    f"🟢 DM-ready (`@username`): `{len(ready)}`\n"
+                    f"⏭️ Hidden username (skip): `{skipped_n}`\n\n"
                     f"Kitne logo ko message bhejna chahte hain? (Number daalein ya `all` likhein):"
                 )
             else:
@@ -1116,6 +1793,12 @@ def setup_dmsender_handlers(bot: TelegramClient, db, proxy_manager=None,
             )
 
         elif step == "AWAITING_TEXT":
+            # #region agent log
+            _agent_dbg("H3", "dmsender.py:wizard_steps", "AWAITING_TEXT input", {
+                "text_is_none": event.text is None,
+                "has_media": bool(getattr(event, "media", None)),
+            })
+            # #endregion
             msg_text = event.text.strip()
             state["text"] = msg_text
 

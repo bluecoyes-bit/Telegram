@@ -18,7 +18,7 @@ from telethon.tl.functions.messages import (
 )
 from telethon.tl.functions.contacts import GetContactsRequest
 from telethon.errors import *
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -27,14 +27,19 @@ import httpx
 import subprocess
 
 from config import CONFIG, DEVICE_PROFILES
-from database import SuiteDatabase
+from database import (
+    SuiteDatabase,
+    RECOVERABLE_HEALTH_STATUSES,
+    PERMANENT_DEAD_STATUSES,
+    AUDITOR_POOL_STATUSES,
+    MODULE_REST_FIELDS,
+    is_usable_session_key,
+    is_module_rest_active,
+)
 from resource_manager import (
     ProxyManager,
     ProxyLeaseManager,
     AccountLeaseManager,
-    AccountState,
-    TERMINAL_DB_STATUSES,
-    ELIGIBLE_DB_STATUSES,
     SessionManager,
     SessionAlreadyOwnedError,
     SessionLifecycleState,
@@ -90,7 +95,10 @@ from scraper import MemberScraper
 from videochat import CloudVoiceChatEngine
 from adder import EnterpriseMemberAdder, AdderState, status_updater_loop
 from dmsender import setup_dmsender_handlers
-from web_console import console_router, init_console_db, setup_console_routes, init_console_session_manager, shutdown_background_tasks
+from web_console import (
+    console_router, init_console_db, setup_console_routes,
+    init_console_session_manager, shutdown_background_tasks, verify_api_token,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("MasterSuiteBot")
@@ -165,8 +173,199 @@ class AccountStatus(str, Enum):
     QUARANTINED = "quarantined"
 
 
+def account_status_key(acc) -> str:
+    """Canonical lowercase status from a document or raw enum/str value."""
+    raw = acc.get("status") if isinstance(acc, dict) else acc
+    if hasattr(raw, "value"):
+        raw = raw.value
+    return str(raw or "").strip().lower()
+
+
+def is_recoverable_health_account(acc: dict) -> bool:
+    """Failed / restricted / banned — the orange 'Spam Muted' pool."""
+    return account_status_key(acc) in RECOVERABLE_HEALTH_STATUSES
+
+
+def is_auditor_pool_account(acc: dict) -> bool:
+    """Accounts the session auditor may reconnect (must have a session)."""
+    return account_status_key(acc) in AUDITOR_POOL_STATUSES
+
+
+def is_permanent_dead_account(acc: dict) -> bool:
+    return account_status_key(acc) in PERMANENT_DEAD_STATUSES
+
+
+SPAM_RECHECK_HOURS = float(CONFIG.get("SPAM_RECHECK_HOURS", 24.0))
+_DEAD_AUTH_ERROR_NAMES = frozenset({
+    "AuthKeyUnregisteredError", "SessionRevokedError",
+    "UserDeactivatedError", "UserDeactivatedBanError",
+})
+
+
+def is_auth_key_collision(exc: BaseException) -> bool:
+    """Auth key used on two IPs / duplicated — quarantine, never 'proxy skip'."""
+    if type(exc).__name__ in ("AuthKeyDuplicatedError",):
+        return True
+    msg = str(exc).lower()
+    return "authorization key" in msg and (
+        "two" in msg or "duplicat" in msg or "different" in msg
+    )
+
+
+def is_invalid_session_string_error(exc: BaseException) -> bool:
+    return isinstance(exc, ValueError) and "not a valid string" in str(exc).lower()
+
+
+INVALID_SESSION_ERROR = "invalid_session_string"
+
+
+def is_known_invalid_session(acc: dict) -> bool:
+    """Already flagged: do not reconnect or wait 3–6 min on this row again."""
+    err = str(
+        (acc or {}).get("last_error")
+        or (acc or {}).get("revocation_reason")
+        or ""
+    ).lower()
+    return (
+        INVALID_SESSION_ERROR in err
+        or "not a valid string" in err
+        or "invalid session" in err
+    )
+
+
+def _health_scan_log(icon: str, phone: str, detail: str) -> None:
+    logger.info(f"🏥 [HealthScan] {icon} +{phone} · {detail}")
+
+
+def snapshot_proxy_pool(plm: Any, proxy_loaded: int = 0) -> Dict[str, int]:
+    """Live proxy accounting for the console.
+
+    Login reserve is a hold on *free* proxies, not a second lease count.
+    20 workers leased + 2 reserved + 78 free = 100.
+    """
+    leased = 0
+    resting = 0
+    total = 0
+    available = 0
+    reserve = 0
+    try:
+        nodes = getattr(plm, "proxy_nodes", None) or {}
+        cooldown = getattr(plm, "proxy_cooldown", None) or set()
+        total = len(nodes)
+        if nodes:
+            for node in nodes.values():
+                if bool(getattr(node, "is_leased", False)):
+                    leased += 1
+                    continue
+                in_cd = False
+                check = getattr(node, "is_in_cooldown", None)
+                if callable(check):
+                    in_cd = bool(check())
+                pid = getattr(node, "proxy_id", None)
+                if in_cd or (pid is not None and pid in cooldown):
+                    resting += 1
+        else:
+            resting = len(cooldown)
+            stats = getattr(plm, "stats", None) or {}
+            leased = int(stats.get("current_active_leases", 0) or 0)
+        getter = getattr(plm, "get_available_count", None)
+        if callable(getter):
+            available = int(getter() or 0)
+        else:
+            available = max(0, total - leased - resting)
+        limiter = getattr(plm, "login_reserve_limit", None)
+        if callable(limiter):
+            reserve = int(limiter() or 0)
+    except Exception:
+        pass
+    if total <= 0:
+        total = int(proxy_loaded or 0)
+        if available <= 0:
+            available = total
+    reserve = max(0, min(int(reserve), int(available)))
+    return {
+        "total": int(total),
+        "leased": int(leased),
+        "resting": int(resting),
+        "reserved": int(reserve),
+        "free": max(0, int(available) - reserve),
+    }
+
+
+def format_proxy_pool_line(snap: Dict[str, int], next_free_eta: Optional[float] = None) -> str:
+    line = (
+        f"🛡️ Proxy Pool: `{snap['free']}` free • `{snap['resting']}` resting • "
+        f"`{snap['leased']}` leased • 🔐 `{snap['reserved']}` reserved for login "
+        f"(of `{snap['total']}`)"
+    )
+    if snap["free"] == 0 and snap["resting"] > 0 and next_free_eta is not None:
+        line += f" • next free in ~{_fmt_eta(next_free_eta)}"
+    return line
+
+
+def is_dead_auth_error(exc: BaseException) -> bool:
+    return type(exc).__name__ in _DEAD_AUTH_ERROR_NAMES
+
+
+def spam_cooldown_active(acc: dict, now: Optional[datetime] = None) -> bool:
+    """TAO spam_until: live but limited — skip campaigns until the recheck time."""
+    until = acc.get("spam_until") if isinstance(acc, dict) else None
+    if not until:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if isinstance(until, datetime):
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return until > now
+    try:
+        return float(until) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def needs_spam_recheck(acc: dict, now: Optional[datetime] = None) -> bool:
+    """True when a previous SpamBot park has expired (TAO recheck)."""
+    if not (acc or {}).get("spam_until"):
+        return False
+    return not spam_cooldown_active(acc, now)
+
+
+def is_campaign_healthy(acc: dict, now: Optional[datetime] = None) -> bool:
+    """TAO healthy_ids: authorized + status=active + not inside spam_until."""
+    if account_status_key(acc) != AccountStatus.ACTIVE:
+        return False
+    if not safe_session_str(acc if isinstance(acc, dict) else {}):
+        return False
+    if is_known_invalid_session(acc):
+        return False
+    if spam_cooldown_active(acc, now):
+        return False
+    return True
+
+
+def classify_spambot_reply(reply: str) -> str:
+    """Parse @SpamBot text. active | spam_block | spam_block_perm | unknown.
+
+    Unknown must never be stored as healthy (TAO: 宁可不写库，也不能误判为健康).
+    """
+    text = (reply or "").strip()
+    if not text:
+        return "unknown"
+    low = text.lower()
+    if any(s in low for s in ("good news", "no limits", "free as a bird")):
+        return "active"
+    if re.search(r"until\s+\S", text, re.I) or "limited until" in low:
+        return "spam_block"
+    if any(s in low for s in ("limited", "restricted", "cannot", "sorry")):
+        return "spam_block_perm"
+    return "unknown"
+
+
 class ExplorerFilter(str, Enum):
     ACTIVE = "active"
+    SPAM = "spam"
     REVOKED = "revoked"
     PENDING = "pending"
     TODAY = "today"
@@ -255,32 +454,61 @@ class GlobalState:
         live=True always recomputes fresh (used by the /live real-time monitor).
         """
         now = time.time()
-        if not live and now < self._status_bar_expires and self._status_bar_cache:
+        if (
+            not live
+            and now < self._status_bar_expires
+            and self._status_bar_cache
+            and self.auditor_state.get("phase") != "paused"
+        ):
             return self._status_bar_cache
         
         # Cache miss — compute fresh
         total = len(all_sessions)
-        active_cnt = sum(1 for x in all_sessions if x.get("status") == AccountStatus.ACTIVE)
-        revoked_cnt = sum(1 for x in all_sessions if x.get("status") == AccountStatus.REVOKED)
-        pending_cnt = sum(1 for x in all_sessions if x.get("status") in (
+        spam_parked_cnt = sum(
+            1 for x in all_sessions
+            if account_status_key(x) == AccountStatus.ACTIVE and spam_cooldown_active(x)
+        )
+        active_cnt = sum(
+            1 for x in all_sessions
+            if account_status_key(x) == AccountStatus.ACTIVE and not spam_cooldown_active(x)
+        )
+        pending_cnt = sum(1 for x in all_sessions if account_status_key(x) in (
             AccountStatus.PENDING, AccountStatus.TWOFA_REQUIRED))
-        failed_cnt = sum(1 for x in all_sessions if x.get("status") in (
-            AccountStatus.FAILED, AccountStatus.BANNED))
+        failed_cnt = sum(1 for x in all_sessions if is_recoverable_health_account(x))
+        revoked_cnt = sum(
+            1 for x in all_sessions
+            if account_status_key(x) in PERMANENT_DEAD_STATUSES
+            or account_status_key(x) in (
+                AccountStatus.REVOKED, AccountStatus.QUARANTINED, "permanently_failed",
+            )
+        )
         worker_id = CONFIG.get("WORKER_NODE_ID", "worker_01")
-        proxy_count = getattr(proxy_manager, 'working_count', 0)
+        proxy_loaded = int(getattr(proxy_manager, "count", 0) or 0)
+        proxy_count = int(getattr(proxy_manager, "working_count", 0) or 0)
+        if proxy_count <= 0:
+            proxy_count = proxy_loaded
 
         # ── 🔥 LIVE SYSTEM ACTIVITY (auditor / proxy pool / recovery) ──
         now_ts = time.time()
         try:
-            free_proxies = proxy_lease_manager.get_available_count()
-            total_proxies = len(proxy_lease_manager.proxy_nodes)
-            resting_proxies = len(proxy_lease_manager.proxy_cooldown)
-            leased_proxies = int(proxy_lease_manager.stats.get("current_active_leases", 0))
-            cooling_until = [n.cooldown_until for n in proxy_lease_manager.proxy_nodes.values()
-                             if n.is_in_cooldown()]
+            snap = snapshot_proxy_pool(proxy_lease_manager, proxy_loaded)
+            free_proxies = snap["free"]
+            total_proxies = snap["total"]
+            resting_proxies = snap["resting"]
+            leased_proxies = snap["leased"]
+            cooling_until = []
+            nodes = getattr(proxy_lease_manager, "proxy_nodes", None) or {}
+            cooling_until = [
+                n.cooldown_until for n in nodes.values()
+                if callable(getattr(n, "is_in_cooldown", None)) and n.is_in_cooldown()
+            ]
             next_free_eta = (min(cooling_until) - now_ts) if cooling_until else None
         except Exception:
-            free_proxies = resting_proxies = leased_proxies = total_proxies = 0
+            snap = snapshot_proxy_pool(None, proxy_loaded)
+            free_proxies = snap["free"]
+            total_proxies = snap["total"]
+            resting_proxies = snap["resting"]
+            leased_proxies = snap["leased"]
             next_free_eta = None
 
         a = self.auditor_state
@@ -328,32 +556,52 @@ class GlobalState:
         if r.get("last_recovered") is not None:
             recovery_line += f" • last: 🟢 {r.get('last_recovered')} recovered"
 
-        proxy_line = (
-            f"🛡️ Proxy Pool: `{free_proxies}` free • `{resting_proxies}` resting • "
-            f"`{leased_proxies}` leased (of `{total_proxies}`)"
-        )
-        if free_proxies == 0 and resting_proxies > 0 and next_free_eta is not None:
-            proxy_line += f" • next free in ~{_fmt_eta(next_free_eta)}"
-        try:
-            reserve = proxy_lease_manager.login_reserve_limit()
-        except Exception:
-            reserve = 0
-        if reserve > 0:
-            proxy_line += f" • 🔐 {reserve} reserved for login"
+        proxy_line = format_proxy_pool_line(snap, next_free_eta)
 
         feed_lines = []
         for ts, line in list(self.live_feed.items())[-6:]:
             clock = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
             feed_lines.append(f"`{clock}` {line}")
 
+        yellow_line = f"🟡 `{pending_cnt}` Pending / 2FA"
+        adder_rest_cnt = sum(
+            1 for x in all_sessions
+            if account_status_key(x) == AccountStatus.ACTIVE and is_module_rest_active(x, "adder")
+        )
+        dm_rest_cnt = sum(
+            1 for x in all_sessions
+            if account_status_key(x) == AccountStatus.ACTIVE and is_module_rest_active(x, "dmsender")
+        )
+        active_all = sum(
+            1 for x in all_sessions if account_status_key(x) == AccountStatus.ACTIVE
+        )
+        adder_free = sum(
+            1 for x in all_sessions
+            if account_status_key(x) == AccountStatus.ACTIVE
+            and not is_module_rest_active(x, "adder")
+            and not spam_cooldown_active(x)
+        )
+        dm_free = sum(
+            1 for x in all_sessions
+            if account_status_key(x) == AccountStatus.ACTIVE
+            and not is_module_rest_active(x, "dmsender")
+            and not spam_cooldown_active(x)
+        )
         self._status_bar_cache = (
             "**Workspace Overview**\n"
             f"Total Inventory: `{total}` Accounts\n"
-            f"🟢 `{active_cnt}` Active (Good Health)\n"
-            f"🟡 `{pending_cnt}` Pending / 2FA\n"
-            f"🟠 `{failed_cnt}` Failed / Spam Muted (Recoverable)\n"
+            f"🟢 `{active_all}` Active\n"
+            f"**Adder spam**\n"
+            f"🟢 `{adder_free}` free · 🟡 `{adder_rest_cnt}` spam\n"
+            f"**DM Sender spam**\n"
+            f"🟢 `{dm_free}` free · 🟡 `{dm_rest_cnt}` spam\n"
+            f"🐦 `{spam_parked_cnt}` SpamBot limited (recheck {int(SPAM_RECHECK_HOURS)}h)\n"
+            f"{yellow_line}\n"
+            f"🟠 `{failed_cnt}` Failed / Recoverable\n"
             f"🔴 `{revoked_cnt}` Revoked / Dead\n"
-            f"Infrastructure: ⚡ Node `{worker_id}` • 🛡️ `{proxy_count}` Proxies Healthy\n"
+            f"Infrastructure: ⚡ Node `{worker_id}` • 🛡️ `{proxy_count}`"
+            + (f"/`{proxy_loaded}`" if proxy_loaded > proxy_count else "")
+            + " Proxies Healthy\n"
             "\n"
             "**⚙️ System Activity**\n"
             + "\n".join(activity_lines) + "\n"
@@ -554,11 +802,34 @@ async def safe_answer(event, text=None, alert=False):
     except Exception:
         pass
 
+async def evaluate_spambot(client) -> str:
+    """Read @SpamBot reply. TAO: free bird / temp block / perm block / unknown."""
+    await client.send_message("SpamBot", "/start")
+    await asyncio.sleep(4)
+    reply = ""
+    try:
+        async for m in client.iter_messages("SpamBot", limit=5):
+            if getattr(m, "out", False):
+                continue
+            reply = (getattr(m, "message", None) or "").strip()
+            if reply:
+                break
+    except Exception:
+        return "unknown"
+    return classify_spambot_reply(reply)
+
+
 def get_proxy_count() -> int:
     try:
-        return proxy_manager.working_count
-    except AttributeError:
-        return len(proxy_manager.working_proxies) if hasattr(proxy_manager, 'working_proxies') else 0
+        working = int(getattr(proxy_manager, "working_count", 0) or 0)
+        if working > 0:
+            return working
+        loaded = int(getattr(proxy_manager, "count", 0) or 0)
+        if loaded > 0:
+            return loaded
+        return len(getattr(proxy_manager, "working_proxies", []) or [])
+    except Exception:
+        return 0
 
 def clean_phone_input(phone_str: str) -> str:
     if not phone_str:
@@ -586,8 +857,16 @@ def is_admin(sender_id) -> bool:
 
 
 def safe_session_str(record: dict) -> Optional[str]:
-    """Normalize session key: try session_string, then session."""
-    return record.get("session_string") or record.get("session")
+    """Normalize session key: try session_string, then session.
+
+    Reason/error prose (e.g. 'Account terminated: you're banned...') is not
+    a Telethon key and must not be handed to StringSession().
+    """
+    for key in ("session_string", "session"):
+        value = (record or {}).get(key)
+        if is_usable_session_key(value):
+            return str(value).strip()
+    return None
 
 
 def get_device_profile(record: dict) -> dict:
@@ -600,10 +879,74 @@ def get_device_profile(record: dict) -> dict:
     }
 
 
+def until_eta(until: Any, now: Optional[datetime] = None) -> str:
+    """Remaining park time for console labels (`18h`, `40m`, `due`)."""
+    if not until:
+        return ""
+    now = now or datetime.now(timezone.utc)
+    if isinstance(until, datetime):
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        secs = (until - now).total_seconds()
+        if secs <= 0:
+            return "due"
+        if secs >= 3600:
+            return f"{int(secs // 3600)}h"
+        return f"{max(1, int(secs // 60))}m"
+    return ""
+
+
+def spam_park_eta(acc: dict, now: Optional[datetime] = None) -> str:
+    """Remaining SpamBot park time for console labels (`18h`, `40m`, `due`)."""
+    return until_eta((acc or {}).get("spam_until"), now)
+
+
+def module_park_eta(acc: dict, module: str, now: Optional[datetime] = None) -> str:
+    """Remaining adder/DM module spam rest for console labels."""
+    field = MODULE_REST_FIELDS.get(str(module or "").strip().lower())
+    if not field:
+        return ""
+    return until_eta((acc or {}).get(field), now)
+
+
+def format_account_spam_block(record: dict) -> str:
+    """Profile lines: adder spam, DM spam, and SpamBot stay independent."""
+    lines: List[str] = []
+    if is_module_rest_active(record, "adder"):
+        eta = module_park_eta(record, "adder") or "24h"
+        note = str(record.get("adder_rest_note") or "").strip()
+        extra = f" — `{note[:80]}`" if note else ""
+        lines.append(f"🟡 **Adder spam** `{eta}`{extra}")
+    else:
+        lines.append("🟢 **Adder:** free")
+    if is_module_rest_active(record, "dmsender"):
+        eta = module_park_eta(record, "dmsender") or "24h"
+        note = str(record.get("dmsender_rest_note") or "").strip()
+        extra = f" — `{note[:80]}`" if note else ""
+        lines.append(f"🟡 **DM Sender spam** `{eta}`{extra}")
+    else:
+        lines.append("🟢 **DM Sender:** free")
+    if spam_cooldown_active(record):
+        eta = spam_park_eta(record) or "soon"
+        lines.append(f"🐦 **SpamBot:** limited `{eta}`")
+        note = str(record.get("last_error") or "").strip()
+        if note:
+            lines.append(f"SpamBot: `{note[:80]}`")
+    elif account_status_key(record) == AccountStatus.ACTIVE:
+        lines.append("🐦 **SpamBot:** Free as a bird (campaign-ready)")
+    return "\n".join(lines) + "\n"
+
+
 def get_account_label(acc: dict) -> str:
     """Build button label for account explorer."""
     phone_num = str(acc.get("phone", ""))
     status_val = acc.get("status", AccountStatus.PENDING)
+    if spam_cooldown_active(acc):
+        eta = spam_park_eta(acc) or f"{int(SPAM_RECHECK_HOURS)}h"
+        return f"🟡 +{phone_num} • 🚫 spam {eta}"
+
     status_icon = {
         AccountStatus.ACTIVE: "🟢",
         AccountStatus.REVOKED: "🔴",
@@ -613,6 +956,16 @@ def get_account_label(acc: dict) -> str:
         AccountStatus.BANNED: "🔴",
         AccountStatus.RESTRICTED: "🟠",
     }.get(status_val, "⚪")
+
+    rest_tags = []
+    if is_module_rest_active(acc, "adder"):
+        eta = module_park_eta(acc, "adder") or "24h"
+        rest_tags.append(f"adder spam {eta}")
+    if is_module_rest_active(acc, "dmsender"):
+        eta = module_park_eta(acc, "dmsender") or "24h"
+        rest_tags.append(f"DM spam {eta}")
+    if rest_tags:
+        return f"{status_icon} +{phone_num} • {' · '.join(rest_tags)}"
 
     first_name = str(acc.get("first_name") or "").strip()
     name_lbl = f"👤 {first_name} | " if first_name and first_name != "None" else ""
@@ -724,6 +1077,245 @@ async def managed_client(record: dict):
         if not lease:
             raise ConnectionError(f"No eligible session for {phone}")
         yield lease.client
+
+
+_health_scan_lock = asyncio.Lock()
+
+
+async def apply_tao_health_and_spam(client, phone: str) -> str:
+    """TAO split: get_me is session health; SpamBot is free-bird vs limited.
+
+    Returns: active | muted | unknown | dead | empty
+    Live profile always promotes to active. Spam never revokes.
+    Unknown SpamBot reply does not guess healthy and does not park.
+    """
+    try:
+        me = await asyncio.wait_for(client.get_me(), timeout=10.0)
+    except (UserDeactivatedError, UserDeactivatedBanError,
+            SessionRevokedError, AuthKeyUnregisteredError):
+        return "dead"
+    if not me:
+        return "empty"
+
+    session_str = None
+    try:
+        session_str = client.session.save()
+    except Exception:
+        session_str = None
+    await db.promote_authorized_account_async(phone, session_str)
+
+    try:
+        verdict = await evaluate_spambot(client)
+    except Exception:
+        return "unknown"
+    if verdict == "active":
+        await db.clear_spam_until_async(phone)
+        return "active"
+    if verdict == "unknown":
+        return "unknown"
+    await db.park_spam_limited_async(
+        phone, f"SpamBot:{verdict}", SPAM_RECHECK_HOURS)
+    return "muted"
+
+
+async def execute_health_scan(*, limit: Optional[int] = None) -> dict:
+    """TAO health + spam: get_me then SpamBot. Auditor paused for the pass.
+
+    Shared by the Telegram button, `/health_scan`, and POST /api/health-scan.
+    """
+    if _health_scan_lock.locked():
+        logger.warning("🏥 [HealthScan] ⏳ already running · skipped")
+        return {"already_running": True, "scanned": 0, "restored": 0}
+
+    async with _health_scan_lock:
+        stop_auditor()
+        try:
+            restore_stats = await db.unquarantine_recoverable_sessions_async()
+            all_accounts = await db.get_all_accounts_raw()
+            recoverable = [acc for acc in all_accounts if is_recoverable_health_account(acc)]
+            spam_due = [
+                acc for acc in all_accounts
+                if account_status_key(acc) == AccountStatus.ACTIVE
+                and needs_spam_recheck(acc)
+            ]
+            seen_phones = set()
+            queued = []
+            for acc in recoverable + spam_due:
+                phone_key = normalize_phone(str(acc.get("phone", "")))
+                if not phone_key or phone_key in seen_phones:
+                    continue
+                seen_phones.add(phone_key)
+                queued.append(acc)
+            skipped_invalid = [
+                acc for acc in queued
+                if is_known_invalid_session(acc) or not safe_session_str(acc)
+            ]
+            targets = [
+                acc for acc in queued
+                if not is_known_invalid_session(acc) and safe_session_str(acc)
+            ]
+            if limit and limit > 0:
+                targets = targets[: int(limit)]
+
+            recovered = 0
+            still_restricted = 0
+            no_proxy = 0
+            busy = 0
+            dead = 0
+            invalid_new = 0
+            scan_sem = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 10))))
+            scan_delay = CONFIG.get("RECOVERY_ACCOUNT_DELAY", (180, 360))
+
+            logger.info(
+                f"🏥 [HealthScan] 🚀 start · restored {restore_stats.get('restored', 0)} · "
+                f"queue {len(targets)} · skip-invalid {len(skipped_invalid)} · "
+                f"workers {scan_sem._value} · wait {scan_delay[0]}-{scan_delay[1]}s"
+            )
+
+            async def _scan_one(acc):
+                nonlocal recovered, still_restricted, no_proxy, busy, dead, invalid_new
+                phone = normalize_phone(str(acc.get("phone", "")))
+                if is_known_invalid_session(acc) or not safe_session_str(acc):
+                    still_restricted += 1
+                    _health_scan_log("🧩", phone, "bad/missing session · skipped")
+                    return
+                if await account_lease_manager.is_busy(phone) or await session_manager.is_owned(phone):
+                    busy += 1
+                    _health_scan_log("🔒", phone, "busy · skipped")
+                    return
+                async with scan_sem:
+                    await asyncio.sleep(random.uniform(float(scan_delay[0]), float(scan_delay[1])))
+                    try:
+                        async with managed_client(acc) as client:
+                            if not client.is_connected():
+                                try:
+                                    await asyncio.wait_for(client.connect(), timeout=15.0)
+                                except Exception as conn_err:
+                                    if is_auth_key_collision(conn_err):
+                                        dead += 1
+                                        await db.mark_account_revoked_async(
+                                            phone, "AuthKeyDuplicatedError")
+                                        _health_scan_log("⚠️", phone, "auth-key collision → quarantined")
+                                        return
+                                    if is_invalid_session_string_error(conn_err):
+                                        invalid_new += 1
+                                        await db.mark_account_failed_async(
+                                            phone, INVALID_SESSION_ERROR)
+                                        _health_scan_log("🧩", phone, "Not a valid string → skip forever")
+                                        return
+                                    no_proxy += 1
+                                    _health_scan_log("🛡️", phone, f"no proxy · skipped ({conn_err})")
+                                    return
+                            outcome = await apply_tao_health_and_spam(client, phone)
+                            if outcome == "dead":
+                                dead += 1
+                                await db.mark_account_revoked_async(
+                                    phone, "Permanently Banned / Revoked by Telegram.")
+                                _health_scan_log("🪦", phone, "unauthorized / no profile → REVOKED")
+                                return
+                            if outcome == "empty":
+                                still_restricted += 1
+                                _health_scan_log("🟠", phone, "get_me empty · left FAILED")
+                                return
+                            if outcome == "active":
+                                recovered += 1
+                                _health_scan_log("✅", phone, "get_me + SpamBot free as a bird → ACTIVE")
+                                return
+                            if outcome == "muted":
+                                still_restricted += 1
+                                _health_scan_log(
+                                    "🟡", phone,
+                                    f"live session · SpamBot limited · parked "
+                                    f"{int(SPAM_RECHECK_HOURS)}h (not dead)"
+                                )
+                                return
+                            recovered += 1
+                            _health_scan_log(
+                                "⏭️", phone,
+                                "get_me ok → ACTIVE · SpamBot unknown (not guessed)"
+                            )
+                    except SessionAlreadyOwnedError:
+                        busy += 1
+                        _health_scan_log("🔒", phone, "owned at acquire · skipped")
+                    except (UserDeactivatedError, UserDeactivatedBanError,
+                            SessionRevokedError, AuthKeyUnregisteredError) as e:
+                        dead += 1
+                        await db.mark_account_revoked_async(
+                            phone, "Permanently Banned / Revoked by Telegram.")
+                        _health_scan_log("🪦", phone, f"{type(e).__name__} → REVOKED")
+                    except ValueError as e:
+                        invalid_new += 1
+                        await db.mark_account_failed_async(phone, INVALID_SESSION_ERROR)
+                        _health_scan_log("🧩", phone, "Not a valid string → skip forever")
+                    except ConnectionError as e:
+                        no_proxy += 1
+                        _health_scan_log("🛡️", phone, f"no proxy · skipped ({e})")
+                    except Exception as e:
+                        if is_auth_key_collision(e):
+                            dead += 1
+                            _health_scan_log("⚠️", phone, "auth-key collision → quarantined")
+                            return
+                        still_restricted += 1
+                        await db.mark_account_failed_async(phone, "Unstable connectivity")
+                        _health_scan_log("🟠", phone, f"{type(e).__name__} · left FAILED")
+
+            if targets:
+                await asyncio.gather(*[asyncio.create_task(_scan_one(a)) for a in targets])
+
+            updated_all = await db.get_all_accounts_raw()
+            total_active = sum(
+                1 for x in updated_all if account_status_key(x) == AccountStatus.ACTIVE
+            )
+            stats = {
+                "already_running": False,
+                "restored": restore_stats.get("restored", 0),
+                "skipped_permanent": restore_stats.get("skipped_permanent", 0),
+                "no_session": restore_stats.get("no_session", 0),
+                "skipped_invalid": len(skipped_invalid) + invalid_new,
+                "scanned": len(targets),
+                "recovered": recovered,
+                "still_restricted": still_restricted,
+                "dead": dead,
+                "no_proxy": no_proxy,
+                "busy": busy,
+                "active_pool": total_active,
+            }
+            logger.info(
+                f"🏥 [HealthScan] 🏁 done · ✅ {recovered} free-bird · 🟡 {still_restricted} spam-parked · "
+                f"🪦 {dead} dead · 🧩 {stats['skipped_invalid']} bad-session · "
+                f"🛡️ {no_proxy} no-proxy · 🔒 {busy} busy · 🟢 pool {total_active}"
+            )
+            return stats
+        finally:
+            start_auditor()
+
+
+def format_health_scan_report(stats: dict) -> str:
+    if stats.get("already_running"):
+        return "⏳ **Health scan already running.** Try again when the current pass finishes."
+    if not stats.get("scanned"):
+        restored_n = stats.get("restored", 0)
+        if restored_n:
+            return (
+                f"♻️ `{restored_n}` wrongly-killed accounts restored to `failed`, "
+                "but none currently have a usable session for SpamBot recovery."
+            )
+        return "✅ **System Health Excellent:** Koi bhi account 'failed' ya 'muted' state mein nahi hai."
+    return (
+        "🏥 **Health Scan & Recovery Complete!**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"♻️ **Restored wrongly-killed:** `{stats.get('restored', 0)}`\n"
+        f"🔍 **Scanned:** `{stats.get('scanned', 0)}` accounts\n"
+        f"🧩 **Bad session (won't retry):** `{stats.get('skipped_invalid', 0)}`\n"
+        f"🟢 **Free as a bird:** `{stats.get('recovered', 0)}`\n"
+        f"🟡 **Live but SpamBot-limited:** `{stats.get('still_restricted', 0)}` "
+        f"(recheck in {int(SPAM_RECHECK_HOURS)}h)\n"
+        f"🔴 **Unauthorized / Dead:** `{stats.get('dead', 0)}`\n"
+        f"🛡️ **Skipped (No Proxy Available):** `{stats.get('no_proxy', 0)}`\n"
+        f"🔒 **Skipped (Busy on Another Task):** `{stats.get('busy', 0)}`\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 **New Active Pool Size:** `{stats.get('active_pool', 0)}` Accounts ready for use."
+    )
 
 
 # ──────────────────────────────────────────────
@@ -942,6 +1534,10 @@ async def centralized_ui_router(event) -> None:
         buttons = [
             [Button.inline("Login New Account", data="action_init_login"),
              Button.inline("Account Explorer", data="nav_lvl2_explorer")],
+            [Button.inline("🟢 Active", data="set_exp_active"),
+             Button.inline("🐦 SpamBot", data="set_exp_spam")],
+            [Button.inline("🟡 Adder spam", data="set_exp_adder_spam"),
+             Button.inline("🟡 DM spam", data="set_exp_dm_spam")],
             [Button.inline("Reload Sessions", data="action_trigger_reload"),
              Button.inline("Clean Revoked", data="action_trigger_clean")],
             [Button.inline("🏥 Health Scan & Recover Muted", data="action_health_scan")],
@@ -1091,7 +1687,12 @@ async def centralized_ui_router(event) -> None:
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
         filter_map = {
-            "active": lambda x: x.get("status") == AccountStatus.ACTIVE,
+            "active": lambda x: (
+                x.get("status") == AccountStatus.ACTIVE and not spam_cooldown_active(x)
+            ),
+            "spam": lambda x: spam_cooldown_active(x),
+            "adder_spam": lambda x: is_module_rest_active(x, "adder"),
+            "dm_spam": lambda x: is_module_rest_active(x, "dmsender"),
             "revoked": lambda x: x.get("status") == AccountStatus.REVOKED,
             "pending": lambda x: x.get("status") in (AccountStatus.PENDING, AccountStatus.TWOFA_REQUIRED),
             "today": lambda x: (
@@ -1105,7 +1706,10 @@ async def centralized_ui_router(event) -> None:
         filtered = [x for x in all_sessions if pred(x)]
 
         header_map = {
-            "active": "Active Matrix",
+            "active": "Active",
+            "spam": "SpamBot limited",
+            "adder_spam": "Adder spam",
+            "dm_spam": "DM Sender spam",
             "revoked": "Revoked Pool",
             "pending": "Pending Interceptions",
             "today": "Today's Logins",
@@ -1131,7 +1735,7 @@ async def centralized_ui_router(event) -> None:
             f"⚡ **Current View Filter:** `[{header_lbl}]`\n"
             f"📦 **Segment Record:** Showing `{start_idx + 1}–{min(end_idx, total_items)}` of `{total_items}` entries\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Select any identity element node from the catalog below to inspect structural metadata logs."
+            "Select a phone to open its profile. Adder spam and DM spam are separate. 🐦 SpamBot is its own list."
         )
 
         explorer_buttons = []
@@ -1149,11 +1753,16 @@ async def centralized_ui_router(event) -> None:
         ])
         explorer_buttons.append([
             Button.inline("🟢 Active", data="set_exp_active"),
+            Button.inline("🐦 SpamBot", data="set_exp_spam"),
             Button.inline("🔴 Revoked", data="set_exp_revoked"),
-            Button.inline("🟡 Pending", data="set_exp_pending"),
         ])
         explorer_buttons.append([
-            Button.inline("📅 Today's Session Matrix Logs", data="set_exp_today"),
+            Button.inline("🟡 Adder spam", data="set_exp_adder_spam"),
+            Button.inline("🟡 DM spam", data="set_exp_dm_spam"),
+        ])
+        explorer_buttons.append([
+            Button.inline("🟡 Pending", data="set_exp_pending"),
+            Button.inline("📅 Today", data="set_exp_today"),
         ])
         explorer_buttons.append([
             Button.inline("⬅️ Return to Accounts Admin", data="nav_lvl1_accounts"),
@@ -1185,12 +1794,16 @@ async def centralized_ui_router(event) -> None:
             AccountStatus.BANNED: ("Banned", "🔴"),
         }
         status_label, status_icon = status_labels.get(status_val, ("Unknown", "⚪"))
+        spam_line = format_account_spam_block(record)
+        if spam_cooldown_active(record):
+            status_icon, status_label = "🟡", "Active (SpamBot limited)"
 
         profile_text = (
             f"**Account Profile**\n\n"
             f"**Identity**\n"
             f"Phone: `+{record.get('phone')}`\n"
-            f"Status: {status_icon} {status_label}\n\n"
+            f"Status: {status_icon} {status_label}\n"
+            f"{spam_line}\n"
             f"**Device Configuration**\n"
             f"Model: `{record.get('device_model', 'Ubuntu Desktop')}`\n"
             f"OS: `{record.get('system_version', 'Linux Core')}`\n\n"
@@ -1266,81 +1879,16 @@ async def centralized_ui_router(event) -> None:
 
     # ── ACTION: HEALTH SCAN ──
     elif route == "action_health_scan":
-        await event.edit("⚕️ **Global Health Scan & Auto-Recovery Initiated!**\n\nScanning `failed` accounts (human-paced, 3-6 min per account)...", buttons=None)
-
-        all_accounts = await db.get_all_accounts_raw()
-        # FAILED accounts only — banned, restricted and revoked are never touched.
-        failed_accounts = [acc for acc in all_accounts if acc.get("status") == AccountStatus.FAILED]
-
-        if not failed_accounts:
-            await event.edit(
-                "✅ **System Health Excellent:** Koi bhi account 'failed' ya 'muted' state mein nahi hai.",
-                buttons=[[Button.inline("⬅️ Back", data="nav_lvl1_accounts")]],
-            )
-            return
-
-        recovered_count = 0
-        still_restricted = 0
-        no_proxy_count = 0
-        busy_count = 0
-        scan_sem = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 3))))
-        scan_delay = CONFIG.get("RECOVERY_ACCOUNT_DELAY", (180, 360))
-
-        async def _ui_scan_worker(acc):
-            nonlocal recovered_count, still_restricted, no_proxy_count, busy_count
-            phone = normalize_phone(str(acc.get("phone", "")))
-            # FIRST-COME-FIRST-USE LOCK: never touch an account owned by
-            # another task (campaign, login, auditor).
-            if await account_lease_manager.is_busy(phone) or await session_manager.is_owned(phone):
-                busy_count += 1
-                logger.debug(f"[UIHealthScan] +{phone} busy on another task — skipped.")
-                return
-            async with scan_sem:
-                # Human pacing between account scans (3-6 min + micro-jitter).
-                await asyncio.sleep(random.uniform(float(scan_delay[0]), float(scan_delay[1])))
-                if not safe_session_str(acc):
-                    still_restricted += 1
-                    return
-                try:
-                    async with managed_client(acc) as client:
-                        # Connect explicitly; no free proxy = skip, never mark.
-                        if not client.is_connected():
-                            try:
-                                await asyncio.wait_for(client.connect(), timeout=15.0)
-                            except Exception as conn_err:
-                                no_proxy_count += 1
-                                logger.debug(f"[UIHealthScan] +{phone} connect skipped: {conn_err}")
-                                return
-                        if await client.is_user_authorized():
-                            await client.get_me()
-                            await client.send_message("SpamBot", "/start")
-                            await db.update_session_status_async(phone, AccountStatus.ACTIVE, client.session.save())
-                            recovered_count += 1
-                            return
-                        still_restricted += 1
-                except SessionAlreadyOwnedError:
-                    # Safety net: owned at acquire time — never mark it.
-                    busy_count += 1
-                    logger.debug(f"[UIHealthScan] +{phone} owned at acquire time — skipped.")
-                except ConnectionError as e:
-                    # No proxy leaseable / connect refused: skip, never mark failed.
-                    no_proxy_count += 1
-                    logger.debug(f"[UIHealthScan] +{phone} skipped (no proxy/connect): {e}")
-                except Exception:
-                    still_restricted += 1
-
-        await asyncio.gather(*[asyncio.create_task(_ui_scan_worker(a)) for a in failed_accounts])
-
-        report = (
-            "🏥 **Health Scan & Recovery Complete!**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔍 Scanned: `{len(failed_accounts)}` accounts\n"
-            f"🟢 **Successfully Recovered:** `{recovered_count}`\n"
-            f"🟠 **Still Restricted:** `{still_restricted}`\n"
-            f"🛡️ **Skipped (No Proxy Available):** `{no_proxy_count}`\n"
-            f"🔒 **Skipped (Busy on Another Task):** `{busy_count}`\n"
+        await event.edit(
+            "⚕️ **Global Health Scan & Auto-Recovery Initiated!**\n\n"
+            "Restoring wrongly-killed sessions, then scanning failed/muted accounts...",
+            buttons=None,
         )
-        await event.edit(report, buttons=[[Button.inline("⬅️ Back to Accounts", data="nav_lvl1_accounts")]])
+        stats = await execute_health_scan()
+        await event.edit(
+            format_health_scan_report(stats),
+            buttons=[[Button.inline("⬅️ Back to Accounts", data="nav_lvl1_accounts")]],
+        )
 
     # ── ACTION: HALT VOICE ──
     elif route == "action_halt_voice":
@@ -1622,7 +2170,9 @@ async def verify_handler(event) -> None:
         await client.sign_in(phone=clean_phone_with_plus, code=code, phone_code_hash=phone_code_hash)
 
         session_str = client.session.save()
-        db.update_session_status(db_clean_phone, AccountStatus.ACTIVE.value, session_str)
+        db.update_session_status(
+            db_clean_phone, AccountStatus.ACTIVE.value, session_str=session_str
+        )
         if hasattr(db, "save_authorized_session"):
             db.save_authorized_session(db_clean_phone, session_str, AccountStatus.ACTIVE, device, two_fa_password=None)
 
@@ -1986,95 +2536,37 @@ async def clean_banned_accounts_router(event) -> None:
 @bot.on(events.NewMessage(pattern='/restore_spambanned'))
 async def restore_spambanned_router(event) -> None:
     """
-    Restore accounts that were incorrectly marked terminal because the
-    classifier misread a temporary spam restriction
-    (USER_BANNED_IN_CHANNEL) as ACCOUNT_BANNED.
+    Restore accounts that were incorrectly marked terminal (banned / revoked /
+    quarantined / permanently_failed) while they still have a usable session.
 
-    For every account currently in a terminal/quarantined state whose
-    revocation_reason contains spam-restriction text, the command pulls
-    the most recent session string snapshot from `session_backups`,
-    restores it into `source_accounts`, and sets status back to `failed`
-    so the auditor/recovery loop will re-verify it with SpamBot as
-    Telegram lifts the restriction.
+    Uses the live session string first, then `session_backups`. Never restores
+    `auth_key_duplicated`, `deactivated`, or `invalid`. Restored rows go back
+    to `failed` so the auditor (authorized → active) and SpamBot health scan
+    (free as a bird → active) can re-verify them.
     """
     if not is_admin(event.sender_id):
         return
 
     status_msg = await event.reply(
-        "🛠️ **Spam-Ban Misclassification Restore Initiated**\n\n"
-        "Scanning terminal accounts killed by `USER_BANNED_IN_CHANNEL` / spam-restriction misclassification..."
+        "🛠️ **Wrongly-Killed Session Restore Initiated**\n\n"
+        "Moving banned/revoked/quarantined accounts that still have a session back to `failed`..."
     )
 
-    SPAM_REASON_KEYWORDS = [
-        "temporarily banned from sending in supergroups/channels",
-        "user_banned_in_channel",
-        "supergroups/channels",
-        "spam restriction",
-    ]
-
-    restored_count = 0
-    no_backup_count = 0
-    not_misclassified_count = 0
-    errors: list[str] = []
-
     try:
-        all_accounts = await db.get_all_accounts_raw()
-        terminal_statuses = set(TERMINAL_DB_STATUSES)
-
-        for acc in all_accounts:
-            phone = normalize_phone(str(acc.get("phone", "")))
-            status = str(getattr(acc.get("status"), "value", acc.get("status"))).lower()
-            reason = str(acc.get("revocation_reason") or "").lower()
-
-            if status not in terminal_statuses:
-                continue
-            if not any(kw in reason for kw in SPAM_REASON_KEYWORDS):
-                not_misclassified_count += 1
-                continue
-
-            try:
-                backup = db.session_backups.find_one(
-                    {"phone": phone},
-                    sort=[("backup_created_at", -1)],
-                )
-                if not backup:
-                    no_backup_count += 1
-                    logger.warning(f"[RestoreSpamBanned] No backup for {phone}")
-                    continue
-
-                session_snapshot = str(backup.get("session_snapshot") or "").strip()
-                if not session_snapshot or session_snapshot == "None":
-                    no_backup_count += 1
-                    logger.warning(f"[RestoreSpamBanned] Empty backup session for {phone}")
-                    continue
-
-                restored = await db.restore_session_from_backup_async(
-                    phone,
-                    session_snapshot,
-                    reason="Restored from spam-restriction misclassification; pending recovery",
-                )
-                if restored:
-                    restored_count += 1
-                    logger.info(f"[RestoreSpamBanned] Restored +{phone} to failed with backup session")
-                else:
-                    errors.append(f"+{phone}: terminal account no longer present")
-            except Exception as inner:
-                logger.error(f"[RestoreSpamBanned] Failed to restore +{phone}: {inner}", exc_info=True)
-                errors.append(f"+{phone}: {inner}")
+        stats = await db.unquarantine_recoverable_sessions_async()
+        restored_count = stats.get("restored", 0)
+        no_session_count = stats.get("no_session", 0)
+        skipped_permanent = stats.get("skipped_permanent", 0)
 
         report = (
-            "✅ **Spam-Ban Restore Complete**\n"
+            "✅ **Session Restore Complete**\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🟢 **Restored to `failed`:** `{restored_count}`\n"
-            f"🟠 **No usable backup:** `{no_backup_count}`\n"
-            f"🔴 **Terminal but not spam-related:** `{not_misclassified_count}`\n"
-        )
-        if errors:
-            report += f"⚠️ **Errors:** `{len(errors)}`\n"
-            report += "\n".join(f"`{e}`" for e in errors[:10])
-        report += (
+            f"🟠 **Terminal with no usable session:** `{no_session_count}`\n"
+            f"🔴 **Permanent dead (not restored):** `{skipped_permanent}`\n"
             "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "ℹ️ Restored accounts will be re-checked by the auditor/recovery loop via SpamBot."
+            "ℹ️ Restored accounts: auditor marks **authorized → active**; "
+            "health scan marks **SpamBot free as a bird → active**."
         )
         await status_msg.edit(report)
     except Exception as ex:
@@ -2111,89 +2603,10 @@ async def global_health_scan_router(event) -> None:
 
     status_msg = await event.reply(
         "⚕️ **Global Health Scan & Auto-Recovery Initiated!**\n\n"
+        "Restoring wrongly-killed sessions, then scanning failed/muted accounts..."
     )
-
-    all_accounts = await db.get_all_accounts_raw()
-    # Scan FAILED accounts only — banned, restricted and revoked are never touched.
-    failed_accounts = [acc for acc in all_accounts if acc.get("status") == AccountStatus.FAILED]
-
-    if not failed_accounts:
-        await status_msg.edit("✅ **System Health Excellent:** Koi bhi account 'failed' ya 'muted' state mein nahi hai. Auto-recovery ki zaroorat nahi.")
-        return
-
-    recovered_count = 0
-    permanently_dead_count = 0
-    still_restricted_count = 0
-    no_proxy_count = 0
-    busy_count = 0
-    scan_semaphore = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 3))))
-    scan_delay = CONFIG.get("RECOVERY_ACCOUNT_DELAY", (180, 360))
-
-    async def scan_and_recover(acc):
-        nonlocal recovered_count, permanently_dead_count, still_restricted_count, no_proxy_count, busy_count
-        phone = normalize_phone(str(acc.get("phone", "")))
-        # FIRST-COME-FIRST-USE LOCK: an account busy on any other task
-        # (campaign, login, auditor) is never touched by the health scan.
-        if await account_lease_manager.is_busy(phone) or await session_manager.is_owned(phone):
-            busy_count += 1
-            logger.debug(f"[HealthScan] +{phone} busy on another task — skipped.")
-            return
-        async with scan_semaphore:
-            # Human pacing between account scans (3-6 min + micro-jitter).
-            await asyncio.sleep(random.uniform(float(scan_delay[0]), float(scan_delay[1])))
-            session_str = safe_session_str(acc)
-            if not session_str:
-                still_restricted_count += 1
-                return
-
-            try:
-                async with managed_client(acc) as client:
-                    if not await client.is_user_authorized():
-                        raise SessionRevokedError(request=None)
-                    me = await client.get_me()
-                    try:
-                        await client.send_message("SpamBot", "/start")
-                        await db.update_session_status_async(phone, AccountStatus.ACTIVE, client.session.save())
-                        recovered_count += 1
-                    except Exception as spam_err:
-                        still_restricted_count += 1
-                        logger.debug(f"[HealthScan] +{phone} still restricted: {spam_err}")
-                        await db.mark_account_failed_async(phone, f"Still Restricted")
-            except SessionAlreadyOwnedError:
-                # Safety net: account became owned between the pre-check and
-                # the acquire. Never mark it — another task owns it.
-                busy_count += 1
-                logger.debug(f"[HealthScan] +{phone} owned at acquire time — skipped.")
-            except (UserDeactivatedError, UserDeactivatedBanError, SessionRevokedError, AuthKeyUnregisteredError):
-                permanently_dead_count += 1
-                await db.mark_account_revoked_async(phone, "Permanently Banned / Revoked by Telegram.")
-            except ConnectionError as e:
-                # No proxy leaseable / connect refused: skip, never mark failed.
-                no_proxy_count += 1
-                logger.debug(f"[HealthScan] +{phone} skipped (no proxy/connect): {e}")
-            except Exception:
-                still_restricted_count += 1
-                await db.mark_account_failed_async(phone, "Unstable connectivity")
-
-    tasks = [asyncio.create_task(scan_and_recover(acc)) for acc in failed_accounts]
-    await asyncio.gather(*tasks)
-
-    updated_all = await db.get_all_accounts_raw()
-    total_active = sum(1 for x in updated_all if x.get("status") == AccountStatus.ACTIVE)
-
-    report = (
-        "🏥 **Health Scan & Recovery Complete!**\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 Total 'Failed' Scanned: `{len(failed_accounts)}`\n\n"
-        f"🟢 **Successfully Recovered:** `{recovered_count}` (Spam mute lifted!)\n"
-        f"🟠 **Still Restricted/Muted:** `{still_restricted_count}` (Need more time)\n"
-        f"🔴 **Permanently Dead:** `{permanently_dead_count}` (Marked as Revoked)\n"
-        f"🛡️ **Skipped (No Proxy Available):** `{no_proxy_count}`\n"
-        f"🔒 **Skipped (Busy on Another Task):** `{busy_count}`\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 **New Active Pool Size:** `{total_active}` Accounts ready for use."
-    )
-    await status_msg.edit(report)
+    stats = await execute_health_scan()
+    await status_msg.edit(format_health_scan_report(stats))
 
 
 # ──────────────────────────────────────────────
@@ -2443,7 +2856,10 @@ async def run_member_adder_matrix(event) -> None:
 
     try:
         # 1. Initialize State Tracker
-        adder_state = AdderState(total_target=0, max_workers=requested_workers or 10)
+        adder_state = AdderState(
+            total_target=0,
+            max_workers=requested_workers or int(CONFIG.get("ADDER_MAX_WORKER_SESSIONS", 90)),
+        )
 
         # 2. Send initial status message to get message_id
         status_msg_obj = await bot.send_message(chat_id, "🚀 Initializing Enterprise System...")
@@ -2873,8 +3289,12 @@ async def _auditor_run_pass(accounts: list, capacity: int) -> dict:
                 try:
                     ok = await _audit_single_account(acc)
                     dur = time.monotonic() - started
-                    line = (f"✅ +{phone} connected & authorized • {dur:.1f}s" if ok
-                            else f"🪦 +{phone} DEAD • {dur:.1f}s")
+                    if ok is True:
+                        line = f"✅ +{phone} connected & authorized • {dur:.1f}s"
+                    elif ok is False:
+                        line = f"🪦 +{phone} DEAD • {dur:.1f}s"
+                    else:
+                        line = f"⏭ +{phone} skipped (busy/owned) • {dur:.1f}s"
                 except _AuditNoProxy as e:
                     ok = "skip"
                     line = f"⏭ +{phone} skipped (proxy: {str(e)[:80]}) • {time.monotonic() - started:.1f}s"
@@ -2894,6 +3314,8 @@ async def _auditor_run_pass(accounts: list, capacity: int) -> dict:
                     return ("busy",)
                 if ok == "error":
                     return ("failed",)
+                if ok is None:
+                    return ("skipped",)
                 return ("no_proxy",)
             finally:
                 GLOBAL.mark_audit_account_finished(phone)
@@ -2916,7 +3338,8 @@ async def continuous_session_auditor() -> None:
     pass_no = 0
 
     audit_logger.info(
-        "🚀 Session Auditor online (batch mode) — checking ACTIVE + FAILED accounts, "
+        "🚀 Session Auditor online (batch mode) — authorized → ACTIVE, "
+        "unauthorized → REVOKED; skips busy/owned (never DEAD), "
         f"recheck interval={RECHECK_SECONDS // 3600}h, human-paced via the proxy cooldown window."
     )
 
@@ -2929,14 +3352,13 @@ async def continuous_session_auditor() -> None:
                 continue
 
             all_accounts = await db.get_all_accounts_raw()
-            # Auditor pool: ACTIVE accounts (session still alive?) plus FAILED
-            # accounts. BANNED, RESTRICTED and REVOKED accounts are never
-            # touched by the scanner.
+            # TAO split: auditor = live `active` sessions only. Failed/limited
+            # wait for SpamBot after spam_until (health scan / recovery).
             audit_pool = [
                 acc for acc in all_accounts
-                if str(acc.get("status", "")).lower() in (
-                    AccountStatus.ACTIVE, AccountStatus.FAILED,
-                ) and safe_session_str(acc)
+                if is_auditor_pool_account(acc)
+                and not is_permanent_dead_account(acc)
+                and safe_session_str(acc)
             ]
             if not audit_pool:
                 await asyncio.sleep(random.randint(300, 600))
@@ -2975,7 +3397,7 @@ async def continuous_session_auditor() -> None:
             total_batches = (len(due) + BATCH_SIZE - 1) // BATCH_SIZE
             audit_logger.info(
                 f"🔍 Audit pass starting: {len(due)} due of {len(audit_pool)} "
-                f"(active+failed pool), concurrency={capacity}, recheck={RECHECK_SECONDS // 3600}h."
+                f"(authorized→active pool), concurrency={capacity}, recheck={RECHECK_SECONDS // 3600}h."
             )
             GLOBAL.update_auditor_state(
                 phase="scanning", pass_no=pass_no, pool=len(audit_pool), due=len(due),
@@ -3096,37 +3518,46 @@ class _AuditNoProxy(Exception):
 
 
 async def _promote_authorized_failed(account_doc: dict, client, clean_phone: str) -> None:
-    """A FAILED account whose session verifies as authorized is promoted back
-    to ACTIVE (with a fresh session string) so the console reflects reality."""
-    if str(account_doc.get("status", "")).lower() != AccountStatus.FAILED:
+    """Authorized session → ACTIVE, including failed/banned/revoked misclassifications.
+
+    `update_session_status` cannot lift a terminal row, so this uses the
+    explicit promote path. Permanent-dead keys are never lifted.
+    """
+    if is_permanent_dead_account(account_doc):
         return
     try:
-        await db.update_session_status_async(
-            clean_phone, AccountStatus.ACTIVE, client.session.save())
-        audit_logger.info(f"🟢 +{clean_phone} authorized → promoted FAILED → ACTIVE")
-        GLOBAL.push_live_event(f"🟢 +{clean_phone} FAILED → ACTIVE (verified)")
+        session_str = None
+        try:
+            session_str = client.session.save()
+        except Exception:
+            session_str = None
+        lifted = await db.promote_authorized_account_async(clean_phone, session_str)
+        if lifted and account_status_key(account_doc) != AccountStatus.ACTIVE:
+            prev = account_status_key(account_doc).upper() or "UNKNOWN"
+            audit_logger.info(f"🟢 +{clean_phone} authorized → promoted {prev} → ACTIVE")
+            GLOBAL.push_live_event(f"🟢 +{clean_phone} {prev} → ACTIVE (verified)")
     except Exception as e:
         audit_logger.error(f"Promotion failed for +{clean_phone}: {e}")
 
 
-async def _audit_single_account(account_doc: dict) -> bool:
+async def _audit_single_account(account_doc: dict) -> Optional[bool]:
     phone = account_doc.get("phone")
     clean_phone = normalize_phone(str(phone)) if phone else ""
 
     if not clean_phone or not safe_session_str(account_doc):
-        return False
+        return None
 
     # Skip accounts that are currently leased/busy (voice/adder/dm).
     # Ownership is tracked by AccountLeaseManager/SessionManager, not DB locks.
     if await account_lease_manager.is_busy(clean_phone):
         audit_logger.debug(f"🔒 Account +{clean_phone} busy (leased). Skipping audit.")
-        return False
+        return None
 
     # Skip accounts in a login/OTP/2FA reservation or actively leased via
     # SessionManager — the auditor must never overlap an owned session.
     if await session_manager.is_owned(clean_phone):
         audit_logger.debug(f"🔒 Account +{clean_phone} owned (SessionManager). Skipping audit.")
-        return False
+        return None
 
     # ── 🔥 LIGHT CACHING: Skip if recently checked successfully ──
     now = time.time()
@@ -3140,51 +3571,67 @@ async def _audit_single_account(account_doc: dict) -> bool:
 
     try:
         async with managed_client(account_doc) as client:
-            # Ensure connection first
             if not client.is_connected():
                 try:
                     await asyncio.wait_for(client.connect(), timeout=15.0)
+                except AuthKeyDuplicatedError:
+                    raise
                 except Exception as conn_err:
-                    # Most common cause: no proxy leaseable right now (pool
-                    # resting). Skip without marking anything.
-                    audit_logger.debug(f"[SessionCheck] +{clean_phone} connect failed: {conn_err}")
-                    raise _AuditNoProxy(f"connect failed: {conn_err}")
+                    if is_auth_key_collision(conn_err):
+                        reason_failed = "AuthKeyDuplicatedError: Session key already in use"
+                        is_duplicate = True
+                    elif is_invalid_session_string_error(conn_err):
+                        audit_logger.info(
+                            f"[SessionCheck] +{clean_phone} invalid session string — skip"
+                        )
+                        return None
+                    else:
+                        audit_logger.debug(
+                            f"[SessionCheck] +{clean_phone} connect failed: {conn_err}"
+                        )
+                        raise _AuditNoProxy(f"connect failed: {conn_err}")
 
-            # Step 1: Lightweight authorization check
-            authorized, reason = await check_session_authorization(client, clean_phone)
-
-            if authorized:
-                # Account is healthy/authorized - cache timestamp
-                _last_auth_check[clean_phone] = time.time()
-                await _promote_authorized_failed(account_doc, client, clean_phone)
-                await db.mark_account_checked_async(clean_phone)
-                return True
-
-            # Step 2: Handle specific failure reasons
-            if reason == "revoked":
-                reason_failed = "Session revoked/unregistered"
-            elif reason == "unauthorized":
-                reason_failed = "Session unauthorized"
-            elif reason == "timeout":
-                reason_failed = "Authorization check timeout"
-            elif reason == "connection_error":
-                reason_failed = "Connection error"
-            else:
-                # IMPORTANT: For ambiguous/unknown failures, perform ONE deep fallback verification
+            if not is_duplicate:
+                # TAO health_check: get_me() is the source of truth.
+                # is_user_authorized() False is NOT dead — live sessions
+                # stay ACTIVE. Only explicit auth-dead errors revoke.
                 try:
                     me = await asyncio.wait_for(client.get_me(), timeout=10.0)
-                    if me:
-                        # Deep check passed - account is actually healthy
-                        _last_auth_check[clean_phone] = time.time()
-                        await _promote_authorized_failed(account_doc, client, clean_phone)
-                        await db.mark_account_checked_async(clean_phone)
-                        return True
-                    else:
-                        reason_failed = "Deep identity verification failed"
-                except (AuthKeyUnregisteredError, SessionRevokedError):
-                    reason_failed = "Session revoked/unregistered"
+                except (AuthKeyUnregisteredError, SessionRevokedError,
+                        UserDeactivatedError, UserDeactivatedBanError) as e:
+                    reason_failed = f"{type(e).__name__}"
+                except AuthKeyDuplicatedError:
+                    raise
                 except Exception as e:
-                    reason_failed = f"Deep verification failed: {str(e)[:120]}"
+                    if is_auth_key_collision(e):
+                        reason_failed = "AuthKeyDuplicatedError: Session key already in use"
+                        is_duplicate = True
+                    elif is_invalid_session_string_error(e):
+                        audit_logger.info(
+                            f"[SessionCheck] +{clean_phone} invalid session string — skip"
+                        )
+                        return None
+                    else:
+                        audit_logger.info(
+                            f"[SessionCheck] +{clean_phone} get_me skip: {type(e).__name__}: {e}"
+                        )
+                        await db.mark_account_checked_async(clean_phone)
+                        return None
+                else:
+                    if me:
+                        _last_auth_check[clean_phone] = time.time()
+                        await _promote_authorized_failed(
+                            account_doc, client, clean_phone)
+                        await db.mark_account_checked_async(clean_phone)
+                        audit_logger.info(
+                            f"[SessionCheck] +{clean_phone} get_me ok → ACTIVE"
+                        )
+                        return True
+                    audit_logger.info(
+                        f"[SessionCheck] +{clean_phone} get_me empty — skip (not dead)"
+                    )
+                    return None
+
 
     except AuthKeyDuplicatedError as e:
         audit_logger.critical(
@@ -3206,7 +3653,7 @@ async def _audit_single_account(account_doc: dict) -> bool:
         # pre-checks and the acquire. SessionAlreadyOwnedError is a BUSY/skip
         # condition — it must NEVER escalate into an account failure.
         audit_logger.debug(f"🔒 Account +{clean_phone} owned at acquire time. Skipping audit (busy).")
-        return True
+        return None
 
     except (UserDeactivatedError, UserDeactivatedBanError) as e:
         reason_failed = f"Account Terminated: {e}"
@@ -3219,24 +3666,58 @@ async def _audit_single_account(account_doc: dict) -> bool:
             raise _AuditNoProxy(str(e))
         audit_logger.debug(f"🌐 Transient network error for +{clean_phone}")
         await db.mark_account_checked_async(clean_phone)
-        return True
+        return None
+    except FloodWaitError as e:
+        audit_logger.debug(
+            f"⏳ FloodWait {getattr(e, 'seconds', '?')}s for +{clean_phone}; skipping"
+        )
+        return None
+    except ValueError as e:
+        if is_invalid_session_string_error(e):
+            audit_logger.info(
+                f"[SessionCheck] +{clean_phone} invalid session string — skip"
+            )
+            return None
+        audit_logger.info(f"[SessionCheck] +{clean_phone} ValueError skip: {e}")
+        return None
     except (asyncio.TimeoutError, OSError, ssl.SSLError):
         audit_logger.debug(f"🌐 Transient network error for +{clean_phone}")
         await db.mark_account_checked_async(clean_phone)
-        return True  # Not permanently dead, skip
+        return None
     except Exception as e:
-        err_txt = str(e).lower()
-        if any(m in err_txt for m in ["authkey", "sessionrevoked", "expired", "unauthorized",
-                                       "revoked", "deactivated", "banned", "locked", "restricted"]):
-            reason_failed = f"Structural handshake failure: {e}"
+        if is_auth_key_collision(e):
+            reason_failed = "AuthKeyDuplicatedError: Session key already in use"
+            is_duplicate = True
+        elif is_invalid_session_string_error(e):
+            audit_logger.info(
+                f"[SessionCheck] +{clean_phone} invalid session string — skip"
+            )
+            return None
         else:
-            audit_logger.debug(f"Transient operational error for +{clean_phone}: {e}")
-            await db.mark_account_checked_async(clean_phone)
-            return True  # Transient, skip
+            result = classify_exception(e)
+            if result.is_quarantinable:
+                reason_failed = result.reason
+            else:
+                audit_logger.debug(
+                    f"Transient operational error for +{clean_phone}: "
+                    f"{result.category.value}: {e}"
+                )
+                await db.mark_account_checked_async(clean_phone)
+                return None
 
     if reason_failed:
         audit_logger.critical(f"❌ Session +{clean_phone} is dead: {reason_failed}")
-        if not is_duplicate:
+        if is_duplicate:
+            try:
+                await session_manager.mark_quarantined(
+                    clean_phone,
+                    reason="AuthKeyDuplicatedError",
+                    category=ErrorCategory.AUTH_KEY_DUPLICATED,
+                )
+            except Exception:
+                pass
+            db.set_account_state(clean_phone, AccountStatus.AUTH_KEY_DUPLICATED)
+        else:
             db.mark_account_revoked(clean_phone, reason_failed)
         await db.mark_account_checked_async(clean_phone)
 
@@ -3438,13 +3919,33 @@ async def root_health_check():
 async def health_check():
     return {"status": "healthy"}
 
+
+@app.post("/api/health-scan")
+async def api_health_scan(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_token: Optional[str] = Header(default=None),
+    limit: int = Query(0, ge=0, le=500),
+):
+    """Trigger Health Scan & Recover Muted (same path as the Telegram button)."""
+    _ensure_web_api_token()
+    token = str(CONFIG.get("WEB_API_TOKEN") or "").strip()
+    provided = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        provided = authorization[7:].strip()
+    elif x_api_token:
+        provided = x_api_token.strip()
+    if not verify_api_token(provided, token):
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+    return await execute_health_scan(limit=limit or None)
+
 # ──────────────────────────────────────────────
 # 28. AUTO-RECOVERY LOOP
 # ──────────────────────────────────────────────
 
 async def _recover_failed_accounts(failed_accounts: list) -> int:
     recovered = 0
-    semaphore = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 3))))
+    semaphore = asyncio.Semaphore(max(1, int(CONFIG.get("HEALTH_SCAN_CONCURRENCY", 10))))
     acc_delay = CONFIG.get("RECOVERY_ACCOUNT_DELAY", (180, 360))
 
     async def _recover_one(acc) -> bool:
@@ -3452,13 +3953,23 @@ async def _recover_failed_accounts(failed_accounts: list) -> int:
         session_str = safe_session_str(acc)
         if not session_str:
             return False
-
-        # 1) Never attempt terminal accounts (revoked/banned/deactivated/
-        #    invalid/auth_key_duplicated/permanently_failed/quarantined).
-        db_status = str(acc.get("status", "")).lower()
-        if db_status in TERMINAL_DB_STATUSES:
+        if is_known_invalid_session(acc):
             audit_logger.debug(
-                f"RECOVERY_SKIP | +{phone} | terminal status={db_status}"
+                f"RECOVERY_SKIP | +{phone} | known invalid session string"
+            )
+            return False
+
+        # 1) Never attempt permanently-dead keys (auth_key_duplicated /
+        #    deactivated / invalid). Failed/banned/restricted are recoverable.
+        db_status = account_status_key(acc)
+        if db_status in PERMANENT_DEAD_STATUSES:
+            audit_logger.debug(
+                f"RECOVERY_SKIP | +{phone} | permanent-dead status={db_status}"
+            )
+            return False
+        if spam_cooldown_active(acc):
+            audit_logger.debug(
+                f"RECOVERY_SKIP | +{phone} | SpamBot cooldown until {acc.get('spam_until')}"
             )
             return False
         # 2) Never operate on an account currently owned by another worker
@@ -3480,19 +3991,30 @@ async def _recover_failed_accounts(failed_accounts: list) -> int:
                 # Human pacing between account recovery attempts.
                 await asyncio.sleep(random.uniform(float(acc_delay[0]), float(acc_delay[1])))
                 async with managed_client(acc) as client:
-                    if await client.is_user_authorized():
-                        await client.get_me()
-                        await client.send_message("SpamBot", "/start")
-                        await db.update_session_status_async(
-                            phone, AccountStatus.ACTIVE, client.session.save())
-                        audit_logger.info(f"🟢 Recovered +{phone} (spam mute lifted).")
-                        return True
-                    else:
-                        # Retry/terminal classification via managed_client;
-                        # managed_client also refuses to bypass an owned session.
+                    outcome = await apply_tao_health_and_spam(client, phone)
+                    if outcome == "dead":
                         audit_logger.debug(
-                            f"RECOVERY_SKIP | +{phone} | client not authorized"
+                            f"RECOVERY_SKIP | +{phone} | auth-dead during recovery"
                         )
+                        return False
+                    if outcome == "empty":
+                        audit_logger.debug(
+                            f"RECOVERY_SKIP | +{phone} | get_me empty"
+                        )
+                        return False
+                    if outcome == "muted":
+                        audit_logger.debug(
+                            f"RECOVERY_SKIP | +{phone} | SpamBot limited "
+                            f"parked {int(SPAM_RECHECK_HOURS)}h (session still ACTIVE)"
+                        )
+                        return False
+                    if outcome == "unknown":
+                        audit_logger.info(
+                            f"🟢 +{phone} live · SpamBot unknown (not guessed)"
+                        )
+                        return True
+                    audit_logger.info(f"🟢 Recovered +{phone} (free as a bird).")
+                    return True
         except SessionAlreadyOwnedError:
             # Acquire race: account became owned by a worker or login.
             # Skip - never escalate into an account failure.
@@ -3523,14 +4045,30 @@ async def auto_health_recovery_loop() -> None:
             continue
 
         try:
+            restore_stats = await db.unquarantine_recoverable_sessions_async()
             all_accounts = await db.get_all_accounts_raw()
-            # Recovery sweep touches FAILED accounts only — banned, restricted
-            # and revoked accounts are never operated on.
-            failed_accounts = [acc for acc in all_accounts if acc.get("status") == AccountStatus.FAILED]
+            failed_accounts = [
+                acc for acc in all_accounts if is_recoverable_health_account(acc)
+            ]
+            spam_due = [
+                acc for acc in all_accounts
+                if account_status_key(acc) == AccountStatus.ACTIVE
+                and needs_spam_recheck(acc)
+            ]
+            seen = set()
+            sweep_targets = []
+            for acc in failed_accounts + spam_due:
+                key = normalize_phone(str(acc.get("phone", "")))
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                sweep_targets.append(acc)
+            failed_accounts = sweep_targets
 
             if failed_accounts:
                 audit_logger.info(
-                    f"🏥 Recovery sweep starting: {len(failed_accounts)} failed/muted accounts, "
+                    f"🏥 Recovery sweep starting: {len(failed_accounts)} failed/muted accounts "
+                    f"(restored {restore_stats.get('restored', 0)} wrongly-killed), "
                     f"human-paced {CONFIG.get('RECOVERY_ACCOUNT_DELAY', (180, 360))[0]}-"
                     f"{CONFIG.get('RECOVERY_ACCOUNT_DELAY', (180, 360))[1]}s per account."
                 )

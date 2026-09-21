@@ -50,14 +50,108 @@ MAX_PROJECTION_FIELDS = {      # Always fetch only what's needed
     "account_sequence_index": 1, "dc_id": 1, "is_restricted": 1,
     "2fa_password": 1, "revocation_reason": 1, "last_error": 1,
     "proxy": 1, "proxy_updated_at": 1,
+    "spam_until": 1,
+    "adder_rest_until": 1,
+    "dmsender_rest_until": 1,
+    "adder_rest_note": 1,
+    "dmsender_rest_note": 1,
+}
+
+MODULE_REST_FIELDS = {
+    "adder": "adder_rest_until",
+    "dmsender": "dmsender_rest_until",
+}
+MODULE_REST_NOTES = {
+    "adder": "adder_rest_note",
+    "dmsender": "dmsender_rest_note",
 }
 
 # Canonical terminal statuses (PATCH #9): a terminal account is never
-# reactivated by an ordinary worker transition.
+# reactivated by an ordinary worker transition (campaigns / adder / DM).
 TERMINAL_DB_STATUSES = frozenset({
     "revoked", "banned", "deactivated", "invalid",
     "auth_key_duplicated", "permanently_failed", "quarantined",
 })
+
+# SpamBot / health-scan pool. `banned` is also terminal for campaigns, but
+# the console lumps it into "Failed / Spam Muted (Recoverable)" — health
+# scan and restore must see those accounts, not report an empty failed set.
+RECOVERABLE_HEALTH_STATUSES = frozenset({
+    "failed", "restricted", "banned",
+})
+
+# Wrongly-killed / misclassified terminals that can be restored if a
+# session string (live or backup) still exists.
+RESTORABLE_TERMINAL_STATUSES = frozenset({
+    "banned", "revoked", "quarantined", "permanently_failed",
+})
+
+# Session key itself is unusable — never auto-restore or promote.
+PERMANENT_DEAD_STATUSES = frozenset({
+    "auth_key_duplicated", "deactivated", "invalid",
+})
+
+# Auditor is session-liveness only (TAO health_check). Failed/spam-muted
+# accounts are rechecked by SpamBot after spam_until, not mass-revoked here.
+AUDITOR_POOL_STATUSES = frozenset({
+    "active",
+})
+
+# Prose that must never be stored in session / session_string.
+# Telethon StringSession is base64-ish with no spaces; a 100-char
+# "Account terminated: you're banned from sending..." wipe was caused
+# by passing classify_exception().reason as the session_str positional arg.
+_SESSION_REASON_MARKERS = (
+    "account terminated",
+    "banned from sending",
+    "banned at runtime",
+    "not a valid string",
+    "session unauthorized",
+    "authorization key",
+    "caused by invoke",
+    "the channel specified is private",
+)
+
+
+def is_usable_session_key(value: Any) -> bool:
+    """True when `value` looks like a session token, not an error/reason string."""
+    text = str(value or "").strip()
+    if not text or text.lower() in ("none", "null", "nil"):
+        return False
+    if " " in text:
+        return False
+    low = text.lower()
+    return not any(m in low for m in _SESSION_REASON_MARKERS)
+
+
+def _until_is_future(until: Any, now: Optional[datetime] = None) -> bool:
+    if not until:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if isinstance(until, datetime):
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return until > now
+    return False
+
+
+def is_spam_park_active(doc: Any, now: Optional[datetime] = None) -> bool:
+    """True while TAO/SpamBot spam_until is still in the future."""
+    until = doc.get("spam_until") if isinstance(doc, dict) else None
+    return _until_is_future(until, now)
+
+
+def is_module_rest_active(doc: Any, module: str, now: Optional[datetime] = None) -> bool:
+    """True while this module's 24h operation rest is still in the future.
+
+    Adder rest and DM rest are independent. SpamBot spam_until is separate.
+    """
+    field = MODULE_REST_FIELDS.get(str(module or "").strip().lower())
+    if not field or not isinstance(doc, dict):
+        return False
+    return _until_is_future(doc.get(field), now)
 
 # Finite socket timeout for Mongo I/O (PATCH #9). PyMongo defaults to an
 # infinite socket timeout; a stalled server must never hang the process.
@@ -636,6 +730,24 @@ class SuiteDatabase:
         """Internal: strip everything but digits."""
         return str(phone).strip().replace(" ", "").replace("+", "")
 
+    def _coerce_session_key(
+        self, session_str: Any, *, phone: str = "", caller: str = ""
+    ) -> Optional[str]:
+        """Return a writable session token, or None if this is reason/error prose."""
+        if session_str is None:
+            return None
+        text = str(session_str).strip()
+        if not text:
+            return None
+        if is_usable_session_key(text):
+            return text
+        logger.error(
+            "SESSION_WRITE_REJECTED | phone=%s | caller=%s | "
+            "refusing to store reason/error text as session (len=%s)",
+            phone, caller, len(text),
+        )
+        return None
+
     @staticmethod
     def _status_value(status: Any) -> str:
         """Canonical lowercase status string from enum/str (case-safe)."""
@@ -798,13 +910,15 @@ class SuiteDatabase:
             for doc in docs:
                 phone = doc.get("phone")
                 if not phone: continue
-                
+                if is_spam_park_active(doc):
+                    continue
+
                 phone_clean = str(phone).strip().replace(" ", "").replace("+", "")
                 session_token = doc.get("session") or doc.get("session_string")
                 
-                if not session_token or str(session_token).strip() in ("", "None"): continue
+                if not is_usable_session_key(session_token):
+                    continue
                 session_token = str(session_token).strip()
-                if len(session_token) <= 10: continue
                 
                 clean_doc = {
                     "phone": phone_clean,
@@ -821,6 +935,10 @@ class SuiteDatabase:
                     "account_sequence_index": doc.get("account_sequence_index", 1),
                     "last_updated": doc.get("last_updated") or doc.get("timestamp"),
                     "authenticated_at": doc.get("authenticated_at"),
+                    "spam_until": doc.get("spam_until"),
+                    "adder_rest_until": doc.get("adder_rest_until"),
+                    "dmsender_rest_until": doc.get("dmsender_rest_until"),
+                    "status": doc.get("status") or "active",
                 }
                 active_pool.append(clean_doc)
             
@@ -849,7 +967,7 @@ class SuiteDatabase:
                 return False
             
             session_str = str(original_doc.get("session_string") or original_doc.get("session") or "").strip()
-            if not session_str or session_str == "None":
+            if not is_usable_session_key(session_str):
                 return False
             
             backup_payload = {
@@ -900,10 +1018,15 @@ class SuiteDatabase:
                 "app_version": "4.8.4"
             }
 
+        usable = self._coerce_session_key(
+            session_str, phone=clean_phone, caller="save_pending_session"
+        )
+        if not usable:
+            return
         payload = {
             "phone": clean_phone,
-            "session": session_str,
-            "session_string": session_str,
+            "session": usable,
+            "session_string": usable,
             "status": self._status_value(status),
             "phone_code_hash": phone_code_hash,
             "device_model": final_device["device_model"],
@@ -958,10 +1081,15 @@ class SuiteDatabase:
 
         self._check_open()
 
+        usable = self._coerce_session_key(
+            session_str, phone=clean_phone, caller="save_authorized_session"
+        )
+        if not usable:
+            return
         set_payload = {
             "phone": clean_phone,
-            "session_string": str(session_str),
-            "session": str(session_str),
+            "session_string": usable,
+            "session": usable,
             "status": self._status_value(status),
             "device_model": device.get("device_model", "PC 64bit"),
             "system_version": device.get("system_version", "Windows 11"),
@@ -1002,7 +1130,7 @@ class SuiteDatabase:
             device, two_fa_password,
         )
 
-    def update_session_status(self, phone: str, status: str, session_str: Optional[str] = None, reason: Optional[str] = None):
+    def update_session_status(self, phone: str, status: str, session_str: Optional[str] = None, *, reason: Optional[str] = None):
         """
         Set/refresh account status.
 
@@ -1011,13 +1139,21 @@ class SuiteDatabase:
         auth_key_duplicated, ...). This prevents a stale worker from
         reactivating a terminal account through the plain update path.
 
-        `reason` is stored in revocation_reason — it must NEVER be passed as
-        session_str (that would overwrite the session string with text).
+        `reason` is keyword-only and stored in revocation_reason.
+        A reason/error sentence passed as `session_str` is refused (it used
+        to overwrite the Telethon key and produce 142 'Not a valid string' flags).
         """
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
         self._check_open()
+        usable = self._coerce_session_key(
+            session_str, phone=clean_phone, caller="update_session_status"
+        )
+        if session_str and not usable:
+            if not reason:
+                reason = str(session_str)[:500]
+            session_str = None
         self.backup_original_session(clean_phone)
         target_status = self._status_value(status)
         query: dict = {"phone": clean_phone}
@@ -1027,9 +1163,9 @@ class SuiteDatabase:
             "status": target_status,
             "last_updated": datetime.now(timezone.utc),
         }
-        if session_str:
-            update_data["session"] = session_str
-            update_data["session_string"] = session_str
+        if usable:
+            update_data["session"] = usable
+            update_data["session_string"] = usable
         if reason:
             update_data["revocation_reason"] = str(reason)[:500]
         try:
@@ -1051,11 +1187,11 @@ class SuiteDatabase:
 
     async def update_session_status_async(
         self, phone: str, status: str, session_str: Optional[str] = None,
-        reason: Optional[str] = None,
+        *, reason: Optional[str] = None,
     ) -> None:
         """Async-safe status refresh."""
         return await self._run_sync(
-            self.update_session_status, phone, status, session_str, reason,
+            self.update_session_status, phone, status, session_str, reason=reason,
         )
 
     def restore_session_from_backup(
@@ -1063,13 +1199,16 @@ class SuiteDatabase:
     ) -> bool:
         """Restore a known-good session after an intentional terminal override."""
         clean_phone = self._normalize(phone)
-        if not clean_phone or not str(session_str).strip():
+        usable = self._coerce_session_key(
+            session_str, phone=clean_phone, caller="restore_session_from_backup"
+        )
+        if not clean_phone or not usable:
             return False
         self._check_open()
         update_data = {
             "status": self._status_value("failed"),
-            "session": str(session_str),
-            "session_string": str(session_str),
+            "session": usable,
+            "session_string": usable,
             "last_updated": datetime.now(timezone.utc),
         }
         if reason:
@@ -1098,6 +1237,200 @@ class SuiteDatabase:
             self.restore_session_from_backup, phone, session_str, reason,
         )
 
+    def promote_authorized_account(
+        self, phone: str, session_str: Optional[str] = None
+    ) -> bool:
+        """Session verified live (`get_me`). Lift to active.
+
+        Does not clear `spam_until` — SpamBot is a separate check (TAO).
+        Never lifts `auth_key_duplicated` / `deactivated` / `invalid`.
+        """
+        clean_phone = self._normalize(phone)
+        if not clean_phone:
+            return False
+        self._check_open()
+        update_data = {
+            "status": "active",
+            "last_updated": datetime.now(timezone.utc),
+            "last_checked_time": datetime.now(timezone.utc),
+            "last_error": "",
+        }
+        if session_str:
+            usable = self._coerce_session_key(
+                session_str, phone=clean_phone, caller="promote_authorized_account"
+            )
+            if usable:
+                update_data["session"] = usable
+                update_data["session_string"] = usable
+        try:
+            result = self.src_accounts.update_one(
+                {
+                    "phone": clean_phone,
+                    "status": {"$nin": list(PERMANENT_DEAD_STATUSES)},
+                },
+                {"$set": update_data},
+            )
+            if result.matched_count:
+                self._session_cache.invalidate(f"session:{clean_phone}")
+                self._stats_cache.invalidate("status_bar")
+                return True
+        except Exception as e:
+            logger.error(
+                f"promote_authorized_account failed for {clean_phone} "
+                f"({type(e).__name__}): {e}"
+            )
+        return False
+
+    async def promote_authorized_account_async(
+        self, phone: str, session_str: Optional[str] = None
+    ) -> bool:
+        return await self._run_sync(
+            self.promote_authorized_account, phone, session_str,
+        )
+
+    def _latest_backup_session(self, phone: str) -> str:
+        """Most recent *usable* session snapshot from `session_backups`."""
+        try:
+            variants = [phone, f"+{phone}"]
+            cursor = self.session_backups.find({"phone": {"$in": variants}})
+            if hasattr(cursor, "sort"):
+                cursor = cursor.sort("backup_created_at", -1)
+            for doc in cursor:
+                snap = str(
+                    doc.get("session_snapshot")
+                    or doc.get("session")
+                    or doc.get("session_string")
+                    or ""
+                ).strip()
+                if is_usable_session_key(snap):
+                    return snap
+        except Exception as e:
+            logger.debug(f"_latest_backup_session failed for {phone}: {e}")
+        return ""
+
+    def repair_corrupted_session_strings(self) -> dict:
+        """Replace reason/error prose in session fields with the newest usable backup.
+
+        Does not change status. Clears last_error when it was the false
+        `invalid_session_string` flag caused by the overwritten key.
+        """
+        repaired = 0
+        no_backup = 0
+        already_ok = 0
+        self._check_open()
+        try:
+            accounts = list(self.src_accounts.find({}))
+        except Exception as e:
+            logger.error(f"repair_corrupted_session_strings list failed: {e}")
+            return {"repaired": 0, "no_backup": 0, "already_ok": 0}
+
+        for acc in accounts:
+            live = str(acc.get("session_string") or acc.get("session") or "").strip()
+            if is_usable_session_key(live):
+                already_ok += 1
+                continue
+            phone = self._normalize(str(acc.get("phone") or ""))
+            if not phone:
+                no_backup += 1
+                continue
+            backup = self._latest_backup_session(phone)
+            if not backup:
+                no_backup += 1
+                continue
+            payload = {
+                "session": backup,
+                "session_string": backup,
+                "last_updated": datetime.now(timezone.utc),
+            }
+            err = str(acc.get("last_error") or "").lower()
+            if "invalid_session" in err or "not a valid string" in err:
+                payload["last_error"] = ""
+            try:
+                self.src_accounts.update_one(
+                    {"phone": acc.get("phone")},
+                    {"$set": payload},
+                )
+                self._session_cache.invalidate(f"session:{phone}")
+                repaired += 1
+            except Exception as e:
+                logger.error(
+                    f"repair_corrupted_session_strings failed for {phone}: {e}"
+                )
+                no_backup += 1
+        if repaired:
+            self._stats_cache.invalidate("status_bar")
+            logger.warning(
+                "SESSION_KEY_REPAIRED | restored %s corrupted session field(s) "
+                "from session_backups",
+                repaired,
+            )
+        return {
+            "repaired": repaired,
+            "no_backup": no_backup,
+            "already_ok": already_ok,
+        }
+
+    def unquarantine_recoverable_sessions(self) -> dict:
+        """Move wrongly-killed terminals that still have a session back to failed.
+
+        Campaigns still skip terminal rows; this is the restore / health-scan
+        entry point so SpamBot and the auditor can re-verify them. Never
+        touches `auth_key_duplicated`, `deactivated`, or `invalid`.
+        """
+        restored = 0
+        skipped_permanent = 0
+        no_session = 0
+        self._check_open()
+        try:
+            repair_stats = self.repair_corrupted_session_strings()
+        except Exception as e:
+            logger.error(f"unquarantine repair pass failed: {e}")
+            repair_stats = {"repaired": 0, "no_backup": 0, "already_ok": 0}
+        try:
+            accounts = list(self.src_accounts.find({}))
+        except Exception as e:
+            logger.error(f"unquarantine_recoverable_sessions list failed: {e}")
+            return {
+                "restored": 0,
+                "skipped_permanent": 0,
+                "no_session": 0,
+                "repaired": repair_stats.get("repaired", 0),
+            }
+
+        for acc in accounts:
+            status = self._status_value(acc.get("status"))
+            if status in PERMANENT_DEAD_STATUSES:
+                skipped_permanent += 1
+                continue
+            if status not in RESTORABLE_TERMINAL_STATUSES:
+                continue
+            phone = self._normalize(str(acc.get("phone") or ""))
+            if not phone:
+                continue
+            session = str(
+                acc.get("session_string") or acc.get("session") or ""
+            ).strip()
+            if not is_usable_session_key(session):
+                session = self._latest_backup_session(phone)
+            if not session:
+                no_session += 1
+                continue
+            if self.restore_session_from_backup(
+                phone,
+                session,
+                reason="Restored wrongly-killed session; pending SpamBot health check",
+            ):
+                restored += 1
+        return {
+            "restored": restored,
+            "skipped_permanent": skipped_permanent,
+            "no_session": no_session,
+            "repaired": repair_stats.get("repaired", 0),
+        }
+
+    async def unquarantine_recoverable_sessions_async(self) -> dict:
+        return await self._run_sync(self.unquarantine_recoverable_sessions)
+
     def save_migrated_session(
         self, phone: str, api_id: int, api_hash: str,
         session_str: str, device: dict
@@ -1108,13 +1441,19 @@ class SuiteDatabase:
             return
         
         self.backup_original_session(clean_phone)
+
+        usable = self._coerce_session_key(
+            session_str, phone=clean_phone, caller="save_migrated_session"
+        )
+        if not usable:
+            return
         
         payload = {
             "phone": clean_phone,
             "api_id": int(api_id),
             "api_hash": str(api_hash),
-            "session_string": str(session_str),
-            "session": str(session_str),
+            "session_string": usable,
+            "session": usable,
             "device_metadata": device or {},
             "device_model": (device or {}).get("device_model", "PC 64bit"),
             "system_version": (device or {}).get("system_version", "Windows 11"),
@@ -1146,8 +1485,83 @@ class SuiteDatabase:
     # 7. ACCOUNT STATE MANAGEMENT
     # ────────────────────────────────────────────────────────────
     
-    def mark_account_failed(self, phone: str, error_msg: str) -> None:
-        """Mark account as failed (temporary)."""
+    def stick_account_device(self, phone: str, device: dict) -> None:
+        """Write a device fingerprint only when the account has none yet."""
+        clean_phone = self._normalize(phone)
+        if not clean_phone or not isinstance(device, dict):
+            return
+        model = str(device.get("device_model") or "").strip()
+        if not model:
+            return
+        self._check_open()
+        payload = {
+            "device_model": model,
+            "system_version": str(device.get("system_version") or "Windows 11"),
+            "app_version": str(device.get("app_version") or "4.8.4"),
+            "device_metadata": {
+                "device_model": model,
+                "system_version": str(device.get("system_version") or "Windows 11"),
+                "app_version": str(device.get("app_version") or "4.8.4"),
+            },
+        }
+        try:
+            self.src_accounts.update_one(
+                {
+                    "phone": clean_phone,
+                    "$or": [
+                        {"device_model": {"$exists": False}},
+                        {"device_model": None},
+                        {"device_model": ""},
+                    ],
+                },
+                {"$set": payload},
+            )
+            self._session_cache.invalidate(f"session:{clean_phone}")
+        except Exception as e:
+            logger.error(f"stick_account_device error for {clean_phone}: {e}")
+
+    async def stick_account_device_async(self, phone: str, device: dict) -> None:
+        return await self._run_sync(self.stick_account_device, phone, device)
+
+    def mark_account_failed(
+        self, phone: str, error_msg: str, spam_until: Optional[datetime] = None
+    ) -> None:
+        """Mark account as failed (temporary, recoverable).
+
+        Never overwrites a terminal status (revoked/banned/auth_key_duplicated/...).
+        Optional `spam_until` is only stored when explicitly passed; SpamBot
+        parks use `park_spam_limited` so a live session is not demoted.
+        """
+        clean_phone = self._normalize(phone)
+        if not clean_phone:
+            return
+        self._check_open()
+        payload = {
+            "status": "failed",
+            "last_error": str(error_msg)[:500],
+            "updated_at": datetime.now(timezone.utc),
+            "last_checked_time": datetime.now(timezone.utc),
+        }
+        if spam_until is not None:
+            payload["spam_until"] = spam_until
+        try:
+            self.src_accounts.update_one(
+                {
+                    "phone": clean_phone,
+                    "status": {"$nin": list(TERMINAL_DB_STATUSES)},
+                },
+                {"$set": payload},
+            )
+            self._session_cache.invalidate(f"session:{clean_phone}")
+            self._stats_cache.invalidate("status_bar")
+        except Exception as e:
+            logger.error(f"mark_account_failed error: {e}")
+
+    def park_spam_limited(
+        self, phone: str, note: str, hours: float = 24.0
+    ) -> None:
+        """TAO spam_block: keep the live session, set spam_until for campaign skip."""
+        until = datetime.now(timezone.utc) + timedelta(hours=float(hours))
         clean_phone = self._normalize(phone)
         if not clean_phone:
             return
@@ -1156,16 +1570,167 @@ class SuiteDatabase:
             self.src_accounts.update_one(
                 {"phone": clean_phone},
                 {"$set": {
-                    "status": "failed",
-                    "last_error": str(error_msg)[:500],
-                    "updated_at": datetime.now(timezone.utc),
+                    "spam_until": until,
+                    "last_error": str(note)[:500],
                     "last_checked_time": datetime.now(timezone.utc),
-                }}
+                    "last_updated": datetime.now(timezone.utc),
+                }},
             )
             self._session_cache.invalidate(f"session:{clean_phone}")
             self._stats_cache.invalidate("status_bar")
         except Exception as e:
-            logger.error(f"mark_account_failed error: {e}")
+            logger.error(f"park_spam_limited error for {clean_phone}: {e}")
+
+    def clear_spam_until(self, phone: str) -> None:
+        """SpamBot free as a bird — campaign-eligible again."""
+        clean_phone = self._normalize(phone)
+        if not clean_phone:
+            return
+        self._check_open()
+        try:
+            self.src_accounts.update_one(
+                {"phone": clean_phone},
+                {"$set": {
+                    "spam_until": None,
+                    "last_error": "",
+                    "last_checked_time": datetime.now(timezone.utc),
+                    "last_updated": datetime.now(timezone.utc),
+                }},
+            )
+            self._session_cache.invalidate(f"session:{clean_phone}")
+            self._stats_cache.invalidate("status_bar")
+        except Exception as e:
+            logger.error(f"clear_spam_until error for {clean_phone}: {e}")
+
+    async def park_spam_limited_async(
+        self, phone: str, note: str, hours: float = 24.0
+    ) -> None:
+        return await self._run_sync(self.park_spam_limited, phone, note, hours)
+
+    def park_module_rest(
+        self, phone: str, module: str, note: str, hours: float = 24.0
+    ) -> None:
+        """24h rest for one module only. Does not set SpamBot spam_until.
+
+        Adder rest never blocks dmsender, and the reverse is also true.
+        Status stays active (green).
+        """
+        key = str(module or "").strip().lower()
+        field = MODULE_REST_FIELDS.get(key)
+        if not field:
+            logger.warning("park_module_rest unknown module=%s", module)
+            return
+        until = datetime.now(timezone.utc) + timedelta(hours=float(hours))
+        clean_phone = self._normalize(phone)
+        if not clean_phone:
+            return
+        self._check_open()
+        payload = {
+            field: until,
+            "last_checked_time": datetime.now(timezone.utc),
+            "last_updated": datetime.now(timezone.utc),
+        }
+        note_field = MODULE_REST_NOTES.get(key)
+        if note_field:
+            payload[note_field] = str(note)[:500]
+        try:
+            self.src_accounts.update_one(
+                {"phone": clean_phone},
+                {"$set": payload},
+            )
+            self._session_cache.invalidate(f"session:{clean_phone}")
+            self._stats_cache.invalidate("status_bar")
+        except Exception as e:
+            logger.error("park_module_rest error for %s module=%s: %s", clean_phone, key, e)
+
+    async def park_module_rest_async(
+        self, phone: str, module: str, note: str, hours: float = 24.0
+    ) -> None:
+        return await self._run_sync(self.park_module_rest, phone, module, note, hours)
+
+    def migrate_legacy_adder_spam_to_module_rest(self) -> Dict[str, int]:
+        """Move adder 24h parks off shared spam_until onto adder_rest_until.
+
+        Those accounts stay adder-spam. spam_until is cleared so DM sender
+        sees them as free. Real SpamBot parks (last_error SpamBot:...) stay.
+        """
+        self._check_open()
+        now = datetime.now(timezone.utc)
+        moved = 0
+        skipped_spambot = 0
+        try:
+            docs = list(self.src_accounts.find({}))
+            for doc in docs:
+                if not isinstance(doc, dict):
+                    continue
+                if not is_spam_park_active(doc, now):
+                    continue
+                note = str(doc.get("last_error") or doc.get("adder_rest_note") or "")
+                if not note.startswith("ADDER_REST"):
+                    skipped_spambot += 1
+                    continue
+                phone = self._normalize(doc.get("phone"))
+                if not phone:
+                    continue
+                until = doc.get("spam_until")
+                existing = doc.get("adder_rest_until")
+                adder_until = until
+                if _until_is_future(existing, now) and isinstance(existing, datetime) and isinstance(until, datetime):
+                    if existing.tzinfo is None:
+                        existing = existing.replace(tzinfo=timezone.utc)
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                    if existing > until:
+                        adder_until = existing
+                payload = {
+                    "adder_rest_until": adder_until,
+                    "adder_rest_note": (doc.get("adder_rest_note") or note)[:500],
+                    "spam_until": None,
+                    "dmsender_rest_until": None,
+                    "dmsender_rest_note": "",
+                    "last_error": "",
+                    "last_checked_time": now,
+                    "last_updated": now,
+                }
+                self.src_accounts.update_one({"phone": phone}, {"$set": payload})
+                self._session_cache.invalidate(f"session:{phone}")
+                moved += 1
+            self._stats_cache.invalidate("status_bar")
+            logger.info(
+                "migrate_legacy_adder_spam_to_module_rest moved=%s skipped_spambot=%s",
+                moved, skipped_spambot,
+            )
+            return {"moved": moved, "skipped_spambot": skipped_spambot}
+        except Exception as e:
+            logger.error("migrate_legacy_adder_spam_to_module_rest error: %s", e)
+            return {
+                "moved": moved,
+                "skipped_spambot": skipped_spambot,
+                "error": str(e),
+            }
+
+    def clear_module_rest(self, phone: str, module: str) -> None:
+        key = str(module or "").strip().lower()
+        field = MODULE_REST_FIELDS.get(key)
+        if not field:
+            return
+        clean_phone = self._normalize(phone)
+        if not clean_phone:
+            return
+        self._check_open()
+        payload = {field: None}
+        note_field = MODULE_REST_NOTES.get(key)
+        if note_field:
+            payload[note_field] = ""
+        try:
+            self.src_accounts.update_one({"phone": clean_phone}, {"$set": payload})
+            self._session_cache.invalidate(f"session:{clean_phone}")
+            self._stats_cache.invalidate("status_bar")
+        except Exception as e:
+            logger.error("clear_module_rest error for %s: %s", clean_phone, e)
+
+    async def clear_spam_until_async(self, phone: str) -> None:
+        return await self._run_sync(self.clear_spam_until, phone)
     
     def mark_account_checked(self, phone: str) -> None:
         """Persist last_checked_time=now so the auditor's LRU rotation survives restarts."""
@@ -1205,9 +1770,13 @@ class SuiteDatabase:
         except Exception as e:
             logger.error(f"mark_account_revoked error: {e}")
 
-    async def mark_account_failed_async(self, phone: str, error_msg: str) -> None:
+    async def mark_account_failed_async(
+        self, phone: str, error_msg: str, spam_until: Optional[datetime] = None
+    ) -> None:
         """Async-safe account failure marking."""
-        return await self._run_sync(self.mark_account_failed, phone, error_msg)
+        return await self._run_sync(
+            self.mark_account_failed, phone, error_msg, spam_until,
+        )
 
     async def mark_account_revoked_async(self, phone: str, system_reason: str) -> None:
         """Async-safe account revocation marking."""
@@ -1337,17 +1906,13 @@ class SuiteDatabase:
         return await self._run_sync(run_find)
     
     async def fetch_unprocessed_scraped_pool(self) -> list:
-        def run_agg():
-            pipeline = [
-                {"$lookup": {"from": MONGODB_SETTINGS["PROCESSED_MEMBERS_COLLECTION"], "localField": "user_id", "foreignField": "user_identifier", "as": "processed_match"}},
-                {"$match": {"processed_match": {"$size": 0}}},
-                {"$project": {"processed_match": 0}}
-            ]
-            return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))
+        """Return scraped members. Adding never removes them from this pool."""
+        def run_find():
+            return list(self.scraped_members.find({}))
         try:
-            return await self._run_sync(run_agg)
+            return await self._run_sync(run_find)
         except Exception as e:
-            logger.error(f"fetch_unprocessed_scraped_pool aggregation failed: {e}")
+            logger.error(f"fetch_unprocessed_scraped_pool failed: {e}")
             return []
 
     def purge_scraped_repository(self) -> int:
@@ -1355,15 +1920,19 @@ class SuiteDatabase:
         return self.clear_scraped_data()
 
     def log_addition_state(self, user_id: str, username: str, outcome: str) -> None:
-        """Log member addition outcome to processed_history."""
-        identity = username if (username and username != "None" and username != "") else user_id
+        """Log member addition outcome keyed by user_id (username is metadata)."""
+        uid = str(user_id or "").strip()
+        uname = str(username or "").strip()
+        identity = uid if uid and uid not in ("None", "0") else uname
+        if not identity:
+            return
         try:
             self.processed_history.update_one(
                 {"user_identifier": str(identity)},
                 {"$set": {
                     "user_identifier": str(identity),
-                    "user_id": str(user_id),
-                    "username": str(username),
+                    "user_id": str(uid),
+                    "username": str(uname),
                     "outcome": str(outcome),
                     "timestamp": int(time.time()),
                     "date_recorded": datetime.now(timezone.utc),
@@ -1537,11 +2106,13 @@ class SuiteDatabase:
                 total += count
                 if status == "active":
                     active_cnt = count
-                elif status == "revoked":
-                    revoked_cnt = count
+                elif status in PERMANENT_DEAD_STATUSES or status in (
+                    "revoked", "quarantined", "permanently_failed",
+                ):
+                    revoked_cnt += count
                 elif status in ("pending", "2fa_required"):
                     pending_cnt += count
-                elif status in ("failed", "banned", "restricted"):
+                elif status in RECOVERABLE_HEALTH_STATUSES:
                     failed_cnt += count
                 else:
                     pending_cnt += count
@@ -1559,21 +2130,17 @@ class SuiteDatabase:
         
         
     async def fetch_unprocessed_scraped_pool_paginated(self, skip: int, limit: int) -> list:
-       
-        pipeline = [
-            {"$lookup": {"from": MONGODB_SETTINGS["PROCESSED_MEMBERS_COLLECTION"],
-                         "localField": "user_id", "foreignField": "user_identifier", "as": "processed_match"}},
-            {"$match": {"processed_match": {"$size": 0}}},
-            {"$project": {"processed_match": 0}},
-            {"$skip": skip},
-            {"$limit": limit},
-        ]
+        """Page scraped members. Adding never deletes or hides scrape records."""
+        skip_n = max(0, int(skip))
+        limit_n = max(1, int(limit))
 
-        def run_agg():
+        def run_find():
             self._ensure_connection()
-            return list(self.scraped_members.aggregate(pipeline, allowDiskUse=True))
+            return list(
+                self.scraped_members.find({}).skip(skip_n).limit(limit_n)
+            )
 
-        return await self._run_sync(run_agg)
+        return await self._run_sync(run_find)
 
     def close(self):
         """Close MongoDB connection gracefully (idempotent, PATCH #9)."""

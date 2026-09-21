@@ -98,8 +98,11 @@ class AuditorConfig:
 @dataclass
 class AdderConfig:
     """Member adder rate-limit & burst protection."""
-    max_workers: int = field(default_factory=lambda: _env_int("ADDER_MAX_WORKERS", 20, 1, 50))
-    max_worker_sessions: int = field(default_factory=lambda: _env_int("ADDER_MAX_WORKER_SESSIONS", 10, 1, 30))
+    max_workers: int = field(default_factory=lambda: _env_int("ADDER_MAX_WORKERS", 90, 1, 100))
+    max_worker_sessions: int = field(default_factory=lambda: _env_int("ADDER_MAX_WORKER_SESSIONS", 90, 1, 100))
+    batch_size: int = field(default_factory=lambda: _env_int("ADDER_BATCH_SIZE", 10, 1, 50))
+    max_concurrent_batches: int = field(default_factory=lambda: _env_int("ADDER_MAX_CONCURRENT_BATCHES", 2, 1, 20))
+    max_live_accounts: int = field(default_factory=lambda: _env_int("ADDER_MAX_LIVE_ACCOUNTS", 12, 1, 20))
     human_add_interval: Tuple[int, int] = (25, 45)
     burst_add_limit: int = field(default_factory=lambda: _env_int("ADDER_BURST_ADD_LIMIT", 6, 1, 20))
     burst_cooldown: Tuple[int, int] = (30, 50)
@@ -180,9 +183,24 @@ CONFIG: Dict[str, Any] = {
     "AUDITOR_ENABLED": _env_bool("AUDITOR_ENABLED", True),
 
     # ── Adder ──
-    "ADDER_MAX_WORKERS": _env_int("ADDER_MAX_WORKERS", 20, 1, 50),
-    "ADDER_MAX_WORKER_SESSIONS": _env_int("ADDER_MAX_WORKER_SESSIONS", 10, 1, 30),
+    "ADDER_MAX_WORKERS": _env_int("ADDER_MAX_WORKERS", 90, 1, 100),
+    "ADDER_MAX_WORKER_SESSIONS": _env_int("ADDER_MAX_WORKER_SESSIONS", 90, 1, 100),
+    "ADDER_BATCH_SIZE": _env_int("ADDER_BATCH_SIZE", 10, 1, 50),
+    "ADDER_MAX_CONCURRENT_BATCHES": _env_int("ADDER_MAX_CONCURRENT_BATCHES", 2, 1, 20),
+    "ADDER_MAX_LIVE_ACCOUNTS": _env_int("ADDER_MAX_LIVE_ACCOUNTS", 12, 1, 20),
+    "ADDER_CHAT_BAN_STOP_THRESHOLD": _env_int("ADDER_CHAT_BAN_STOP_THRESHOLD", 3, 1, 50),
+    "ADDER_SHORT_FLOOD_WAIT": _env_int("ADDER_SHORT_FLOOD_WAIT", 30, 5, 120),
+    "ADDER_ACCOUNT_LAUNCH_DELAY": (8, 15),
     "ADDER_HUMAN_ADD_INTERVAL": (25, 45),
+    # DM pacing: fixed interval, not 45/proxy_count (that collapsed to ~0.5s).
+    "DM_HUMAN_INTERVAL": (25, 45),
+    "DM_MAX_WORKERS": _env_int("DM_MAX_WORKERS", 20, 1, 50),
+    "DM_MAX_RETRY_DELAY": _env_int("DM_MAX_RETRY_DELAY", 60, 5, 300),
+    "DM_BATCH_SIZE": _env_int("DM_BATCH_SIZE", 10, 1, 50),
+    "DM_MAX_CONCURRENT_BATCHES": _env_int("DM_MAX_CONCURRENT_BATCHES", 2, 1, 20),
+    "DM_MEMBERS_PER_ACCOUNT": _env_int("DM_MEMBERS_PER_ACCOUNT", 30, 1, 200),
+    "DM_SHORT_FLOOD_WAIT": _env_int("DM_SHORT_FLOOD_WAIT", 30, 5, 120),
+    "DM_ACCOUNT_LAUNCH_DELAY": (8, 15),
     "ADDER_BURST_ADD_LIMIT": _env_int("ADDER_BURST_ADD_LIMIT", 6, 1, 20),
     "ADDER_BURST_COOLDOWN_TIME": (30, 50),
     "ADDER_PROGRESS_UPDATE_INTERVAL": _env_int("ADDER_PROGRESS_UPDATE_INTERVAL", 8, 2, 30),
@@ -208,8 +226,15 @@ CONFIG: Dict[str, Any] = {
     # (micro-jitter is added in code).
     "RECOVERY_INITIAL_DELAY": _env_int("RECOVERY_INITIAL_DELAY", 600, 60, 3600),
     "RECOVERY_INTERVAL": _env_int("RECOVERY_INTERVAL", 21600, 3600, 86400),
-    "RECOVERY_ACCOUNT_DELAY": (180, 360),
-    "HEALTH_SCAN_CONCURRENCY": _env_int("HEALTH_SCAN_CONCURRENCY", 3, 1, 10),
+    "RECOVERY_ACCOUNT_DELAY": (
+        min(_env_int("RECOVERY_ACCOUNT_DELAY_MIN", 180, 0, 3600),
+            _env_int("RECOVERY_ACCOUNT_DELAY_MAX", 360, 0, 3600)),
+        max(_env_int("RECOVERY_ACCOUNT_DELAY_MIN", 180, 0, 3600),
+            _env_int("RECOVERY_ACCOUNT_DELAY_MAX", 360, 0, 3600)),
+    ),
+    "HEALTH_SCAN_CONCURRENCY": _env_int("HEALTH_SCAN_CONCURRENCY", 10, 1, 10),
+    # TAO check_spam_status: temp "limited until" parks spam_until for this many hours.
+    "SPAM_RECHECK_HOURS": max(1.0, min(168.0, _env_float("SPAM_RECHECK_HOURS", 24.0))),
     "ENABLE_CONTACT_SCRAPER": _env_bool("ENABLE_CONTACT_SCRAPER", True),
     "ENABLE_VOICE_CHAT": _env_bool("ENABLE_VOICE_CHAT", True),
     "ENABLE_HEALTH_CHECK": _env_bool("ENABLE_HEALTH_CHECK", True),
@@ -346,7 +371,8 @@ def log_config_summary() -> None:
         f"Pool={CONFIG['MAX_POOL_SIZE']}/{CONFIG['MAX_POOL_ABSOLUTE']}, "
         f"Auditor={CONFIG['AUDITOR_BATCH_SIZE']}x{CONFIG['AUDITOR_BATCH_STAGGER']}s, "
         f"MongoPool={MONGO_CFG.max_pool_size}, "
-        f"AdderWorkers={CONFIG['ADDER_MAX_WORKERS']}"
+        f"Adder={CONFIG['ADDER_MAX_CONCURRENT_BATCHES']}x{CONFIG['ADDER_BATCH_SIZE']} "
+        f"(live<={CONFIG['ADDER_MAX_LIVE_ACCOUNTS']})"
     )
     logger.info(summary)
 

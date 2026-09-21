@@ -33,7 +33,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config import CONFIG, DEVICE_PROFILES
-from database import SuiteDatabase
+from database import SuiteDatabase, is_spam_park_active, is_module_rest_active
 from exception_classifier import ErrorCategory, classify_exception
 
 logger = logging.getLogger("ResourceManager")
@@ -93,6 +93,9 @@ TERMINAL_STATUSES = TERMINAL_DB_STATUSES  # Backward compatibility alias
 PROXY_TEST_URL: str = "https://httpbin.org/ip"
 PROXY_TEST_TIMEOUT: float = 5.0
 PROXY_TEST_TIMEOUT_SLOW: float = 15.0
+# TAO proxycheck: probe Telegram DC2 through the proxy, not an HTTP website.
+TELEGRAM_DC_PROBE: Tuple[str, int] = ("149.154.167.51", 443)
+TELEGRAM_DC_PROBE_TIMEOUT: float = 10.0
 MAX_PROXY_FAILURES: int = 3
 PROXY_ROTATION_WINDOW: float = 5 * 60
 MIN_WORKING_PROXIES_TO_START: int = 1
@@ -116,6 +119,35 @@ LOGIN_RESERVED_PROXIES: int = int(os.environ.get("LOGIN_RESERVED_PROXIES", "2"))
 def humanized_proxy_cooldown() -> float:
     """3-5 minute proxy rest window plus a few seconds of micro-jitter."""
     return random.uniform(PROXY_COOLDOWN_MIN_SECONDS, PROXY_COOLDOWN_MAX_SECONDS) + random.uniform(*PROXY_MICRO_JITTER_SECONDS)
+
+
+def resolve_account_device(record: Optional[dict]) -> dict:
+    """Sticky per-account Telethon device fingerprint.
+
+    Prefer the account's stored profile. Never pick a random DEVICE_PROFILES
+    entry when the record already has device_model (top-level or metadata).
+    Empty {} metadata is ignored so it cannot wipe a stored fingerprint.
+    """
+    rec = record if isinstance(record, dict) else {}
+    meta = rec.get("device_metadata") if isinstance(rec.get("device_metadata"), dict) else {}
+    model = str(meta.get("device_model") or rec.get("device_model") or "").strip()
+    if model:
+        return {
+            "device_model": model,
+            "system_version": str(
+                meta.get("system_version") or rec.get("system_version") or "Windows 11"
+            ),
+            "app_version": str(
+                meta.get("app_version") or rec.get("app_version") or "4.8.4"
+            ),
+        }
+    if DEVICE_PROFILES:
+        return dict(random.choice(DEVICE_PROFILES))
+    return {
+        "device_model": "PC 64bit",
+        "system_version": "Windows 11",
+        "app_version": "4.8.4",
+    }
 
 try:
     from colorama import Fore, Style
@@ -399,6 +431,34 @@ def get_proxy_provider(provider_name: Optional[str] = None) -> ProxyProvider:
     if name == "webshare": return WebshareProxyProvider()
     return FileProxyProvider()
 
+def probe_telegram_dc(url: str, timeout: float = TELEGRAM_DC_PROBE_TIMEOUT) -> Optional[float]:
+    """Open a TCP path through the proxy to Telegram DC2.
+
+    Same method as TAO ``tam/proxycheck.py``: CONNECT to 149.154.167.51:443.
+    Returns latency_ms on success, None on failure. Does not fetch websites.
+    """
+    if not url:
+        return None
+    started = time.monotonic()
+    sock = None
+    try:
+        from python_socks.sync import Proxy
+        sock = Proxy.from_url(url).connect(
+            dest_host=TELEGRAM_DC_PROBE[0],
+            dest_port=TELEGRAM_DC_PROBE[1],
+            timeout=timeout,
+        )
+        return round((time.monotonic() - started) * 1000, 1)
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
 class ProxyManager:
     def __init__(self, proxy_file: Optional[str] = None, provider_name: Optional[str] = None):
         self.proxy_file: str = proxy_file or "proxies.txt"
@@ -448,6 +508,16 @@ class ProxyManager:
                          "url": n.url, "added_at": n.added_at, "proxy_id": n.proxy_id, "latency": n.latency} for n in nodes]
         self.count = len(self.proxies)
         logger.info(f"Loaded {self.count} proxies from {self.provider.name} provider")
+        # Paid gateway providers are already purchased/sticky. Keep them in the
+        # lease pool immediately; background DC probes prune nodes that cannot
+        # open TCP to Telegram DC2 (149.154.167.51:443).
+        if self.provider.name in ("decodo", "webshare") and self.proxies:
+            self.working_proxies = list(self.proxies)
+            self.working_count = self.count
+            logger.info(
+                f"Trusted provider '{self.provider.name}': "
+                f"{self.working_count} proxies marked available immediately"
+            )
         if self.count == 0:
             logger.warning("No proxies found. Downloading from sources...")
             self._download_proxies()
@@ -463,18 +533,19 @@ class ProxyManager:
                                      "url": node.url, "added_at": node.added_at, "proxy_id": node.proxy_id, "latency": node.latency})
             self.count = len(self.proxies)
             logger.info(f"Downloaded {self.count} proxies from {provider_name} provider")
+            if self.proxies:
+                self.working_proxies = list(self.proxies)
+                self.working_count = self.count
 
     def _test_proxy_sync(self, proxy: Dict[str, Any], timeout: Optional[float] = None) -> bool:
-        try:
-            start = time.time()
-            resp = self._session.get("https://core.telegram.org", proxies={"http": proxy["url"], "https": proxy["url"]},
-                                     timeout=timeout or PROXY_TEST_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code == 200:
-                proxy["latency"] = (time.time() - start) * 1000
-                return True
-        except Exception:
-            pass
-        return False
+        latency = probe_telegram_dc(
+            str(proxy.get("url") or ""),
+            timeout=timeout or TELEGRAM_DC_PROBE_TIMEOUT,
+        )
+        if latency is None:
+            return False
+        proxy["latency"] = latency
+        return True
 
     def get_testing_progress(self) -> Dict[str, Any]:
         with self._lock: return self._testing_progress.copy()
@@ -517,10 +588,16 @@ class ProxyManager:
                                 self.working_count = len(self.working_proxies)
                             else:
                                 self.failed_proxies[proxy["url"]] = self.failed_proxies.get(proxy["url"], 0) + 1
+                                if proxy in self.working_proxies:
+                                    self.working_proxies.remove(proxy)
+                                    self.working_count = len(self.working_proxies)
                     except (FuturesTimeoutError, Exception):
                         with self._lock:
                             self._tested_count += 1
                             self.failed_proxies[proxy["url"]] = self.failed_proxies.get(proxy["url"], 0) + 1
+                            if proxy in self.working_proxies:
+                                self.working_proxies.remove(proxy)
+                                self.working_count = len(self.working_proxies)
                     if self._tested_count % TEST_BATCH_SIZE == 0: _update_progress()
             _update_progress()
 
@@ -540,6 +617,10 @@ class ProxyManager:
             finally:
                 self._testing_active = False
                 _update_progress(finished=True)
+                logger.info(
+                    f"Proxy DC probe complete: {self._working_found}/{self._tested_count} "
+                    f"reached Telegram DC {TELEGRAM_DC_PROBE[0]}:{TELEGRAM_DC_PROBE[1]}"
+                )
 
         self._testing_thread = threading.Thread(target=_run_testing, name="ProxyTester", daemon=True)
         self._testing_thread.start()
@@ -693,6 +774,8 @@ class ProxyLeaseManager:
 
     async def _sync_proxies(self) -> None:
         working = list(self.proxy_manager.working_proxies)
+        if not working:
+            working = list(getattr(self.proxy_manager, "proxies", None) or [])
         incoming: Dict[str, Dict[str, Any]] = {}
         for pd in working:
             pid = self._proxy_id_from_record(pd)
@@ -930,10 +1013,15 @@ class AccountLeaseManager:
     async def is_eligible(self, phone: str) -> bool:
         record = await self.db.get_session_by_phone_async(self._key(phone))
         if not record: return False
+        if is_spam_park_active(record): return False
         return str(record.get("status", "")).lower() in ELIGIBLE_DB_STATUSES
 
     async def filter_eligible(self, accounts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [acc for acc in accounts if str(acc.get("status", "")).lower() in ELIGIBLE_DB_STATUSES]
+        return [
+            acc for acc in accounts
+            if str(acc.get("status", "")).lower() in ELIGIBLE_DB_STATUSES
+            and not is_spam_park_active(acc)
+        ]
 
     async def acquire(self, phone: str, *, module: str = "unknown", worker_id: Optional[str] = None, timeout: float = 30.0, skip_if_busy: bool = False) -> Optional[AccountLease]:
         clean_phone = self._key(phone)
@@ -1121,9 +1209,50 @@ class SessionManager:
 
             session_str = record.get("session_string") or record.get("session")
             if not session_str: await self._rollback_reservation(clean_phone, lease_owner_key, reservation_id); yield None; return
+            if is_spam_park_active(record) and str(module or "").lower() in ("adder", "dmsender"):
+                await self._log_lifecycle(
+                    "SESSION_SKIP_SPAM_PARK", phone=clean_phone, session_fp="",
+                    module=module, worker_id=worker_id or "",
+                    error="spam_until active — skip campaigns",
+                )
+                logger.info(
+                    "SESSION_SKIP_SPAM_PARK | phone=%s | module=%s | not leasing for adding",
+                    clean_phone, module,
+                )
+                await self._rollback_reservation(clean_phone, lease_owner_key, reservation_id)
+                yield None
+                return
+            mod = str(module or "").lower()
+            if is_module_rest_active(record, mod):
+                await self._log_lifecycle(
+                    "SESSION_SKIP_MODULE_REST", phone=clean_phone, session_fp="",
+                    module=module, worker_id=worker_id or "",
+                    error=f"{mod}_rest_until active",
+                )
+                logger.info(
+                    "SESSION_SKIP_MODULE_REST | phone=%s | module=%s | 24h rest for this module only",
+                    clean_phone, mod,
+                )
+                await self._rollback_reservation(clean_phone, lease_owner_key, reservation_id)
+                yield None
+                return
             api_id = int(record.get("api_id", CONFIG["API_ID"])); api_hash = str(record.get("api_hash", CONFIG["API_HASH"]))
             fingerprint = compute_session_fingerprint(session_str, api_id)
-            device = record.get("device_metadata") or random.choice(DEVICE_PROFILES)
+            device = resolve_account_device(record)
+            stored_model = ""
+            meta = record.get("device_metadata") if isinstance(record.get("device_metadata"), dict) else {}
+            stored_model = str(meta.get("device_model") or record.get("device_model") or "").strip()
+            if not stored_model:
+                try:
+                    stick = getattr(self.db, "stick_account_device_async", None)
+                    if callable(stick):
+                        await stick(clean_phone, device)
+                    else:
+                        stick_sync = getattr(self.db, "stick_account_device", None)
+                        if callable(stick_sync):
+                            await asyncio.to_thread(stick_sync, clean_phone, device)
+                except Exception:
+                    pass
 
             # Honor the caller's timeout for the proxy-wait phase (dmsender
             # passes a short bound so workers stay responsive); callers that
@@ -1138,6 +1267,11 @@ class SessionManager:
 
             client = self._create_client(session_str=session_str, api_id=api_id, api_hash=api_hash, device=device, proxy=proxy_record)
             client_id = str(id(client))
+            logger.info(
+                "SESSION_DEVICE | phone=%s | module=%s | device_model=%s | os=%s | app=%s",
+                clean_phone, module,
+                device.get("device_model"), device.get("system_version"), device.get("app_version"),
+            )
             await self._log_lifecycle("SESSION_CLIENT_CREATED", phone=clean_phone, session_fp=fingerprint, module=module, worker_id=worker_id or "", client_id=client_id, proxy_url=(proxy_record or {}).get("url", "") if proxy_record else "")
 
             lease_id = uuid.uuid4().hex[:12]
@@ -1181,8 +1315,13 @@ class SessionManager:
             info = self._sessions.get(clean_phone)
             if info and info.lifecycle in (SessionLifecycleState.BUSY, SessionLifecycleState.RESERVED, SessionLifecycleState.LOGIN_PENDING, SessionLifecycleState.OTP_WAITING, SessionLifecycleState.TWOFA_WAITING, SessionLifecycleState.QUARANTINED, SessionLifecycleState.TERMINAL): return False
             new_info = SessionInfo(phone=clean_phone, session_fingerprint="", status="login_pending", lifecycle=SessionLifecycleState.LOGIN_PENDING, client=client, owner=owner_key, worker_id=owner_key, lease_id=uuid.uuid4().hex[:12])
-            if client is not None: new_info.client_id = str(id(client)); new_info.connection_ts = time.time()
-            self._active_count += 1; self._sessions[clean_phone] = new_info
+            if client is not None:
+                new_info.client_id = str(id(client))
+                new_info.connection_ts = time.time()
+                # Count live clients only. A login reservation without a client
+                # is ownership, not an active Telethon connection.
+                self._active_count += 1
+            self._sessions[clean_phone] = new_info
             return True
 
     async def set_login_stage(self, phone: str, owner_key: str, stage: SessionLifecycleState) -> bool:
@@ -1432,10 +1571,37 @@ class SessionManager:
                               sequential_updates=False, receive_updates=False, timeout=10.0, connection_retries=1, request_retries=1)
 
     async def _safe_disconnect_client(self, client: Optional[Any]) -> None:
-        if not client: return
+        if not client:
+            return
         try:
-            if client.is_connected(): await asyncio.wait_for(client.disconnect(), timeout=3.0)
-        except Exception as e: logger.debug(f"Safe disconnect error: {e}")
+            sender = getattr(client, "_sender", None)
+            if sender is not None and not isinstance(sender, bool):
+                try:
+                    sender._connecting = False
+                except Exception:
+                    pass
+                for loop_name in ("_recv_loop", "_send_loop", "_ping_loop"):
+                    task = getattr(sender, loop_name, None)
+                    if isinstance(task, asyncio.Task) and not task.done():
+                        task.cancel()
+                connection = getattr(sender, "_connection", None)
+                if connection is not None and not isinstance(connection, bool):
+                    for loop_name in ("_recv_loop", "_send_loop", "_ping_loop"):
+                        task = getattr(connection, loop_name, None)
+                        if isinstance(task, asyncio.Task) and not task.done():
+                            task.cancel()
+            try:
+                is_connected = client.is_connected
+                connected = is_connected() if callable(is_connected) else bool(is_connected)
+                if asyncio.iscoroutine(connected):
+                    connected.close()
+                    connected = False
+            except Exception:
+                connected = False
+            if connected:
+                await asyncio.wait_for(client.disconnect(), timeout=3.0)
+        except Exception as e:
+            logger.debug(f"Safe disconnect error: {e}")
 
     def _update_db_status_sync(self, phone: str, status: str, reason: str) -> None:
         try:

@@ -48,6 +48,19 @@ try:
 except ImportError:  # older Telethon
     ChannelPrivateError = None
 
+try:
+    from telethon.errors import PeerIdInvalidError
+except ImportError:
+    PeerIdInvalidError = None
+try:
+    from telethon.errors import UsernameNotOccupiedError
+except ImportError:
+    UsernameNotOccupiedError = None
+try:
+    from telethon.errors import UsernameInvalidError
+except ImportError:
+    UsernameInvalidError = None
+
 logger = logging.getLogger("ExceptionClassifier")
 
 
@@ -239,6 +252,44 @@ def classify_exception(exc: BaseException) -> ConnectionResult:
             retryable=False,
             terminal=False,
             reason="Target chat is private or this account is banned from it (chat-specific)",
+            original_exception=exc,
+        )
+
+    if PeerIdInvalidError is not None and isinstance(exc, PeerIdInvalidError):
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.TARGET_UNAVAILABLE,
+            retryable=False,
+            terminal=False,
+            reason="PEER_ID_INVALID: scraper access_hash is not valid on this account",
+            original_exception=exc,
+        )
+    if UsernameNotOccupiedError is not None and isinstance(exc, UsernameNotOccupiedError):
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.TARGET_UNAVAILABLE,
+            retryable=False,
+            terminal=False,
+            reason="Username is not occupied",
+            original_exception=exc,
+        )
+    if UsernameInvalidError is not None and isinstance(exc, UsernameInvalidError):
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.TARGET_UNAVAILABLE,
+            retryable=False,
+            terminal=False,
+            reason="Username is invalid",
+            original_exception=exc,
+        )
+
+    if isinstance(exc, ValueError) and "unresolvable_peer" in str(exc).lower():
+        return ConnectionResult(
+            success=False,
+            category=ErrorCategory.TARGET_UNAVAILABLE,
+            retryable=False,
+            terminal=False,
+            reason="Target has no usable username or access_hash",
             original_exception=exc,
         )
 

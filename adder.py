@@ -9,8 +9,9 @@ import time
 import asyncio
 import random
 import logging
+from collections import deque
 from contextlib import asynccontextmanager
-from typing import List, Dict, Optional, Any, Tuple, AsyncIterator
+from typing import List, Dict, Optional, Any, Tuple, AsyncIterator, Set
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient
@@ -25,13 +26,96 @@ from telethon.errors import (
 from telethon.errors.rpcbaseerrors import RPCError as TelethonRPCError
 
 try:
-    # USER_BANNED_IN_CHANNEL = TEMPORARY spam restriction, NOT termination.
     from telethon.errors import UserBannedInChannelError
-    # Treated exactly like PeerFlood: drop account from this run, keep alive in DB.
-    FLOOD_STOP_ERRORS = (PeerFloodError, FloodWaitError, UserBannedInChannelError)
-except ImportError:  # older Telethon: handled via string match in the crash path
+except ImportError:
     UserBannedInChannelError = None
-    FLOOD_STOP_ERRORS = (PeerFloodError, FloodWaitError)
+try:
+    from telethon.errors import ChatMemberAddFailedError
+except ImportError:
+    ChatMemberAddFailedError = None
+try:
+    from telethon.errors import ChannelPrivateError
+except ImportError:
+    ChannelPrivateError = None
+
+
+def _invite_error_blob(exc: BaseException) -> str:
+    return f"{type(exc).__name__} {exc}".upper()
+
+
+def _is_chat_member_add_failed(exc: BaseException) -> bool:
+    """Telegram 400 CHAT_MEMBER_ADD_FAILED is a per-member skip, not a campaign crash.
+
+    Telethon's class name is ChatMemberAddFailedError; the RPC text is
+    CHAT_MEMBER_ADD_FAILED. Matching only the type name used to miss it,
+    re-raise, and kill every worker via asyncio.gather.
+    """
+    blob = _invite_error_blob(exc)
+    return (
+        "CHAT_MEMBER_ADD_FAILED" in blob
+        or "CHATMEMBERADDFAILED" in blob
+        or (ChatMemberAddFailedError is not None and isinstance(exc, ChatMemberAddFailedError))
+    )
+
+
+def _batch_letter(index: int) -> str:
+    n = max(0, int(index)) + 1
+    out = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
+    return out or "A"
+
+
+def _is_user_banned_in_channel(exc: BaseException) -> bool:
+    blob = _invite_error_blob(exc)
+    return (
+        "USER_BANNED_IN_CHANNEL" in blob
+        or (UserBannedInChannelError is not None and isinstance(exc, UserBannedInChannelError))
+    )
+
+
+def _is_target_chat_stop(exc: BaseException) -> bool:
+    """This account cannot write/add in THIS chat. Session is not dead."""
+    if ChannelPrivateError is not None and isinstance(exc, ChannelPrivateError):
+        return True
+    if _is_user_banned_in_channel(exc):
+        return True
+    blob = _invite_error_blob(exc)
+    compact = blob.replace("_", "").replace(" ", "")
+    return any(token in compact for token in (
+        "CHANNELPRIVATE", "CHATWRITEFORBIDDEN", "CHATADMINREQUIRED",
+    ))
+
+
+def _is_add_restriction_error(exc: BaseException) -> bool:
+    """PeerFlood or chat-ban: retry once, then 24h rest for this account."""
+    if isinstance(exc, PeerFloodError):
+        return True
+    blob = _invite_error_blob(exc)
+    if "PEER_FLOOD" in blob or "PEERFLOOD" in blob:
+        return True
+    return _is_user_banned_in_channel(exc)
+
+
+def plan_adder_accounts(
+    member_count: int,
+    available_accounts: int,
+    members_per_account: int = 30,
+) -> int:
+    """Use ceil(members/30) accounts — never more than are available."""
+    if member_count <= 0 or available_accounts <= 0:
+        return 0
+    per = max(1, int(members_per_account))
+    needed = (int(member_count) + per - 1) // per
+    return min(int(available_accounts), max(1, needed))
+
+
+RESTRICTION_ERRORS = (PeerFloodError,)
+if UserBannedInChannelError is not None:
+    RESTRICTION_ERRORS = (PeerFloodError, UserBannedInChannelError)
+
+FLOOD_STOP_ERRORS = RESTRICTION_ERRORS
 
 from resource_manager import (
     ProxyManager,
@@ -49,7 +133,7 @@ from resource_manager import (
 )
 
 from config import CONFIG, DEVICE_PROFILES
-from database import SuiteDatabase
+from database import SuiteDatabase, is_spam_park_active, is_module_rest_active
 from exception_classifier import ErrorCategory, classify_exception
 from scraper import MemberScraper
 
@@ -76,10 +160,12 @@ class AdderState:
         self.active_workers = 0
         self.max_workers = max_workers
         self.failures = 0
+        self.parked = 0
         
         # Performance metrics
         self.total_delay_sum = 0.0 # Track total delay to calculate average
         self.status_msg = "Running" # Can change to "Completed", "Paused", etc.
+        self.resting: List[str] = []  # phones in 24h add-rest, shown as unavailable
         
     def stop(self, status: str = "Completed"):
         self.is_running = False
@@ -100,14 +186,22 @@ def generate_status_ui(state: AdderState) -> str:
     if state.total_target > 0:
          completion_pct = (state.completed + state.skipped) / state.total_target * 100
 
-    # 3. Health Math
-    health = "Excellent"
-    if state.failures > (state.max_workers * 2):
-        health = "Warning ⚠️"
-    if state.failures > (state.max_workers * 5):
-        health = "Critical ❌"
+    parked = int(getattr(state, "parked", 0) or 0)
+    failures = int(state.failures or 0)
+    max_workers = max(1, int(state.max_workers or 1))
+    if failures > max_workers:
+        health = "Critical"
+    elif failures > 0 or (parked > 0 and state.completed == 0):
+        health = "Warning"
+    else:
+        health = "Excellent"
 
-    worker_health_pct = max(0, 100 - (state.failures * 2)) 
+    if not state.is_running:
+        worker_health_pct = 100 if failures == 0 else max(
+            0, int(100 * (1 - failures / max_workers))
+        )
+    else:
+        worker_health_pct = int(100 * state.active_workers / max_workers) 
 
     # 4. Performance Math (Throughput & Delay)
     elapsed_minutes = elapsed_seconds / 60
@@ -125,6 +219,13 @@ def generate_status_ui(state: AdderState) -> str:
         eta_str = f"{hours:02}h {minutes:02}m"
         if eta_td.days > 0:
             eta_str = f"{eta_td.days}d " + eta_str
+
+    resting_list = list(getattr(state, "resting", None) or [])
+    if resting_list:
+        rest_lines = "\n".join(f"⏸️ {row}" for row in resting_list[-8:])
+        resting_block = f"\n{rest_lines}\n────────────────────────────────"
+    else:
+        resting_block = ""
 
     # 6. Formatting the Exact UI Structure
     ui = f"""⚙️ Adder Status:
@@ -154,7 +255,9 @@ def generate_status_ui(state: AdderState) -> str:
 👥 **Worker Pool**          {state.active_workers} / {state.max_workers}
 🟢 **Worker Health**        {worker_health_pct}%
 ⚠️ **Failures**             {state.failures}
-────────────────────────────────
+🅿️ **Parked (this target)** {parked}
+⏸️ **Resting 24h (add)**    {len(getattr(state, "resting", None) or [])}
+────────────────────────────────{resting_block}
 
 🚀 **PERFORMANCE**
 
@@ -220,6 +323,11 @@ class EnterpriseMemberAdder:
         self.accounts_acquired = 0
         self.session_contention = 0  # lease contention — NOT real downtime
         self.privacy_skips = 0
+        self.flood_drops = 0
+        self.chat_parks = 0
+        self.total_skipped = 0
+        self._batch_index = 0
+        self.batch_reports: List[Dict[str, Any]] = []
 
     # ──────────────────────────────────────────────
     # 🔥 ROBUST CLIENT CLEANUP (prevents ghost tasks & Future exception spam)
@@ -307,7 +415,13 @@ class EnterpriseMemberAdder:
         self.session_contention = 0
         self.privacy_skips = 0
         self.flood_drops = 0
+        self.chat_parks = 0
+        self.total_skipped = 0
         self.accounts_acquired = 0
+        self._batch_index = 0
+        self.batch_reports = []
+        self._stop_new_batches = False
+        self._first_invite_chat_bans = 0
         # The adder owns the proxy pool while running: fully stop the auditor.
         notify_auditor_stop()
 
@@ -320,7 +434,7 @@ class EnterpriseMemberAdder:
                 _proxy_wait_start = time.time()
                 _proxy_wait_limit = float(CONFIG.get("ADDER_PROXY_STABILIZE_WAIT", 120.0))
                 _last_usable = -1
-                while time.time() - _proxy_wait_start < _proxy_wait_limit:
+                while self.is_running and time.time() - _proxy_wait_start < _proxy_wait_limit:
                     usable = self.proxy_lease_manager.usable_available_count()
                     if usable > 0:
                         break
@@ -334,6 +448,9 @@ class EnterpriseMemberAdder:
             except Exception as wait_exc:
                 logger.debug(f"ADDER_PROXY_WAIT_ERROR | {wait_exc}")
 
+        if not self.is_running:
+            return "🛑 **Member Adder Halted** before workers started."
+
         # Pull available unprocessed targeted members list from DB 2 Cloud Cache Repo
         scraped_pool = await self.db.fetch_unprocessed_scraped_pool()
         if not scraped_pool:
@@ -345,47 +462,32 @@ class EnterpriseMemberAdder:
         if not active_accounts:
             self.is_running = False
             return "❌ **Operation Failed:** Source DB (`source_accounts`) me active sessions nahi mile. Pehle `/reload_accounts`, `/login`, ya `/refresh_accounts` run karein."
+        active_accounts = [
+            a for a in active_accounts
+            if not is_module_rest_active(a, "adder")
+        ]
+        if not active_accounts:
+            self.is_running = False
+            return "❌ **Operation Failed:** Koi adder-free account nahi mila (sab 24h adder rest pe hain)."
 
         is_private, resolved_token = self.scraper_helper.resolve_group_link(target_group_link)
 
-        # 🔥 RESOURCE-AWARE SCHEDULING (Phase 15): the worker pool is not a
-        # hard-coded batch. Bounded by eligible accounts, the configured operation
-        # limit, the operator's optional override, and available proxy/network
-        # capacity — whichever is smallest (at least 1 so workers can wait for
-        # capacity instead of dropping work).
-        _adder_configured_limit = int(CONFIG.get("ADDER_MAX_WORKER_SESSIONS", 10))
-        # Honor operator override (e.g. /addmembers <link> 5) but keep it within
-        # the configured hard ceiling.
-        if requested_workers is not None and requested_workers > 0:
-            _adder_configured_limit = min(_adder_configured_limit, requested_workers)
-        _adder_available_proxies = 0
-        if self.proxy_lease_manager is not None:
-            try:
-                # Reserve-aware: never count the login-reserve buffer as
-                # operation capacity.
-                _adder_available_proxies = max(
-                    0, self.proxy_lease_manager.usable_available_count()
-                )
-            except Exception:
-                _adder_available_proxies = 0
-        if _adder_available_proxies > 0:
-            MAX_WORKER_SESSIONS = max(
-                1,
-                min(len(active_accounts), _adder_configured_limit, _adder_available_proxies),
-            )
-        else:
-            # Even if no proxy is *immediately* free, spawn at least one worker
-            # so it can wait on the lease manager instead of doing nothing.
-            MAX_WORKER_SESSIONS = max(1, min(len(active_accounts), _adder_configured_limit))
-        logger.info(
-            f"ADDER_POOL_SIZING | accounts={len(active_accounts)} | usable_proxies="
-            f"{_adder_available_proxies} | configured_limit={_adder_configured_limit} "
-            f"requested={requested_workers} -> workers={MAX_WORKER_SESSIONS}"
-        )
+        # 10 accounts = 1 batch = up to 300 members. At most 2 batches in flight.
+        BATCH_SIZE = max(1, int(CONFIG.get("ADDER_BATCH_SIZE", 10)))
+        MAX_CONCURRENT_BATCHES = max(1, min(2, int(CONFIG.get("ADDER_MAX_CONCURRENT_BATCHES", 2))))
+        MEMBERS_PER_ACCOUNT = max(1, int(CONFIG.get("ADDER_MEMBERS_PER_ACCOUNT", 30)))
+        LIVE_CAP = BATCH_SIZE * MAX_CONCURRENT_BATCHES
+        SHORT_FLOOD_WAIT = max(1, int(CONFIG.get("ADDER_SHORT_FLOOD_WAIT", 30)))
+        ACCOUNT_LAUNCH_DELAY = tuple(CONFIG.get("ADDER_ACCOUNT_LAUNCH_DELAY", (8, 15)))
         HUMAN_ADD_INTERVAL = tuple(CONFIG.get("ADDER_HUMAN_ADD_INTERVAL", (25, 45)))
+        JOIN_SETTLE_DELAY = tuple(CONFIG.get("ADDER_JOIN_SETTLE_DELAY", (8, 18)))
         BURST_ADD_LIMIT = int(CONFIG.get("ADDER_BURST_ADD_LIMIT", 6))
         BURST_COOLDOWN_TIME = tuple(CONFIG.get("ADDER_BURST_COOLDOWN_TIME", (30, 50)))
         PROGRESS_UPDATE_INTERVAL = int(CONFIG.get("ADDER_PROGRESS_UPDATE_INTERVAL", 10))
+        LEASE_RETRY_DELAY = tuple(CONFIG.get("ADDER_LEASE_RETRY_DELAY", (15, 30)))
+        NO_PROXY_RETRY_DELAY = tuple(CONFIG.get("ADDER_NO_PROXY_RETRY_DELAY", (30, 60)))
+        self._batch_index = 0
+        self.batch_reports = []
 
         members_queue = asyncio.Queue()
         PAGE_SIZE = 500
@@ -400,21 +502,70 @@ class EnterpriseMemberAdder:
             if len(page) < PAGE_SIZE:
                 break
 
-        # Dynamically set target for the UI state tracker
-        if self.adder_state:
-            self.adder_state.total_target = members_queue.qsize()
-            self.adder_state.max_workers = MAX_WORKER_SESSIONS
-            self.adder_state.active_workers = 0
+        n_queued = members_queue.qsize()
+        n_members = n_queued if n_queued > 0 else len(scraped_pool)
+        accounts_needed = plan_adder_accounts(
+            n_members, len(active_accounts), MEMBERS_PER_ACCOUNT,
+        )
+        if requested_workers is not None and requested_workers > 0:
+            accounts_needed = min(accounts_needed, requested_workers)
 
-        accounts_queue = asyncio.Queue()
-        for acc_doc in active_accounts:
-            await accounts_queue.put(acc_doc)
+        _pipeline_cap = LIVE_CAP
+        _adder_configured_limit = min(
+            int(CONFIG.get("ADDER_MAX_WORKER_SESSIONS", 90)),
+            _pipeline_cap,
+            LIVE_CAP,
+        )
+        if requested_workers is not None and requested_workers > 0:
+            _adder_configured_limit = min(_adder_configured_limit, requested_workers)
+        _adder_available_proxies = 0
+        if self.proxy_lease_manager is not None:
+            try:
+                _adder_available_proxies = max(
+                    0, self.proxy_lease_manager.usable_available_count()
+                )
+            except Exception:
+                _adder_available_proxies = 0
+        if accounts_needed <= 0:
+            MAX_LIVE_ACCOUNTS = 0
+        elif _adder_available_proxies > 0:
+            MAX_LIVE_ACCOUNTS = max(
+                1,
+                min(accounts_needed, _adder_configured_limit, _adder_available_proxies),
+            )
+        else:
+            MAX_LIVE_ACCOUNTS = max(1, min(accounts_needed, _adder_configured_limit))
+
+        work_accounts = list(active_accounts[:accounts_needed])
+        spare_accounts: deque = deque(active_accounts[accounts_needed:])
+        remaining_q: deque = deque(work_accounts)
+        batches_required = (
+            (accounts_needed + BATCH_SIZE - 1) // BATCH_SIZE if accounts_needed else 0
+        )
+        logger.info(
+            "ADDER_POOL_SIZING | members=%s | per_account=%s | accounts_needed=%s/%s | "
+            "unused_spares=%s | batches_required=%s | usable_proxies=%s | "
+            "batch_size=%s | concurrent_batches=%s | live_cap=%s | "
+            "configured_limit=%s requested=%s -> max_live=%s",
+            n_members, MEMBERS_PER_ACCOUNT, accounts_needed, len(active_accounts),
+            len(spare_accounts), batches_required, _adder_available_proxies,
+            BATCH_SIZE, MAX_CONCURRENT_BATCHES, LIVE_CAP,
+            _adder_configured_limit, requested_workers, MAX_LIVE_ACCOUNTS,
+        )
+
+        if self.adder_state:
+            self.adder_state.total_target = n_queued or n_members
+            self.adder_state.max_workers = MAX_LIVE_ACCOUNTS
+            self.adder_state.active_workers = 0
+            if not getattr(self.adder_state, "resting", None):
+                self.adder_state.resting = []
 
         @asynccontextmanager
         async def account_context(acc_doc: dict, failure: Dict[str, str]) -> AsyncIterator[Optional[dict]]:
             phone = str(acc_doc.get("phone", "")).strip()
             clean_phone = phone.replace("+", "")
             failure["reason"] = "unknown"
+            yielded = False
 
             if not clean_phone:
                 failure["reason"] = "failed: empty phone"
@@ -459,19 +610,19 @@ class EnterpriseMemberAdder:
                         raise ValueError("Session Unauthorized/Dead")
 
                     # ------------------------------------------
-                    # Prepare target
+                    # Join the target first, then settle, then add.
+                    # Never invite without a successful join/resolve.
                     # ------------------------------------------
                     target_entity = None
+                    already_in = False
+                    join_exc = None
 
                     try:
                         if is_private:
-                            # CheckChatInviteRequest resolves the chat for BOTH
-                            # states (already joined -> ChatInviteAlready.chat,
-                            # not joined -> ChatInvite) and never mangles the
-                            # case-sensitive invite hash into a username lookup.
                             invite_info = await client(CheckChatInviteRequest(resolved_token))
                             if type(invite_info).__name__ == "ChatInviteAlready":
                                 target_entity = invite_info.chat
+                                already_in = True
                             else:
                                 updates = await client(ImportChatInviteRequest(resolved_token))
                                 if getattr(updates, "chats", None):
@@ -480,37 +631,35 @@ class EnterpriseMemberAdder:
                                     invite_info = await client(CheckChatInviteRequest(resolved_token))
                                     target_entity = getattr(invite_info, "chat", None)
                         else:
-                            # Public link: resolved_token is the clean username
-                            # payload (never the full URL).
                             await client(JoinChannelRequest(resolved_token))
                     except UserAlreadyParticipantError:
-                        # Account already joined. For private links, resolve the
-                        # chat reference via CheckChatInviteRequest (never via
-                        # get_entity on the raw hash).
+                        already_in = True
                         if is_private:
                             try:
                                 invite_info = await client(CheckChatInviteRequest(resolved_token))
                                 target_entity = getattr(invite_info, "chat", None)
                             except Exception as exc:
-                                logger.warning(
-                                    "ADDER_TARGET_PREPARE_FAILED | phone=%s | error=%s",
-                                    phone,
-                                    exc,
-                                )
+                                join_exc = exc
                     except Exception as exc:
+                        join_exc = exc
+
+                    if join_exc is not None:
+                        if _is_target_chat_stop(join_exc):
+                            failure["reason"] = f"chat_stop: {type(join_exc).__name__}"
+                            logger.warning(
+                                "ADDER_JOIN_CHAT_STOP | phone=%s | err=%s | not inviting",
+                                phone, type(join_exc).__name__,
+                            )
+                            yield None
+                            return
                         logger.warning(
                             "ADDER_TARGET_PREPARE_FAILED | phone=%s | error=%s",
-                            phone,
-                            exc,
+                            phone, join_exc,
                         )
+                        raise join_exc
 
-                    # ------------------------------------------
-                    # Resolve entity
-                    # ------------------------------------------
                     if target_entity is None:
                         if is_private:
-                            # Last-resort: re-check the invite. NEVER pass the
-                            # raw hash to get_entity (it resolves usernames).
                             invite_info = await client(CheckChatInviteRequest(resolved_token))
                             target_entity = getattr(invite_info, "chat", None)
                             if target_entity is None:
@@ -523,6 +672,17 @@ class EnterpriseMemberAdder:
 
                     target_peer = InputPeerChannel(target_entity.id, target_entity.access_hash)
 
+                    settle = random.uniform(*JOIN_SETTLE_DELAY)
+                    logger.info(
+                        "ADDER_JOIN_OK | account=%s | already=%s | settle=%.1fs then add",
+                        clean_phone, already_in, settle,
+                    )
+                    if settle > 0:
+                        if self.adder_state:
+                            self.adder_state.total_delay_sum += settle
+                        await asyncio.sleep(settle)
+
+                    yielded = True
                     yield {
                         "phone": phone,
                         "clean_phone": clean_phone,
@@ -535,6 +695,8 @@ class EnterpriseMemberAdder:
                     }
 
             except SessionAlreadyOwnedError:
+                if yielded:
+                    raise
                 # Routine contention — NOT downtime; the worker may retry.
                 self.session_contention += 1
                 failure["reason"] = "busy"
@@ -542,6 +704,8 @@ class EnterpriseMemberAdder:
                 yield None
 
             except Exception as exc:
+                if yielded:
+                    raise
                 self.accounts_down += 1
                 if self.adder_state:
                     self.adder_state.failures += 1
@@ -559,268 +723,739 @@ class EnterpriseMemberAdder:
         # outlive one cooldown window instead of skipping the account.
         NO_PROXY_LEASE_ATTEMPTS = 6
 
-        async def worker_loop():
-            while self.is_running:
-                try:
-                    account_doc = accounts_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+        deferred_accounts: List[dict] = []
+        queue_lock = asyncio.Lock()
+        blocked_phones: Set[str] = set()
 
-                # Track this worker as alive in the UI as soon as it picks an
-                # account (even while waiting for a session/proxy).
-                if self.adder_state:
-                    self.adder_state.active_workers += 1
+        def _phone_key(value: Any) -> str:
+            if isinstance(value, dict):
+                value = value.get("clean_phone") or value.get("phone") or ""
+            return str(value).strip().replace(" ", "").replace("+", "")
 
-                try:
-                    failure: Dict[str, str] = {}
-                    async with account_context(account_doc, failure) as worker_account:
-                        if worker_account is None:
-                            # No lease this round. Hard failure -> drop. Contention
-                            # or cooling proxy pool -> requeue the account for a
-                            # bounded number of retries (never lost, never double-
-                            # booked: SessionManager enforces single ownership).
-                            reason = failure.get("reason", "unknown")
-                            key = str(account_doc.get("phone", "")).strip()
-                            if reason.startswith("failed") or not self.is_running:
-                                logger.warning(
-                                    f"ADDER_ACCOUNT_DROPPED | account={key} | reason={reason}"
-                                )
-                                continue
-                            count = account_retry.get(key, 0) + 1
-                            no_proxy = reason == "no_proxy"
-                            max_attempts = NO_PROXY_LEASE_ATTEMPTS if no_proxy else ADDER_LEASE_ATTEMPTS
-                            if count <= max_attempts:
-                                account_retry[key] = count
-                                await accounts_queue.put(account_doc)
-                                logger.info(
-                                    f"ADDER_LEASE_RETRY | account={key} | attempt={count}/"
-                                    f"{max_attempts} | reason={reason} | requeued"
-                                )
-                                if no_proxy:
-                                    await asyncio.sleep(random.uniform(30, 60))
-                                else:
-                                    await asyncio.sleep(random.uniform(15, 30))
-                            else:
-                                logger.warning(
-                                    f"ADDER_ACCOUNT_SKIPPED | account={key} | no lease after "
-                                    f"{max_attempts} retries | reason={reason}"
-                                )
-                            continue
+        def _is_blocked(doc_or_phone: Any) -> bool:
+            key = _phone_key(doc_or_phone)
+            return bool(key) and key in blocked_phones
 
-                        # Account acquired a live session and reached the
-                        # invite stage — used to detect "all accounts flood".
-                        self.accounts_acquired += 1
+        async def _block_for_run(phone: str) -> None:
+            key = _phone_key(phone)
+            if not key:
+                return
+            async with queue_lock:
+                blocked_phones.add(key)
+                kept_rem = deque(d for d in remaining_q if _phone_key(d) != key)
+                remaining_q.clear()
+                remaining_q.extend(kept_rem)
+                deferred_accounts[:] = [
+                    d for d in deferred_accounts if _phone_key(d) != key
+                ]
+                kept_sp = deque(d for d in spare_accounts if _phone_key(d) != key)
+                spare_accounts.clear()
+                spare_accounts.extend(kept_sp)
 
+        def _note_skip() -> None:
+            self.total_skipped += 1
+            if self.adder_state:
+                self.adder_state.skipped += 1
+
+        def _note_park() -> None:
+            if self.adder_state:
+                self.adder_state.parked = int(getattr(self.adder_state, "parked", 0) or 0) + 1
+
+        async def _rest_account_24h(phone: str, err_name: str) -> None:
+            await _block_for_run(phone)
+            note = f"ADDER_REST_24H | {err_name}"
+            try:
+                park_async = getattr(self.db, "park_module_rest_async", None)
+                if callable(park_async):
+                    await park_async(phone, "adder", note, 24.0)
+                else:
+                    park_sync = getattr(self.db, "park_module_rest", None)
+                    if callable(park_sync):
+                        await asyncio.to_thread(park_sync, phone, "adder", note, 24.0)
+                    else:
+                        # Older DBs: fall back to shared spam_until (tests).
+                        park_legacy = getattr(self.db, "park_spam_limited_async", None)
+                        if callable(park_legacy):
+                            await park_legacy(phone, note, 24.0)
+                        else:
+                            park_legacy_sync = getattr(self.db, "park_spam_limited", None)
+                            if callable(park_legacy_sync):
+                                await asyncio.to_thread(park_legacy_sync, phone, note, 24.0)
+            except Exception as rest_exc:
+                logger.warning(
+                    "ADDER_REST_24H_FAILED | account=%s | %s", phone, rest_exc,
+                )
+            until_str = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+            display = f"+{phone} unavailable (24h rest) until {until_str} · {err_name}"
+            if self.adder_state is not None:
+                resting = getattr(self.adder_state, "resting", None)
+                if resting is None:
+                    self.adder_state.resting = []
+                    resting = self.adder_state.resting
+                resting.append(display)
+            logger.warning("ADDER_REST_24H | %s", display)
+            try:
+                await update_callback(
+                    f"⏸️ Account +{phone} unavailable for adding · 24h rest · "
+                    f"{err_name} · until {until_str}"
+                )
+            except Exception:
+                pass
+
+        async def run_one_account(account_doc: dict) -> Tuple[int, bool]:
+            added_here = 0
+            needs_replace = False
+            if not self.is_running:
+                return 0, False
+            if _is_blocked(account_doc):
+                logger.info(
+                    "ADDER_SKIP_RESTING | account=%s | already on 24h rest / parked this run",
+                    _phone_key(account_doc),
+                )
+                return 0, True
+
+            # Track this worker as alive in the UI as soon as it picks an
+            # account (even while waiting for a session/proxy).
+            if self.adder_state:
+                self.adder_state.active_workers += 1
+
+            try:
+                failure: Dict[str, str] = {}
+                async with account_context(account_doc, failure) as worker_account:
+                    if worker_account is None:
+                        # No lease this round. Hard failure -> drop. Contention
+                        # or cooling proxy pool -> requeue the account for a
+                        # bounded number of retries (never lost, never double-
+                        # booked: SessionManager enforces single ownership).
+                        reason = failure.get("reason", "unknown")
+                        key = str(account_doc.get("phone", "")).strip()
+                        if reason.startswith("chat_stop"):
+                            self.chat_parks += 1
+                            _note_park()
+                            await _block_for_run(key)
+                            logger.warning(
+                                "ADDER_ACCOUNT_SKIP_CHAT | account=%s | %s | parked this target (not dead)",
+                                key, reason,
+                            )
+                            return 0, True
+                        if _is_blocked(key):
+                            logger.info(
+                                "ADDER_SKIP_RESTING | account=%s | %s",
+                                key, reason,
+                            )
+                            return 0, True
                         try:
-                            while self.is_running:
+                            getter = getattr(self.db, "get_session_by_phone_async", None)
+                            rec = await getter(key) if callable(getter) else None
+                            if rec and (
+                                is_spam_park_active(rec)
+                                or is_module_rest_active(rec, "adder")
+                            ):
+                                await _block_for_run(key)
+                                logger.info(
+                                    "ADDER_SKIP_RESTING | account=%s | spam_until active",
+                                    key,
+                                )
+                                return 0, True
+                        except Exception:
+                            pass
+                        if reason.startswith("failed") or not self.is_running:
+                            logger.warning(
+                                f"ADDER_ACCOUNT_DROPPED | account={key} | reason={reason}"
+                            )
+                            return 0, True
+                        count = account_retry.get(key, 0) + 1
+                        no_proxy = reason == "no_proxy"
+                        max_attempts = NO_PROXY_LEASE_ATTEMPTS if no_proxy else ADDER_LEASE_ATTEMPTS
+                        if count <= max_attempts:
+                            account_retry[key] = count
+                            async with queue_lock:
+                                deferred_accounts.append(account_doc)
+                            logger.info(
+                                f"ADDER_LEASE_RETRY | account={key} | attempt={count}/"
+                                f"{max_attempts} | reason={reason} | requeued"
+                            )
+                            if no_proxy:
+                                await asyncio.sleep(random.uniform(*NO_PROXY_RETRY_DELAY))
+                            else:
+                                await asyncio.sleep(random.uniform(*LEASE_RETRY_DELAY))
+                            return 0, False
+                        logger.warning(
+                            f"ADDER_ACCOUNT_SKIPPED | account={key} | no lease after "
+                            f"{max_attempts} retries | reason={reason}"
+                        )
+                        return 0, True
+
+                    # Account acquired a live session and reached the
+                    # invite stage — used to detect "all accounts flood".
+                    self.accounts_acquired += 1
+
+                    try:
+                        pending_retry = None
+                        while self.is_running:
+                            is_restriction_retry = False
+                            if pending_retry is not None:
+                                member = pending_retry
+                                pending_retry = None
+                                is_restriction_retry = True
+                            else:
                                 try:
                                     member = members_queue.get_nowait()
                                 except asyncio.QueueEmpty:
                                     break
 
-                                uname = str(member.get("username", "")).strip()
-                                uid = str(member.get("user_id", "")).strip()
-                                access_hash = str(member.get("access_hash", "0")).strip()
-                                identity = uname if (uname and uname != "None" and uname != "") else uid
+                            uname = str(member.get("username", "")).strip()
+                            uid = str(member.get("user_id", "")).strip()
+                            access_hash = str(member.get("access_hash", "0")).strip()
+                            identity = uid if (uid and uid not in ("None", "0")) else uname
+                            hash_ok = bool(access_hash and access_hash not in ("0", "None"))
+                            has_username = bool(uname and uname not in ("None", ""))
 
-                                try:
-                                    if uname and uname != "None" and uname != "":
-                                        target_user = await worker_account["client"].get_input_entity(uname)
-                                    elif uid and access_hash and access_hash != "0":
-                                        target_user = InputPeerUser(int(uid), int(access_hash))
-                                    else:
-                                        if self.adder_state:
-                                            self.adder_state.skipped += 1
-                                        await asyncio.to_thread(
-                                            self.db.log_addition_state, uid, uname, "invalid_identity")
-                                        continue
-
-                                    api_start_time = time.time()
-                                    await worker_account["client"](
-                                        InviteToChannelRequest(worker_account["target_peer"], [target_user])
-                                    )
-                                    api_delay = time.time() - api_start_time
-
-                                    self.total_added += 1
-                                    worker_account["burst_count"] += 1
-                                    await asyncio.to_thread(
-                                        self.db.log_addition_state, uid, uname, "success_added")
-
-                                    if self.adder_state:
-                                        self.adder_state.completed += 1
-                                        self.adder_state.total_delay_sum += api_delay
-
-                                    if self.total_added % PROGRESS_UPDATE_INTERVAL == 0:
-                                        if not self.adder_state:
-                                            await update_callback(
-                                                f"📊 **Live Tracking:** `{self.total_added}` members added."
-                                            )
-
-                                    if worker_account["burst_count"] >= BURST_ADD_LIMIT:
-                                        sleep_time = random.uniform(*BURST_COOLDOWN_TIME)
-                                        if self.adder_state:
-                                            self.adder_state.total_delay_sum += sleep_time
-                                        await asyncio.sleep(sleep_time)
-                                        worker_account["burst_count"] = 0
-                                    else:
-                                        sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
-                                        if self.adder_state:
-                                            self.adder_state.total_delay_sum += sleep_time
-                                        await asyncio.sleep(sleep_time)
-
-                                except UserPrivacyRestrictedError:
-                                    self.privacy_skips += 1
-                                    if self.adder_state:
-                                        self.adder_state.skipped += 1
-                                    await asyncio.to_thread(
-                                        self.db.log_addition_state, uid, uname, "privacy_restricted")
-
-                                    sleep_time = random.uniform(3, 6)
-                                    if self.adder_state:
-                                        self.adder_state.total_delay_sum += sleep_time
-                                    await asyncio.sleep(sleep_time)
-
-                                except UserAlreadyParticipantError:
-                                    if self.adder_state:
-                                        self.adder_state.skipped += 1
-                                    await asyncio.to_thread(
-                                        self.db.log_addition_state, uid, uname, "already_member")
-
-                                    sleep_time = random.uniform(1.5, 3.5)
-                                    if self.adder_state:
-                                        self.adder_state.total_delay_sum += sleep_time
-                                    await asyncio.sleep(sleep_time)
-
-                                except FLOOD_STOP_ERRORS as fl_err:
-                                    # Telegram ordered a backoff (PeerFlood / FloodWait /
-                                    # USER_BANNED_IN_CHANNEL temporary restriction):
-                                    # NEVER keep adding with this account. Requeue the
-                                    # member, release the lease with cooldown (proxy
-                                    # rests 3-5 min, account 15 min), and stop using
-                                    # this account immediately — but keep the account
-                                    # alive in the DB (USER_BANNED_IN_CHANNEL is NOT
-                                    # account termination).
-                                    self.accounts_down += 1
-                                    self.flood_drops += 1
-                                    if self.adder_state:
-                                        self.adder_state.failures += 1
-                                    await members_queue.put(member)
-                                    try:
-                                        worker_account["lease"].proxy_should_cooldown = True
-                                    except Exception:
-                                        pass
-                                    logger.warning(
-                                        "ADDER_FLOOD_STOP | account=%s | proxy_node=%s | first_invite=%s | err=%s | member requeued, account dropped",
-                                        worker_account["clean_phone"],
-                                        worker_account.get("proxy_id", "?"),
-                                        worker_account.get("burst_count", 0) == 0,
-                                        type(fl_err).__name__,
-                                    )
-                                    break
-
-                                except (UserIdInvalidError, ValueError):
-                                    if self.adder_state:
-                                        self.adder_state.skipped += 1
+                            try:
+                                if uid and hash_ok:
+                                    target_user = InputPeerUser(int(uid), int(access_hash))
+                                elif has_username:
+                                    target_user = await worker_account["client"].get_input_entity(uname)
+                                else:
+                                    _note_skip()
                                     await asyncio.to_thread(
                                         self.db.log_addition_state, uid, uname, "invalid_identity")
                                     continue
 
-                                except UserNotMutualContactError:
-                                    # Target user's privacy setting: only mutual
-                                    # contacts can add them. Account is fine; skip
-                                    # this member permanently (same as old usradder).
+                                api_start_time = time.time()
+                                await worker_account["client"](
+                                    InviteToChannelRequest(worker_account["target_peer"], [target_user])
+                                )
+                                api_delay = time.time() - api_start_time
+
+                                self.total_added += 1
+                                added_here += 1
+                                worker_account["burst_count"] += 1
+                                await asyncio.to_thread(
+                                    self.db.log_addition_state, uid, uname, "success_added")
+
+                                if self.adder_state:
+                                    self.adder_state.completed += 1
+                                    self.adder_state.total_delay_sum += api_delay
+
+                                if self.total_added % PROGRESS_UPDATE_INTERVAL == 0:
+                                    if not self.adder_state:
+                                        await update_callback(
+                                            f"📊 **Live Tracking:** `{self.total_added}` members added."
+                                        )
+
+                                if worker_account["burst_count"] >= BURST_ADD_LIMIT:
+                                    sleep_time = random.uniform(*BURST_COOLDOWN_TIME)
                                     if self.adder_state:
-                                        self.adder_state.skipped += 1
+                                        self.adder_state.total_delay_sum += sleep_time
+                                    await asyncio.sleep(sleep_time)
+                                    worker_account["burst_count"] = 0
+                                else:
+                                    sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
+                                    if self.adder_state:
+                                        self.adder_state.total_delay_sum += sleep_time
+                                    await asyncio.sleep(sleep_time)
+
+                            except UserPrivacyRestrictedError:
+                                self.privacy_skips += 1
+                                _note_skip()
+                                await asyncio.to_thread(
+                                    self.db.log_addition_state, uid, uname, "privacy_restricted")
+
+                                sleep_time = random.uniform(3, 6)
+                                if self.adder_state:
+                                    self.adder_state.total_delay_sum += sleep_time
+                                await asyncio.sleep(sleep_time)
+
+                            except UserAlreadyParticipantError:
+                                _note_skip()
+                                await asyncio.to_thread(
+                                    self.db.log_addition_state, uid, uname, "already_member")
+
+                                sleep_time = random.uniform(1.5, 3.5)
+                                if self.adder_state:
+                                    self.adder_state.total_delay_sum += sleep_time
+                                await asyncio.sleep(sleep_time)
+
+                            except FloodWaitError as fl_err:
+                                seconds = int(getattr(fl_err, "seconds", 0) or 0)
+                                await members_queue.put(member)
+                                if 0 < seconds <= SHORT_FLOOD_WAIT:
+                                    wait = seconds + random.uniform(1, 5)
+                                    logger.warning(
+                                        "ADDER_FLOOD_WAIT | account=%s | sleep=%.0fs then retry same account",
+                                        worker_account["clean_phone"], wait,
+                                    )
+                                    if self.adder_state:
+                                        self.adder_state.total_delay_sum += wait
+                                    await asyncio.sleep(wait)
+                                    continue
+                                self.flood_drops += 1
+                                _note_park()
+                                needs_replace = True
+                                await _block_for_run(worker_account["clean_phone"])
+                                logger.warning(
+                                    "ADDER_FLOOD_STOP | account=%s | proxy_node=%s | err=FloodWaitError(%ss) | account parked this run (not marked failed, lease released)",
+                                    worker_account["clean_phone"],
+                                    worker_account.get("proxy_id", "?"),
+                                    seconds,
+                                )
+                                break
+
+                            except FLOOD_STOP_ERRORS as fl_err:
+                                err_name = type(fl_err).__name__
+                                if not is_restriction_retry:
+                                    logger.info(
+                                        "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
+                                        worker_account["clean_phone"], err_name,
+                                    )
+                                    pending_retry = member
+                                    continue
+                                await members_queue.put(member)
+                                if _is_user_banned_in_channel(fl_err):
+                                    self.chat_parks += 1
+                                    if worker_account.get("burst_count", 0) == 0:
+                                        self._first_invite_chat_bans += 1
+                                else:
+                                    self.flood_drops += 1
+                                _note_park()
+                                needs_replace = True
+                                logger.warning(
+                                    "ADDER_RESTRICT_STOP | account=%s | proxy_node=%s | err=%s | "
+                                    "member requeued, account 24h rest (not marked failed)",
+                                    worker_account["clean_phone"],
+                                    worker_account.get("proxy_id", "?"),
+                                    err_name,
+                                )
+                                await _rest_account_24h(
+                                    worker_account["clean_phone"], err_name,
+                                )
+                                break
+
+                            except (UserIdInvalidError, ValueError):
+                                _note_skip()
+                                await asyncio.to_thread(
+                                    self.db.log_addition_state, uid, uname, "invalid_identity")
+                                continue
+
+                            except UserNotMutualContactError:
+                                _note_skip()
+                                await asyncio.to_thread(
+                                    self.db.log_addition_state, uid, uname, "not_mutual_contact")
+                                sleep_time = random.uniform(1.5, 3.5)
+                                if self.adder_state:
+                                    self.adder_state.total_delay_sum += sleep_time
+                                await asyncio.sleep(sleep_time)
+                                continue
+
+                            except asyncio.CancelledError:
+                                try:
+                                    await members_queue.put(member)
+                                except Exception:
+                                    pass
+                                raise
+
+                            except TelethonRPCError as rpc_err:
+                                if _is_chat_member_add_failed(rpc_err):
+                                    _note_skip()
                                     await asyncio.to_thread(
-                                        self.db.log_addition_state, uid, uname, "not_mutual_contact")
+                                        self.db.log_addition_state, uid, uname, "add_failed")
+                                    logger.info(
+                                        "ADDER_MEMBER_SKIP | CHAT_MEMBER_ADD_FAILED | identity=%s",
+                                        identity,
+                                    )
                                     sleep_time = random.uniform(1.5, 3.5)
                                     if self.adder_state:
                                         self.adder_state.total_delay_sum += sleep_time
                                     await asyncio.sleep(sleep_time)
                                     continue
-
-                                except TelethonRPCError as rpc_err:
-                                    # Generic chat-level failure (e.g. CHAT_MEMBER_ADD_FAILED):
-                                    # do NOT kill the account. Log member as processed
-                                    # and move on, matching old usradder behavior.
+                                if _is_add_restriction_error(rpc_err):
                                     err_name = type(rpc_err).__name__
-                                    if "CHAT_MEMBER_ADD_FAILED" in err_name or "CHAT_" in err_name:
-                                        if self.adder_state:
-                                            self.adder_state.skipped += 1
-                                        await asyncio.to_thread(
-                                            self.db.log_addition_state, uid, uname, "add_failed")
-                                        sleep_time = random.uniform(1.5, 3.5)
-                                        if self.adder_state:
-                                            self.adder_state.total_delay_sum += sleep_time
-                                        await asyncio.sleep(sleep_time)
-                                        continue
-                                    raise
-
-                                except Exception as crash:
-                                    result = classify_exception(crash)
-                                    if result.is_quarantinable:
-                                        # Account is dead (banned/deactivated/revoked):
-                                        # quarantine via SessionManager — it marks the
-                                        # correct terminal DB status, disconnects the
-                                        # client, and releases the proxy with cooldown.
-                                        # This account is NEVER used again this run.
-                                        self.accounts_down += 1
-                                        if self.adder_state:
-                                            self.adder_state.failures += 1
-                                        try:
-                                            await self.session_manager.mark_quarantined(
-                                                worker_account["clean_phone"],
-                                                reason=result.reason[:100],
-                                                category=result.category,
-                                            )
-                                        except Exception:
-                                            pass
-                                        logger.warning(
-                                            "ADDER_ACCOUNT_QUARANTINED | account=%s | reason=%s",
-                                            worker_account["clean_phone"], result.reason[:80],
+                                    if not is_restriction_retry:
+                                        logger.info(
+                                            "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
+                                            worker_account["clean_phone"], err_name,
                                         )
-                                        break
-
-                                    # Transient error: requeue the member for retry,
-                                    # rest briefly, and drop the account so it is not
-                                    # hammered — the proxy gets its cooldown window
-                                    # when the lease is released.
+                                        pending_retry = member
+                                        continue
                                     await members_queue.put(member)
-                                    sleep_time = random.uniform(8, 12)
-                                    if self.adder_state:
-                                        self.adder_state.total_delay_sum += sleep_time
-                                    await asyncio.sleep(sleep_time)
-                                    try:
-                                        worker_account["lease"].proxy_should_cooldown = True
-                                    except Exception:
-                                        pass
-                                    logger.info(
-                                        "ADDER_ACCOUNT_DROPPED_TRANSIENT | account=%s | err=%s",
-                                        worker_account["clean_phone"], str(crash)[:80],
+                                    self.chat_parks += 1
+                                    _note_park()
+                                    needs_replace = True
+                                    if worker_account.get("burst_count", 0) == 0:
+                                        self._first_invite_chat_bans += 1
+                                    logger.warning(
+                                        "ADDER_RESTRICT_STOP | account=%s | err=%s | "
+                                        "member requeued, account 24h rest (not marked failed)",
+                                        worker_account["clean_phone"], err_name,
+                                    )
+                                    await _rest_account_24h(
+                                        worker_account["clean_phone"], err_name,
                                     )
                                     break
-                        finally:
-                            # Closes the member-processing try for this account.
-                            pass
-                finally:
-                    if self.adder_state:
-                        self.adder_state.active_workers = max(
-                            0,
-                            self.adder_state.active_workers - 1,
-                        )
+                                if _is_target_chat_stop(rpc_err):
+                                    await members_queue.put(member)
+                                    self.chat_parks += 1
+                                    _note_park()
+                                    needs_replace = True
+                                    await _block_for_run(worker_account["clean_phone"])
+                                    if worker_account.get("burst_count", 0) == 0:
+                                        self._first_invite_chat_bans += 1
+                                    logger.warning(
+                                        "ADDER_ACCOUNT_SKIP_CHAT | account=%s | err=%s | parked this target (not dead)",
+                                        worker_account["clean_phone"],
+                                        type(rpc_err).__name__,
+                                    )
+                                    break
+                                _note_skip()
+                                await asyncio.to_thread(
+                                    self.db.log_addition_state, uid, uname, "rpc_skip")
+                                logger.info(
+                                    "ADDER_MEMBER_SKIP | rpc=%s | identity=%s",
+                                    type(rpc_err).__name__, identity,
+                                )
+                                continue
 
-        # 🔥 FIX: Launch workers concurrently and await execution
-        self.active_workers = [asyncio.create_task(worker_loop()) for _ in range(MAX_WORKER_SESSIONS)]
+                            except Exception as crash:
+                                if _is_chat_member_add_failed(crash):
+                                    _note_skip()
+                                    await asyncio.to_thread(
+                                        self.db.log_addition_state, uid, uname, "add_failed")
+                                    logger.info(
+                                        "ADDER_MEMBER_SKIP | CHAT_MEMBER_ADD_FAILED | identity=%s",
+                                        identity,
+                                    )
+                                    continue
+                                if _is_add_restriction_error(crash):
+                                    err_name = type(crash).__name__
+                                    if not is_restriction_retry:
+                                        logger.info(
+                                            "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
+                                            worker_account["clean_phone"], err_name,
+                                        )
+                                        pending_retry = member
+                                        continue
+                                    await members_queue.put(member)
+                                    if _is_user_banned_in_channel(crash):
+                                        self.chat_parks += 1
+                                    else:
+                                        self.flood_drops += 1
+                                    _note_park()
+                                    needs_replace = True
+                                    if worker_account.get("burst_count", 0) == 0:
+                                        self._first_invite_chat_bans += 1
+                                    logger.warning(
+                                        "ADDER_RESTRICT_STOP | account=%s | err=%s | "
+                                        "member requeued, account 24h rest (not marked failed)",
+                                        worker_account["clean_phone"], err_name,
+                                    )
+                                    await _rest_account_24h(
+                                        worker_account["clean_phone"], err_name,
+                                    )
+                                    break
+                                if _is_target_chat_stop(crash):
+                                    await members_queue.put(member)
+                                    self.chat_parks += 1
+                                    _note_park()
+                                    needs_replace = True
+                                    await _block_for_run(worker_account["clean_phone"])
+                                    if worker_account.get("burst_count", 0) == 0:
+                                        self._first_invite_chat_bans += 1
+                                    logger.warning(
+                                        "ADDER_ACCOUNT_SKIP_CHAT | account=%s | err=%s | parked this target (not dead)",
+                                        worker_account["clean_phone"],
+                                        type(crash).__name__,
+                                    )
+                                    break
+                                result = classify_exception(crash)
+                                if result.is_quarantinable:
+                                    # Account is dead (banned/deactivated/revoked):
+                                    # quarantine via SessionManager — it marks the
+                                    # correct terminal DB status, disconnects the
+                                    # client, and releases the proxy with cooldown.
+                                    # This account is NEVER used again this run.
+                                    self.accounts_down += 1
+                                    if self.adder_state:
+                                        self.adder_state.failures += 1
+                                    needs_replace = True
+                                    try:
+                                        await self.session_manager.mark_quarantined(
+                                            worker_account["clean_phone"],
+                                            reason=result.reason[:100],
+                                            category=result.category,
+                                        )
+                                    except Exception:
+                                        pass
+                                    logger.warning(
+                                        "ADDER_ACCOUNT_QUARANTINED | account=%s | reason=%s",
+                                        worker_account["clean_phone"], result.reason[:80],
+                                    )
+                                    break
+
+                                # Transient error: requeue the member. Retryable
+                                # network/timeout errors also requeue the account
+                                # (bounded) instead of dropping it for the whole run.
+                                await members_queue.put(member)
+                                sleep_time = random.uniform(8, 12)
+                                if self.adder_state:
+                                    self.adder_state.total_delay_sum += sleep_time
+                                await asyncio.sleep(sleep_time)
+                                try:
+                                    worker_account["lease"].proxy_should_cooldown = True
+                                except Exception:
+                                    pass
+                                if result.retryable:
+                                    key = str(account_doc.get("phone", "")).strip()
+                                    count = account_retry.get(key, 0) + 1
+                                    if count <= ADDER_LEASE_ATTEMPTS:
+                                        account_retry[key] = count
+                                        async with queue_lock:
+                                            deferred_accounts.append(account_doc)
+                                        logger.info(
+                                            "ADDER_ACCOUNT_RETRY_TRANSIENT | account=%s | attempt=%s/%s | err=%s",
+                                            worker_account["clean_phone"], count,
+                                            ADDER_LEASE_ATTEMPTS, str(crash)[:80],
+                                        )
+                                        break
+                                logger.info(
+                                    "ADDER_ACCOUNT_DROPPED_TRANSIENT | account=%s | err=%s",
+                                    worker_account["clean_phone"], str(crash)[:80],
+                                )
+                                needs_replace = True
+                                break
+                    finally:
+                        # Closes the member-processing try for this account.
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as worker_exc:
+                logger.warning(
+                    "ADDER_WORKER_SURVIVED | account=%s | err=%s",
+                    str(account_doc.get("phone", "")).strip(),
+                    worker_exc,
+                )
+                if self.adder_state:
+                    self.adder_state.failures += 1
+                needs_replace = True
+            finally:
+                if self.adder_state:
+                    self.adder_state.active_workers = max(
+                        0,
+                        self.adder_state.active_workers - 1,
+                    )
+            return added_here, needs_replace
+
+        # Pipelined batches: each batch is BATCH_SIZE accounts. Up to
+        # MAX_CONCURRENT_BATCHES run at once. As soon as batch A is running,
+        # batch B is armed in the background. New batches stop when live
+        # accounts hit the proxy / max_live ceiling. Each account keeps
+        # inviting until Telegram returns a stopping error.
+        self.active_workers = []
+        self._batch_tasks: List[asyncio.Task] = []
+        accounts_in_flight = 0
+        in_flight_lock = asyncio.Lock()
+
+        async def _pending_accounts() -> bool:
+            async with queue_lock:
+                if any(not _is_blocked(d) for d in deferred_accounts):
+                    return True
+                if any(not _is_blocked(d) for d in remaining_q):
+                    return True
+                return False
+
+        async def _pop_wave(max_n: int) -> List[dict]:
+            async with queue_lock:
+                wave: List[dict] = []
+                while len(wave) < max_n:
+                    doc = None
+                    if deferred_accounts:
+                        doc = deferred_accounts.pop(0)
+                    elif remaining_q:
+                        doc = remaining_q.popleft()
+                    else:
+                        break
+                    if _is_blocked(doc):
+                        continue
+                    wave.append(doc)
+                return wave
+
+        async def _take_replacement() -> Optional[dict]:
+            async with queue_lock:
+                while spare_accounts:
+                    doc = spare_accounts.popleft()
+                    if not _is_blocked(doc):
+                        return doc
+                while remaining_q:
+                    doc = remaining_q.popleft()
+                    if not _is_blocked(doc):
+                        return doc
+                while deferred_accounts:
+                    doc = deferred_accounts.pop(0)
+                    if not _is_blocked(doc):
+                        return doc
+                return None
+
+        async def run_slot(account_doc: dict) -> int:
+            added = 0
+            current: Optional[dict] = account_doc
+            while current is not None and self.is_running:
+                n, needs_replace = await run_one_account(current)
+                added += n
+                if not needs_replace or not self.is_running:
+                    break
+                if members_queue.empty():
+                    break
+                nxt = await _take_replacement()
+                if nxt is None:
+                    break
+                logger.info(
+                    "ADDER_ACCOUNT_REPLACE | rested=%s | next=%s | members_left=%s",
+                    str(current.get("phone", "")).strip(),
+                    str(nxt.get("phone", "")).strip(),
+                    members_queue.qsize(),
+                )
+                try:
+                    await update_callback(
+                        f"🔁 Replaced +{current.get('phone', '')} with "
+                        f"+{nxt.get('phone', '')} (24h rest / stop)"
+                    )
+                except Exception:
+                    pass
+                current = nxt
+            return added
+
+        async def run_batch(wave: List[dict], label: str) -> None:
+            logger.info(
+                "📦 Batch %s starting | accounts=%s | members_left=%s",
+                label, len(wave), members_queue.qsize(),
+            )
+            try:
+                await update_callback(
+                    f"📦 Batch {label} started | accounts={len(wave)}"
+                )
+            except Exception:
+                pass
+            tasks = []
+            for i, doc in enumerate(wave):
+                if not self.is_running:
+                    break
+                if i:
+                    delay = random.uniform(*ACCOUNT_LAUNCH_DELAY)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                task = asyncio.create_task(run_slot(doc))
+                tasks.append(task)
+                self.active_workers.append(task)
+            results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+            added_this_batch = 0
+            for result in results:
+                if isinstance(result, int):
+                    added_this_batch += result
+            logger.info(
+                "📦 Batch %s added %s members (campaign total=%s)",
+                label, added_this_batch, self.total_added,
+            )
+            self.batch_reports.append({
+                "label": label,
+                "added": added_this_batch,
+                "accounts": len(wave),
+            })
+            try:
+                await update_callback(
+                    f"📦 Batch {label} added {added_this_batch} members "
+                    f"(campaign total={self.total_added})"
+                )
+            except Exception:
+                pass
+
+        async def dispatch_batches() -> None:
+            nonlocal accounts_in_flight
+            while self.is_running:
+                live = [t for t in self._batch_tasks if not t.done()]
+                self._batch_tasks = live
+
+                if self._stop_new_batches:
+                    if live:
+                        await asyncio.gather(*live, return_exceptions=True)
+                    break
+
+                if members_queue.empty() and self._batch_index > 0:
+                    if live:
+                        await asyncio.gather(*live, return_exceptions=True)
+                    break
+
+                pending = await _pending_accounts()
+                if not pending:
+                    if live:
+                        await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
+                        continue
+                    break
+
+                at_batch_cap = len(live) >= MAX_CONCURRENT_BATCHES
+                at_proxy_cap = accounts_in_flight >= MAX_LIVE_ACCOUNTS
+                if at_batch_cap or at_proxy_cap:
+                    if not live:
+                        break
+                    await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
+                    continue
+
+                room = MAX_LIVE_ACCOUNTS - accounts_in_flight
+                wave = await _pop_wave(min(BATCH_SIZE, room))
+                if not wave:
+                    if live:
+                        await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
+                        continue
+                    break
+
+                label = _batch_letter(self._batch_index)
+                self._batch_index += 1
+                async with in_flight_lock:
+                    accounts_in_flight += len(wave)
+                wave_size = len(wave)
+
+                async def _guarded(_wave=wave, _label=label, _n=wave_size) -> None:
+                    nonlocal accounts_in_flight
+                    try:
+                        await run_batch(_wave, _label)
+                    finally:
+                        async with in_flight_lock:
+                            accounts_in_flight = max(0, accounts_in_flight - _n)
+
+                task = asyncio.create_task(_guarded())
+                self._batch_tasks.append(task)
+                # Yield so batch A actually starts running before we arm B.
+                await asyncio.sleep(0)
+
+            leftover = [t for t in self._batch_tasks if not t.done()]
+            if leftover:
+                await asyncio.gather(*leftover, return_exceptions=True)
+
         try:
-            await asyncio.gather(*self.active_workers)
+            await dispatch_batches()
         except asyncio.CancelledError:
-            pass
+            pending = [
+                t for t in list(self.active_workers) + list(self._batch_tasks)
+                if t is not None and not t.done()
+            ]
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
-        # Stop tracker gracefully after gathering workers
+        remaining_members = members_queue.qsize()
         if self.adder_state:
-            self.adder_state.stop()
+            if remaining_members:
+                self.adder_state.stop("Stopped")
+            else:
+                self.adder_state.stop("Completed")
 
-        # ── ALL accounts gave the same flood response → one short message ──
+        parked = int(self.chat_parks) + int(self.flood_drops)
+        skipped = int(self.total_skipped)
+        summary_tail = (
+            f"✅ Added: {self.total_added} • ⏭️ Skipped: {skipped} • "
+            f"🅿️ Parked: {parked} • 💀 Dead: {self.accounts_down}"
+        )
+
         if (
             self.accounts_acquired > 0
             and self.total_added == 0
@@ -831,14 +1466,26 @@ class EnterpriseMemberAdder:
                 f"⏳ Wait 12–24h, then try `/addmembers` again"
             )
 
-        if self.accounts_down >= len(active_accounts) and not members_queue.empty():
+        if self._stop_new_batches and remaining_members:
             return (
-                f"⚠️ All workers stopped (sessions blocked) • ✅ Added: {self.total_added}"
+                f"⚠️ Stopped: this target banned further invites "
+                f"({self.chat_parks} accounts parked for this group)\n"
+                f"{summary_tail} • ⏳ Remaining: {remaining_members}"
             )
 
-        return (
-            f"✅ Added {self.total_added} members • ⏭️ {self.privacy_skips} skipped • 💀 {self.accounts_down} accounts down"
-        )
+        if remaining_members and (self.accounts_down + parked) >= max(1, self.accounts_acquired):
+            return (
+                f"⚠️ Stopped with members remaining • {summary_tail} • "
+                f"⏳ Remaining: {remaining_members}"
+            )
+
+        if remaining_members:
+            return (
+                f"⚠️ Stopped with members remaining • {summary_tail} • "
+                f"⏳ Remaining: {remaining_members}"
+            )
+
+        return f"{summary_tail}"
 
     def halt_engine(self):
         """Kills active loop variables instantly safely."""
@@ -848,3 +1495,6 @@ class EnterpriseMemberAdder:
         if hasattr(self, 'active_workers'):
             for worker in self.active_workers:
                 worker.cancel()
+        if hasattr(self, '_batch_tasks'):
+            for task in self._batch_tasks:
+                task.cancel()

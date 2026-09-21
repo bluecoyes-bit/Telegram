@@ -107,7 +107,7 @@ class MemberScraper:
         return {
             "user_id": str(user.id),
             "access_hash": str(getattr(user, 'access_hash', '0')),
-            "username": str(user.username) if user.username else "None",
+            "username": str(user.username) if user.username else "",
             "first_name": str(user.first_name or ''),
             "last_name": str(user.last_name or ''),
             "activity_status": status_str,
