@@ -7,7 +7,7 @@ Telethon>=1.33.0
 # 2. WEBRTC AUDIO TRANSMISSION NETWORKING
 # =====================================================================
 # Native WebRTC pipeline interface (latest stable version)
-pytgcalls==2.1.0
+#pytgcalls==2.1.0
 
 # =====================================================================
 # 3. STORAGE DATABASES ECOSYSYTEM LINKS
