@@ -163,6 +163,10 @@ CONFIG: Dict[str, Any] = {
     "BURST_COOLDOWN_TIME": (60, 120),
     "LOOP_KEEP_ALIVE": (30, 45),
 
+    # Sticky-session slots on the Decodo gateway. Scan does not grow this —
+    # set it to the purchased IP/session count (Railway must set this env).
+    "DECODO_PROXY_COUNT": _env_int("DECODO_PROXY_COUNT", 100, 1, 500),
+    "DECODO_PROXY_LIST_URL": _env_str("DECODO_PROXY_LIST_URL", ""),
     "MAX_POOL_SIZE": _env_int("MAX_POOL_SIZE", 50, 10, 500),
     "MAX_POOL_ABSOLUTE": _env_int("MAX_POOL_ABSOLUTE", 200, 20, 1000),
     "STATUS_BAR_CACHE_TTL": _env_int("STATUS_BAR_CACHE_TTL", 30, 5, 300),

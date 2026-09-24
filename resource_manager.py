@@ -281,7 +281,7 @@ class DecodoProxyProvider(ProxyProvider):
         self.password = os.environ.get("DECODO_PASSWORD", "")
         self.endpoint = os.environ.get("DECODO_HOST", "dc.decodo.com")
         self.port = int(os.environ.get("DECODO_PORT", "10001"))
-        self.proxy_count = max(1, int(os.environ.get("DECODO_PROXY_COUNT", "10")))
+        self.proxy_count = max(1, int(CONFIG.get("DECODO_PROXY_COUNT", 100) or 100))
 
     def _node_username(self) -> str:
         """Base username with Decodo's mandatory 'user-' prefix when parameters
@@ -365,8 +365,11 @@ class DecodoProxyProvider(ProxyProvider):
             return []
 
         # ── Mode A: dedicated IP list via the dashboard API URL (preferred) ──
-        list_url = (os.environ.get("DECODO_PROXY_LIST_URL")
-                    or os.environ.get("DECODO_API_URL") or "").strip()
+        list_url = (
+            str(CONFIG.get("DECODO_PROXY_LIST_URL") or "").strip()
+            or os.environ.get("DECODO_PROXY_LIST_URL", "").strip()
+            or os.environ.get("DECODO_API_URL", "").strip()
+        )
         if list_url:
             nodes = self._load_from_list_api(list_url)
             if nodes:
@@ -405,7 +408,8 @@ class DecodoProxyProvider(ProxyProvider):
             nodes.append(self._build_node(proxy_id=f"decodo_{sid}", username=node_user))
         logger.info(
             f"DecodoProxyProvider generated {len(nodes)} sticky-session proxies "
-            f"from {self.endpoint}:{self.port}"
+            f"from {self.endpoint}:{self.port} (DECODO_PROXY_COUNT={self.proxy_count}; "
+            f"scan cannot add more — set DECODO_PROXY_LIST_URL for dedicated IPs)"
         )
         return nodes
 

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
-from telethon.tl.types import InputPeerChannel, InputPeerUser
+from telethon.tl.types import InputPeerChannel
 from telethon.errors import (
     UserPrivacyRestrictedError, UserAlreadyParticipantError,
     FloodWaitError, PeerFloodError, UserIdInvalidError, MessageNotModifiedError,
@@ -906,15 +906,13 @@ class EnterpriseMemberAdder:
 
                             uname = str(member.get("username", "")).strip()
                             uid = str(member.get("user_id", "")).strip()
-                            access_hash = str(member.get("access_hash", "0")).strip()
-                            identity = uid if (uid and uid not in ("None", "0")) else uname
-                            hash_ok = bool(access_hash and access_hash not in ("0", "None"))
-                            has_username = bool(uname and uname not in ("None", ""))
+                            identity = uname if uname and uname.lower() not in ("none", "null") else uid
+                            has_username = bool(uname and uname.lower() not in ("none", "null", ""))
 
                             try:
-                                if uid and hash_ok:
-                                    target_user = InputPeerUser(int(uid), int(access_hash))
-                                elif has_username:
+                                # Cross-account adds: scraper access_hash is bound to
+                                # the scraper session (PEER_ID_INVALID / UserIdInvalid).
+                                if has_username:
                                     target_user = await worker_account["client"].get_input_entity(uname)
                                 else:
                                     _note_skip()
@@ -1009,6 +1007,11 @@ class EnterpriseMemberAdder:
                                         "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
                                         worker_account["clean_phone"], err_name,
                                     )
+                                    sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
+                                    if self.adder_state:
+                                        self.adder_state.total_delay_sum += sleep_time
+                                    if sleep_time > 0:
+                                        await asyncio.sleep(sleep_time)
                                     pending_retry = member
                                     continue
                                 await members_queue.put(member)
@@ -1076,6 +1079,11 @@ class EnterpriseMemberAdder:
                                             "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
                                             worker_account["clean_phone"], err_name,
                                         )
+                                        sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
+                                        if self.adder_state:
+                                            self.adder_state.total_delay_sum += sleep_time
+                                        if sleep_time > 0:
+                                            await asyncio.sleep(sleep_time)
                                         pending_retry = member
                                         continue
                                     await members_queue.put(member)
@@ -1133,6 +1141,11 @@ class EnterpriseMemberAdder:
                                             "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
                                             worker_account["clean_phone"], err_name,
                                         )
+                                        sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
+                                        if self.adder_state:
+                                            self.adder_state.total_delay_sum += sleep_time
+                                        if sleep_time > 0:
+                                            await asyncio.sleep(sleep_time)
                                         pending_retry = member
                                         continue
                                     await members_queue.put(member)
