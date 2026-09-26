@@ -56,27 +56,40 @@ class MemberScraper:
     def resolve_group_link(self, link_str: str) -> tuple[bool, str]:
         if not link_str:
             return False, ""
-            
-        # FIX: Aggressively sanitize any extra characters, brackets, or quotes from copy-paste
-        clean_target = str(link_str).replace("<", "").replace(">", "").replace('"', '').replace("'", "").strip()
-        clean_target = clean_target.rstrip("/")
-        
-        # Regex to capture hash from private links format
-        private_pattern = re.compile(r'(?:t\.me|telegram\.me)/(?:\+|joinchat/)([a-zA-Z0-9_\-]+)')
-        private_match = private_pattern.search(clean_target)
-        
-        if private_match:
-            hash_token = private_match.group(1).strip()
-            return True, hash_token
-            
-        # Fallback for direct hashes without domain
-        if not "/" in clean_target and not clean_target.startswith("@"):
-            if len(clean_target) >= 12 and re.match(r'^[a-zA-Z0-9_\-]+$', clean_target):
-                return True, clean_target
 
-        public_payload = clean_target.split("/")[-1]
-        public_payload = public_payload.lstrip("@").strip()
-        
+        clean_target = str(link_str).replace("<", "").replace(">", "").replace('"', "").replace("'", "").strip()
+        if clean_target:
+            clean_target = clean_target.split()[0]
+        clean_target = clean_target.rstrip("/")
+        if "?" in clean_target:
+            clean_target = clean_target.split("?", 1)[0]
+        if "#" in clean_target:
+            clean_target = clean_target.split("#", 1)[0]
+
+        private_pattern = re.compile(
+            r"(?:t\.me|telegram\.me|telegram\.dog)/(?:\+|joinchat/)([A-Za-z0-9_\-]+)",
+            re.IGNORECASE,
+        )
+        private_match = private_pattern.search(clean_target)
+        if private_match:
+            return True, private_match.group(1).strip()
+
+        public_pattern = re.compile(
+            r"(?:t\.me|telegram\.me|telegram\.dog)/([A-Za-z0-9_]+)$",
+            re.IGNORECASE,
+        )
+        public_match = public_pattern.search(clean_target)
+        if public_match:
+            return False, public_match.group(1).strip()
+
+        if clean_target.startswith("@"):
+            return False, clean_target.lstrip("@").strip()
+
+        # Bare invite hash (no username underscores). Public @names stay public.
+        if re.fullmatch(r"[A-Za-z0-9\-]{16,32}", clean_target):
+            return True, clean_target
+
+        public_payload = clean_target.split("/")[-1].lstrip("@").strip()
         return False, public_payload
 
     def _determine_activity_status(self, user_obj) -> str:

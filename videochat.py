@@ -605,15 +605,22 @@ class CloudVoiceChatEngine:
         except Exception as exc:
             result = classify_exception(exc)
             if result.terminal:
-                # Terminal session/account errors: quarantine + cleanup, NO retry
-                # (SessionManager already quarantines AuthKeyDuplicatedError
-                # centrally inside acquire()).
+                # Terminal errors can happen AFTER acquire (e.g. get_me).
+                # SessionManager does not auto-quarantine post-yield, so do it here.
                 self._set_cluster_state(phone, VoiceClusterState.TERMINAL)
                 self._voice_log(phone, f"Terminal session error (no retry): {exc}", "error")
                 if result.is_quarantinable:
                     try:
                         clean_phone = "".join(c for c in str(phone) if c.isdigit())
-                        self.db.mark_account_failed(clean_phone, f"Terminal during voice call: {result.category.value}")
+                        await self.session_manager.mark_quarantined(
+                            clean_phone,
+                            reason=result.reason or str(exc)[:200],
+                            category=result.category,
+                        )
+                        self.db.mark_account_failed(
+                            clean_phone,
+                            f"Terminal during voice call: {result.category.value}",
+                        )
                     except Exception:
                         pass
                 return f"TERMINAL: {result.category.value}"

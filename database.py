@@ -352,6 +352,9 @@ class SuiteDatabase:
     def _ensure_connection(self) -> None:
         """Verify connection is alive before critical operations (sync)."""
         self._check_open()
+        if not getattr(self, "client", None):
+            self._init_mongo()
+            return
         try:
             self.client.admin.command('ping')
             self._connection_retry_count = 0

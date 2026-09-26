@@ -92,7 +92,7 @@ class AuditorConfig:
     cooldown_min: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MIN", 300, 60, 3600))
     cooldown_max: int = field(default_factory=lambda: _env_int("AUDITOR_COOLDOWN_MAX", 600, 120, 7200))
     recheck_minutes: int = field(default_factory=lambda: _env_int("AUDITOR_RECHECK_MINUTES", 720, 30, 2880))
-    concurrency: int = field(default_factory=lambda: _env_int("AUDITOR_CONCURRENCY", 3, 1, 10))
+    concurrency: int = field(default_factory=lambda: _env_int("AUDITOR_CONCURRENCY", 1, 1, 10))
     enabled: bool = field(default_factory=lambda: _env_bool("AUDITOR_ENABLED", True))
 
 @dataclass
@@ -173,6 +173,10 @@ CONFIG: Dict[str, Any] = {
     "POOL_CLEANUP_MAX_IDLE": _env_int("POOL_CLEANUP_MAX_IDLE", 3600, 300, 14400),
     "AUTH_STATE_TTL": _env_int("AUTH_STATE_TTL", 300, 60, 900),
     "CLIENT_TIMEOUT": _env_float("CLIENT_TIMEOUT", 10.0),
+    "SESSION_IDLE_TTL": _env_float("SESSION_IDLE_TTL", 600.0),
+    "SESSION_CLEANUP_STARTUP_GRACE": _env_float("SESSION_CLEANUP_STARTUP_GRACE", 180.0),
+    "SESSION_CLEANUP_MIN_HOLD": _env_float("SESSION_CLEANUP_MIN_HOLD", 90.0),
+    "SESSION_CLEANUP_INTERVAL": _env_float("SESSION_CLEANUP_INTERVAL", 45.0),
 
     # ── Auditor ──
     "AUDITOR_BATCH_SIZE": _env_int("AUDITOR_BATCH_SIZE", 10, 1, 100),
@@ -183,8 +187,10 @@ CONFIG: Dict[str, Any] = {
     "AUDITOR_COOLDOWN_MIN": _env_int("AUDITOR_COOLDOWN_MIN", 300, 60, 3600),
     "AUDITOR_COOLDOWN_MAX": _env_int("AUDITOR_COOLDOWN_MAX", 600, 120, 7200),
     "AUDITOR_RECHECK_MINUTES": _env_int("AUDITOR_RECHECK_MINUTES", 720, 30, 2880),
-    "AUDITOR_CONCURRENCY": _env_int("AUDITOR_CONCURRENCY", 3, 1, 10),
+    "AUDITOR_CONCURRENCY": _env_int("AUDITOR_CONCURRENCY", 1, 1, 10),
     "AUDITOR_ENABLED": _env_bool("AUDITOR_ENABLED", True),
+    "AUDITOR_JIT_ACCOUNT_DELAY": (20, 55),
+    "AUDITOR_JIT_SETTLE": (2, 8),
 
     # ── Adder ──
     "ADDER_MAX_WORKERS": _env_int("ADDER_MAX_WORKERS", 90, 1, 100),
@@ -208,6 +214,12 @@ CONFIG: Dict[str, Any] = {
     "ADDER_BURST_ADD_LIMIT": _env_int("ADDER_BURST_ADD_LIMIT", 6, 1, 20),
     "ADDER_BURST_COOLDOWN_TIME": (30, 50),
     "ADDER_PROGRESS_UPDATE_INTERVAL": _env_int("ADDER_PROGRESS_UPDATE_INTERVAL", 8, 2, 30),
+    "DIRECTFALL_MAX_LIVE": _env_int("DIRECTFALL_MAX_LIVE", 20, 1, 20),
+    "DIRECTFALL_OFFLINE_WAIT": (300, 480),
+    "DIRECTFALL_ACCOUNT_LAUNCH_DELAY": (120, 180),
+    "DIRECTFALL_MEMBER_INTERVAL": (60, 120),
+    "DIRECTFALL_ERROR_RETRY": (180, 300),
+    "DIRECTFALL_JOIN_SETTLE": (60, 120),
 
     # ── MongoDB ──
     "MONGO_MIN_POOL_SIZE": _env_int("MONGO_MIN_POOL_SIZE", 5, 1, 50),

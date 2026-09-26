@@ -878,7 +878,12 @@ class ProxyLeaseManager:
                         if time.monotonic() >= deadline: return None
                     continue
                 for pid, node in self.proxy_nodes.items():
-                    if pid in self.proxy_cooldown or node.is_in_cooldown() or node.is_leased: continue
+                    if node.is_leased:
+                        continue
+                    if pid in self.proxy_cooldown and not node.is_in_cooldown():
+                        self.proxy_cooldown.discard(pid)
+                    if pid in self.proxy_cooldown or node.is_in_cooldown():
+                        continue
                     lease_id = uuid.uuid4().hex[:16]
                     if not node.acquire(phone, lease_id): continue
                     self.stats["total_acquires"] += 1
@@ -924,10 +929,13 @@ class ProxyLeaseManager:
             else:
                 # Normal disconnect: free the lease, then give the proxy its
                 # human rest window (3-5 min + micro-jitter) before it may
-                # serve another account.
+                # serve another account. Zero rest (tests) skips the cooldown set
+                # so the node is immediately reusable.
                 node.release()
-                node.start_cooldown(duration_seconds=humanized_proxy_cooldown())
-                self.proxy_cooldown.add(node.proxy_id)
+                rest = humanized_proxy_cooldown()
+                if rest > 0:
+                    node.start_cooldown(duration_seconds=rest)
+                    self.proxy_cooldown.add(node.proxy_id)
                 self.stats["total_releases"] += 1
                 self.stats["current_active_leases"] = max(0, self.stats["current_active_leases"] - 1)
             self._condition.notify_all()
@@ -1131,7 +1139,15 @@ class SessionManager:
         self.db = db; self.proxy_manager = proxy_manager; self.proxy_lease_manager = proxy_lease_manager
         self._lock = asyncio.Lock(); self._sessions: Dict[str, SessionInfo] = {}
         self._max_active_clients = max_active_clients; self._active_count = 0
-        self._closed = False; self._session_idle_ttl = session_idle_ttl
+        self._closed = False
+        self._session_idle_ttl = float(session_idle_ttl)
+        # JIT / hit-and-run: do not reap sockets during boot or while a
+        # just-used client is still within the human hold window.
+        self._born_at = time.time()
+        self._startup_grace = float(CONFIG.get("SESSION_CLEANUP_STARTUP_GRACE", 180.0))
+        self._cleanup_min_hold = float(CONFIG.get("SESSION_CLEANUP_MIN_HOLD", 90.0))
+        self._idle_cleanup_interval = float(CONFIG.get("SESSION_CLEANUP_INTERVAL", 45.0))
+        self._last_idle_cleanup_ts = 0.0
         if self.proxy_lease_manager is not None:
             set_liveness_check = getattr(self.proxy_lease_manager, "set_liveness_check", None)
             if callable(set_liveness_check):
@@ -1170,14 +1186,15 @@ class SessionManager:
                      event, phone, session_fp, module, worker_id, client_id, proxy_url, error, extra)
 
     @asynccontextmanager
-    async def acquire(self, phone: str, *, module: str = "unknown", worker_id: Optional[str] = None, proxy_provider: Optional[Callable] = None, timeout: Optional[float] = None, auto_release: bool = True) -> AsyncIterator[Optional[SessionLease]]:
+    async def acquire(self, phone: str, *, module: str = "unknown", worker_id: Optional[str] = None, proxy_provider: Optional[Callable] = None, timeout: Optional[float] = None, auto_release: bool = True, allow_direct: bool = False, skip_idle_cleanup: bool = False) -> AsyncIterator[Optional[SessionLease]]:
         if self._closed: raise RuntimeError("SessionManager is closed")
         clean_phone = self._session_key(phone)
         lease_owner_key = f"{module}:{worker_id or uuid.uuid4().hex[:8]}"
         reservation_id = uuid.uuid4().hex[:12]
         lease: Optional[SessionLease] = None; proxy_record: Optional[dict] = None; client: Any = None; yielded = False
         try:
-            await self.cleanup_idle_sessions()
+            if not skip_idle_cleanup:
+                await self.cleanup_idle_sessions()
             async with self._lock:
                 existing = self._sessions.get(clean_phone)
                 if existing and existing.lifecycle in (SessionLifecycleState.BUSY, SessionLifecycleState.RESERVED, SessionLifecycleState.LOGIN_PENDING, SessionLifecycleState.OTP_WAITING, SessionLifecycleState.TWOFA_WAITING):
@@ -1260,13 +1277,22 @@ class SessionManager:
 
             # Honor the caller's timeout for the proxy-wait phase. Callers that
             # omit it wait up to one full cooldown window (PROXY_ACQUIRE_TIMEOUT).
+            # allow_direct is opt-in only (direct-fall adder): never a fallback
+            # when the proxy pool is empty.
             proxy_wait = PROXY_ACQUIRE_TIMEOUT if timeout is None else max(1.0, min(float(timeout), PROXY_ACQUIRE_TIMEOUT))
-            if proxy_provider is not None: proxy_record = await proxy_provider(clean_phone)
-            elif self.proxy_lease_manager is not None: proxy_record = await self.proxy_lease_manager.acquire_proxy(clean_phone, timeout=proxy_wait)
-            if self.proxy_lease_manager is not None and proxy_record is None:
-                await self._log_lifecycle("SESSION_WAITING_FOR_PROXY", phone=clean_phone, session_fp=fingerprint, module=module, worker_id=worker_id or "", error="proxy acquisition returned no lease")
-                await self._rollback_reservation(clean_phone, lease_owner_key, reservation_id)
-                yield None; return
+            if allow_direct:
+                proxy_record = None
+                logger.info(
+                    "SESSION_DIRECT_FALL | phone=%s | module=%s | connecting without proxy",
+                    clean_phone, module,
+                )
+            else:
+                if proxy_provider is not None: proxy_record = await proxy_provider(clean_phone)
+                elif self.proxy_lease_manager is not None: proxy_record = await self.proxy_lease_manager.acquire_proxy(clean_phone, timeout=proxy_wait)
+                if self.proxy_lease_manager is not None and proxy_record is None:
+                    await self._log_lifecycle("SESSION_WAITING_FOR_PROXY", phone=clean_phone, session_fp=fingerprint, module=module, worker_id=worker_id or "", error="proxy acquisition returned no lease")
+                    await self._rollback_reservation(clean_phone, lease_owner_key, reservation_id)
+                    yield None; return
 
             client = self._create_client(session_str=session_str, api_id=api_id, api_hash=api_hash, device=device, proxy=proxy_record)
             client_id = str(id(client))
@@ -1571,12 +1597,18 @@ class SessionManager:
         return TelegramClient(StringSession(session_str), api_id=api_id, api_hash=api_hash,
                               device_model=device.get("device_model", "PC 64bit"), system_version=device.get("system_version", "Windows 11"),
                               app_version=device.get("app_version", "4.8.4"), proxy=clean_proxy, entity_cache_limit=100,
-                              sequential_updates=False, receive_updates=False, timeout=10.0, connection_retries=1, request_retries=1)
+                              sequential_updates=False, receive_updates=False, auto_reconnect=False,
+                              timeout=10.0, connection_retries=1, request_retries=1)
 
     async def _safe_disconnect_client(self, client: Optional[Any]) -> None:
+        """Deep disconnect: cancel Telethon IO loops, disable reconnect, close TCP."""
         if not client:
             return
         try:
+            try:
+                client._auto_reconnect = False
+            except Exception:
+                pass
             sender = getattr(client, "_sender", None)
             if sender is not None and not isinstance(sender, bool):
                 try:
@@ -1593,16 +1625,11 @@ class SessionManager:
                         task = getattr(connection, loop_name, None)
                         if isinstance(task, asyncio.Task) and not task.done():
                             task.cancel()
-            try:
-                is_connected = client.is_connected
-                connected = is_connected() if callable(is_connected) else bool(is_connected)
-                if asyncio.iscoroutine(connected):
-                    connected.close()
-                    connected = False
-            except Exception:
-                connected = False
-            if connected:
-                await asyncio.wait_for(client.disconnect(), timeout=3.0)
+            disc = getattr(client, "disconnect", None)
+            if callable(disc):
+                result = disc()
+                if asyncio.iscoroutine(result):
+                    await asyncio.wait_for(result, timeout=3.0)
         except Exception as e:
             logger.debug(f"Safe disconnect error: {e}")
 
@@ -1649,13 +1676,27 @@ class SessionManager:
             return {"ok": not violations, "active_count": self._active_count, "live_clients": live_clients, "owned_sessions": owned_sessions, "tracked_sessions": len(self._sessions), "violations": violations}
 
     async def cleanup_idle_sessions(self) -> int:
-        now = time.time(); retiring = []
+        now = time.time()
+        if (now - self._born_at) < self._startup_grace:
+            return 0
+        if (now - self._last_idle_cleanup_ts) < self._idle_cleanup_interval:
+            return 0
+        self._last_idle_cleanup_ts = now
+        min_idle = max(self._session_idle_ttl, self._cleanup_min_hold)
+        retiring = []
         async with self._lock:
             for phone_key, info in list(self._sessions.items()):
-                if info.lifecycle == SessionLifecycleState.AVAILABLE and info.client is not None and (now - info.last_used_ts > self._session_idle_ttl):
-                    cleanup_owner = f"__cleanup__:{uuid.uuid4().hex[:8]}"
-                    info.lifecycle = SessionLifecycleState.RESERVED; info.owner = cleanup_owner; info.lease_id = None
-                    retiring.append((phone_key, cleanup_owner, info.client))
+                if info.lifecycle != SessionLifecycleState.AVAILABLE or info.client is None:
+                    continue
+                idle_for = now - float(info.last_used_ts or 0.0)
+                held_for = now - float(info.connection_ts or info.creation_ts or 0.0)
+                if idle_for <= min_idle or held_for <= self._cleanup_min_hold:
+                    continue
+                cleanup_owner = f"__cleanup__:{uuid.uuid4().hex[:8]}"
+                info.lifecycle = SessionLifecycleState.RESERVED
+                info.owner = cleanup_owner
+                info.lease_id = None
+                retiring.append((phone_key, cleanup_owner, info.client))
         removed = 0
         for phone_key, cleanup_owner, client in retiring:
             await self._safe_disconnect_client(client)

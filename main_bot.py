@@ -741,6 +741,7 @@ session_manager = SessionManager(
     proxy_manager=proxy_manager,
     proxy_lease_manager=proxy_lease_manager,
     max_active_clients=CONFIG.get("MAX_POOL_ABSOLUTE", 200),
+    session_idle_ttl=float(CONFIG.get("SESSION_IDLE_TTL", 600.0)),
 )
 account_lease_manager = AccountLeaseManager(db=db)
 
@@ -1065,18 +1066,31 @@ async def live_monitor_stop_button(event) -> None:
 
 
 @asynccontextmanager
-async def managed_client(record: dict):
+async def managed_client(record: dict, *, module: str = "managed_client",
+                         skip_idle_cleanup: bool = False):
     phone = normalize_phone(str(record.get("phone", "")))
 
     async with session_manager.acquire(
         phone,
-        module="managed_client",
-        worker_id="managed_client",
+        module=module,
+        worker_id=module,
         auto_release=True,
+        skip_idle_cleanup=skip_idle_cleanup,
     ) as lease:
         if not lease:
             raise ConnectionError(f"No eligible session for {phone}")
         yield lease.client
+
+
+async def _human_jit_pause(bounds, default=(2.0, 8.0)) -> None:
+    """Short human-like dwell. Zero/negative bounds are a no-op (tests)."""
+    try:
+        lo, hi = tuple(bounds if bounds is not None else default)
+    except (TypeError, ValueError):
+        lo, hi = default
+    delay = random.uniform(float(lo), float(hi))
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 
 _health_scan_lock = asyncio.Lock()
@@ -1186,7 +1200,9 @@ async def execute_health_scan(*, limit: Optional[int] = None) -> dict:
                 async with scan_sem:
                     await asyncio.sleep(random.uniform(float(scan_delay[0]), float(scan_delay[1])))
                     try:
-                        async with managed_client(acc) as client:
+                        async with managed_client(
+                            acc, module="health_scan", skip_idle_cleanup=True,
+                        ) as client:
                             if not client.is_connected():
                                 try:
                                     await asyncio.wait_for(client.connect(), timeout=15.0)
@@ -1600,6 +1616,7 @@ async def centralized_ui_router(event) -> None:
             f"{status_bar}\n"
             "Deploy parallel actions to your account pool using these commands:\n\n"
             "🚀 **Mass Member Adder Engine:** `/addmembers <link>`\n"
+            "🛡️ **Direct-fall Adder (no proxy):** `/directfall_addmembers <link> [accounts]`\n"
             "🎙️ **Voice Chat Cluster Deployment:** `/run_voicechat <link> [count]`\n"
             "💬 **Direct Message Blast Campaigns:** `/send_dmsender`\n"
             "🌍 **Global Mass DM (All Groups):** `/send_dmsender_all`\n"
@@ -2896,6 +2913,83 @@ async def run_member_adder_matrix(event) -> None:
             logger.error(f"Could not deliver adder error reply: {reply_err}")
 
 
+@bot.on(events.NewMessage(pattern=r"^/directfall_addmembers(?:@\S+)?\s+(\S+)(?:\s+(\d+))?\s*$"))
+async def run_directfall_member_adder(event) -> None:
+    if not is_admin(event.sender_id):
+        return
+
+    if adder_engine.is_running:
+        await event.reply("⚠️ Member Adding background engine processing pool is occupied right now.")
+        return
+
+    chat_id = event.chat_id
+    target_group_link = event.pattern_match.group(1).strip().replace("<", "").replace(">", "").replace('"', '').replace("'", "")
+    requested_workers = None
+    try:
+        requested_workers = int(event.pattern_match.group(2)) if event.pattern_match.group(2) else None
+    except (ValueError, TypeError):
+        requested_workers = None
+    if requested_workers is not None and requested_workers < 1:
+        await event.reply(
+            "❌ Account count `1` ya usse zyada hona chahiye.\n"
+            "Example: `/directfall_addmembers https://t.me/group 10`"
+        )
+        return
+
+    live_cap = int(CONFIG.get("DIRECTFALL_MAX_LIVE", 20))
+    logger.info(
+        "⚡ Launching DIRECT-FALL adder to target: %s (accounts=%s)",
+        target_group_link, requested_workers if requested_workers else "all",
+    )
+
+    try:
+        adder_state = AdderState(
+            total_target=0,
+            max_workers=min(requested_workers, live_cap) if requested_workers else live_cap,
+        )
+        cap_line = (
+            f"Accounts cap: **{requested_workers}** (max {live_cap} live at once)"
+            if requested_workers
+            else f"Accounts: saare adder-free (max {live_cap} live at once)"
+        )
+        status_msg_obj = await bot.send_message(
+            chat_id,
+            "🛡️ **Direct-fall adder starting**\n"
+            f"{cap_line}\n"
+            "Sab selected accounts offline. 5–8 min quiet window, phir "
+            "2–3 min stagger, 1–2 min per add, no proxy. "
+            "Sirf scraper usernames add honge.",
+        )
+        updater_task = asyncio.create_task(
+            status_updater_loop(bot, chat_id, status_msg_obj.id, adder_state)
+        )
+        GLOBAL.register_task(updater_task)
+
+        async def live_callback(text):
+            try:
+                await bot.send_message(chat_id, text)
+            except Exception:
+                pass
+
+        result_text = await adder_engine.execute_adding_pipeline(
+            target_group_link=target_group_link,
+            update_callback=live_callback,
+            adder_state=adder_state,
+            requested_workers=requested_workers,
+            direct_fall=True,
+        )
+        try:
+            await bot.send_message(chat_id, result_text)
+        except Exception as send_err:
+            logger.error(f"Could not deliver direct-fall adder result: {send_err}")
+    except Exception as e:
+        logger.error(f"Direct-fall adder error: {e}")
+        try:
+            await event.reply(f"❌ **Direct-fall Adder Exception:** `{str(e)[:200]}`")
+        except Exception as reply_err:
+            logger.error(f"Could not deliver direct-fall error reply: {reply_err}")
+
+
 # ──────────────────────────────────────────────
 # 22b. FLOODCHECK — forensic single-account invite test
 # ──────────────────────────────────────────────
@@ -3283,9 +3377,10 @@ async def _auditor_run_pass(accounts: list, capacity: int) -> dict:
             GLOBAL.mark_audit_account_started(phone)
             started = time.monotonic()
             try:
-                # Small micro-jitter only: the real human pacing (3-5 min) comes
-                # from the proxy cooldown window enforced by the lease manager.
-                await asyncio.sleep(random.uniform(2.0, 6.0))
+                # Human pacing between JIT checks (20-55s default). Tests
+                # monkeypatch random.uniform to 0 so this is a no-op there.
+                delay_bounds = CONFIG.get("AUDITOR_JIT_ACCOUNT_DELAY", (20, 55))
+                await _human_jit_pause(delay_bounds, default=(20.0, 55.0))
                 try:
                     ok = await _audit_single_account(acc)
                     dur = time.monotonic() - started
@@ -3326,7 +3421,10 @@ async def _auditor_run_pass(accounts: list, capacity: int) -> dict:
 
 
 async def continuous_session_auditor() -> None:
-    await asyncio.sleep(random.randint(30, 90))
+    # Sit behind SessionManager startup grace so cleanup_idle_sessions
+    # never races boot, then add a human-sized extra pause.
+    grace = float(CONFIG.get("SESSION_CLEANUP_STARTUP_GRACE", 180.0))
+    await asyncio.sleep(grace + random.uniform(15.0, 60.0))
 
     # ── 🔥 BATCH CONFIGURATION (tunable) ──
     BATCH_SIZE = CONFIG.get("AUDITOR_BATCH_SIZE", 10)       # Accounts processed per batch
@@ -3334,13 +3432,15 @@ async def continuous_session_auditor() -> None:
     PASS_GAP_MIN = CONFIG.get("AUDITOR_COOLDOWN_MIN", 300)  # Rest between full passes
     PASS_GAP_MAX = CONFIG.get("AUDITOR_COOLDOWN_MAX", 600)
     RECHECK_SECONDS = max(60, int(CONFIG.get("AUDITOR_RECHECK_MINUTES", 720)) * 60)
-    CONCURRENCY = max(1, int(CONFIG.get("AUDITOR_CONCURRENCY", 3)))
+    CONCURRENCY = max(1, int(CONFIG.get("AUDITOR_CONCURRENCY", 1)))
     pass_no = 0
 
     audit_logger.info(
-        "🚀 Session Auditor online (batch mode) — authorized → ACTIVE, "
+        "🚀 Session Auditor online (JIT hit-and-run) — connect+proxy only "
+        "for the check, then deep disconnect. authorized → ACTIVE, "
         "unauthorized → REVOKED; skips busy/owned (never DEAD), "
-        f"recheck interval={RECHECK_SECONDS // 3600}h, human-paced via the proxy cooldown window."
+        f"recheck interval={RECHECK_SECONDS // 3600}h, "
+        "one live TCP per slot, human dwell between accounts."
     )
 
     while True:
@@ -3570,7 +3670,9 @@ async def _audit_single_account(account_doc: dict) -> Optional[bool]:
     is_duplicate = False
 
     try:
-        async with managed_client(account_doc) as client:
+        async with managed_client(
+            account_doc, module="auditor", skip_idle_cleanup=True,
+        ) as client:
             if not client.is_connected():
                 try:
                     await asyncio.wait_for(client.connect(), timeout=15.0)
@@ -3592,6 +3694,9 @@ async def _audit_single_account(account_doc: dict) -> Optional[bool]:
                         raise _AuditNoProxy(f"connect failed: {conn_err}")
 
             if not is_duplicate:
+                await _human_jit_pause(
+                    CONFIG.get("AUDITOR_JIT_SETTLE", (2, 8)), default=(2.0, 8.0),
+                )
                 # TAO health_check: get_me() is the source of truth.
                 # is_user_authorized() False is NOT dead — live sessions
                 # stay ACTIVE. Only explicit auth-dead errors revoke.
@@ -3623,8 +3728,12 @@ async def _audit_single_account(account_doc: dict) -> Optional[bool]:
                         await _promote_authorized_failed(
                             account_doc, client, clean_phone)
                         await db.mark_account_checked_async(clean_phone)
+                        await _human_jit_pause(
+                            CONFIG.get("AUDITOR_JIT_SETTLE", (2, 8)),
+                            default=(2.0, 8.0),
+                        )
                         audit_logger.info(
-                            f"[SessionCheck] +{clean_phone} get_me ok → ACTIVE"
+                            f"[SessionCheck] +{clean_phone} get_me ok → ACTIVE (JIT disconnect)"
                         )
                         return True
                     audit_logger.info(
@@ -3990,7 +4099,14 @@ async def _recover_failed_accounts(failed_accounts: list) -> int:
             async with semaphore:
                 # Human pacing between account recovery attempts.
                 await asyncio.sleep(random.uniform(float(acc_delay[0]), float(acc_delay[1])))
-                async with managed_client(acc) as client:
+                async with managed_client(
+                    acc, module="recovery", skip_idle_cleanup=True,
+                ) as client:
+                    if not client.is_connected():
+                        await asyncio.wait_for(client.connect(), timeout=15.0)
+                    await _human_jit_pause(
+                        CONFIG.get("AUDITOR_JIT_SETTLE", (2, 8)), default=(2.0, 8.0),
+                    )
                     outcome = await apply_tao_health_and_spam(client, phone)
                     if outcome == "dead":
                         audit_logger.debug(

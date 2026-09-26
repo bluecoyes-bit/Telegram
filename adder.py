@@ -328,6 +328,7 @@ class EnterpriseMemberAdder:
         self.total_skipped = 0
         self._batch_index = 0
         self.batch_reports: List[Dict[str, Any]] = []
+        self._direct_fall = False
 
     # ──────────────────────────────────────────────
     # 🔥 ROBUST CLIENT CLEANUP (prevents ghost tasks & Future exception spam)
@@ -384,6 +385,7 @@ class EnterpriseMemberAdder:
         update_callback,
         adder_state: Optional[AdderState] = None,
         requested_workers: Optional[int] = None,
+        direct_fall: bool = False,
     ) -> str:
         """Public entry point: guarantees is_running is reset no matter how the
         run ends (completion, halt, cancellation, or unexpected crash) —
@@ -391,7 +393,8 @@ class EnterpriseMemberAdder:
         The background auditor/recovery is resumed once the adder finishes."""
         try:
             return await self._execute_adding_pipeline_impl(
-                target_group_link, update_callback, adder_state, requested_workers
+                target_group_link, update_callback, adder_state, requested_workers,
+                direct_fall=direct_fall,
             )
         finally:
             self.is_running = False
@@ -406,10 +409,12 @@ class EnterpriseMemberAdder:
         update_callback,
         adder_state: Optional[AdderState] = None,
         requested_workers: Optional[int] = None,
+        direct_fall: bool = False,
     ) -> str:
 
         self.is_running = True
         self.adder_state = adder_state
+        self._direct_fall = bool(direct_fall)
         self.total_added = 0
         self.accounts_down = 0
         self.session_contention = 0
@@ -422,14 +427,44 @@ class EnterpriseMemberAdder:
         self.batch_reports = []
         self._stop_new_batches = False
         self._first_invite_chat_bans = 0
-        # The adder owns the proxy pool while running: fully stop the auditor.
+        # The adder owns the pool while running: fully stop the auditor.
         notify_auditor_stop()
+
+        if self._direct_fall:
+            disc = getattr(self.session_manager, "disconnect_all", None)
+            if callable(disc):
+                try:
+                    result = disc()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as disc_exc:
+                    logger.warning("DIRECTFALL_OFFLINE_FAILED | %s", disc_exc)
+            offline_bounds = tuple(CONFIG.get("DIRECTFALL_OFFLINE_WAIT", (300, 480)))
+            offline_wait = random.uniform(*offline_bounds)
+            logger.info(
+                "DIRECTFALL_QUIET | all sessions disconnected | wait=%.0fs | auditor stopped",
+                offline_wait,
+            )
+            try:
+                await update_callback(
+                    f"📴 **Direct-fall:** sab accounts offline. "
+                    f"Quiet window `{int(offline_wait // 60)}m {int(offline_wait % 60)}s` "
+                    f"— auditor/network touch nahi hoga."
+                )
+            except Exception:
+                pass
+            deadline = time.monotonic() + offline_wait
+            while self.is_running and time.monotonic() < deadline:
+                await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            if not self.is_running:
+                return "🛑 **Member Adder Halted** before workers started."
 
         # Wait for the proxy pool to stabilize after stopping the auditor. The
         # auditor's cancelled workers release their proxy leases into cooldown
         # (3-5 min), so without this wait the adder starts with 0 usable
         # proxies and every worker spins on acquisition retries.
-        if self.proxy_lease_manager is not None:
+        # Direct-fall does not use the proxy pool.
+        if not self._direct_fall and self.proxy_lease_manager is not None:
             try:
                 _proxy_wait_start = time.time()
                 _proxy_wait_limit = float(CONFIG.get("ADDER_PROXY_STABILIZE_WAIT", 120.0))
@@ -471,18 +506,40 @@ class EnterpriseMemberAdder:
             return "❌ **Operation Failed:** Koi adder-free account nahi mila (sab 24h adder rest pe hain)."
 
         is_private, resolved_token = self.scraper_helper.resolve_group_link(target_group_link)
+        public_ref = (
+            resolved_token
+            if str(resolved_token).startswith("@")
+            else f"@{resolved_token}"
+        )
+        logger.info(
+            "ADDER_LINK_RESOLVED | raw=%s | private=%s | token=%s",
+            target_group_link, is_private, resolved_token,
+        )
 
-        # 10 accounts = 1 batch = up to 300 members. At most 2 batches in flight.
-        BATCH_SIZE = max(1, int(CONFIG.get("ADDER_BATCH_SIZE", 10)))
-        MAX_CONCURRENT_BATCHES = max(1, min(2, int(CONFIG.get("ADDER_MAX_CONCURRENT_BATCHES", 2))))
-        MEMBERS_PER_ACCOUNT = max(1, int(CONFIG.get("ADDER_MEMBERS_PER_ACCOUNT", 30)))
-        LIVE_CAP = BATCH_SIZE * MAX_CONCURRENT_BATCHES
+        if self._direct_fall:
+            DIRECTFALL_CAP = max(1, min(20, int(CONFIG.get("DIRECTFALL_MAX_LIVE", 20))))
+            BATCH_SIZE = 1
+            MAX_CONCURRENT_BATCHES = DIRECTFALL_CAP
+            MEMBERS_PER_ACCOUNT = 10**9
+            LIVE_CAP = DIRECTFALL_CAP
+            ACCOUNT_LAUNCH_DELAY = tuple(CONFIG.get("DIRECTFALL_ACCOUNT_LAUNCH_DELAY", (120, 180)))
+            HUMAN_ADD_INTERVAL = tuple(CONFIG.get("DIRECTFALL_MEMBER_INTERVAL", (60, 120)))
+            ERROR_RETRY_INTERVAL = tuple(CONFIG.get("DIRECTFALL_ERROR_RETRY", (180, 300)))
+            JOIN_SETTLE_DELAY = tuple(CONFIG.get("DIRECTFALL_JOIN_SETTLE", (60, 120)))
+            BURST_ADD_LIMIT = 10**9
+            BURST_COOLDOWN_TIME = (0.0, 0.0)
+        else:
+            BATCH_SIZE = max(1, int(CONFIG.get("ADDER_BATCH_SIZE", 10)))
+            MAX_CONCURRENT_BATCHES = max(1, min(2, int(CONFIG.get("ADDER_MAX_CONCURRENT_BATCHES", 2))))
+            MEMBERS_PER_ACCOUNT = max(1, int(CONFIG.get("ADDER_MEMBERS_PER_ACCOUNT", 30)))
+            LIVE_CAP = BATCH_SIZE * MAX_CONCURRENT_BATCHES
+            ACCOUNT_LAUNCH_DELAY = tuple(CONFIG.get("ADDER_ACCOUNT_LAUNCH_DELAY", (8, 15)))
+            HUMAN_ADD_INTERVAL = tuple(CONFIG.get("ADDER_HUMAN_ADD_INTERVAL", (25, 45)))
+            ERROR_RETRY_INTERVAL = HUMAN_ADD_INTERVAL
+            BURST_ADD_LIMIT = int(CONFIG.get("ADDER_BURST_ADD_LIMIT", 6))
+            BURST_COOLDOWN_TIME = tuple(CONFIG.get("ADDER_BURST_COOLDOWN_TIME", (30, 50)))
+            JOIN_SETTLE_DELAY = tuple(CONFIG.get("ADDER_JOIN_SETTLE_DELAY", (8, 18)))
         SHORT_FLOOD_WAIT = max(1, int(CONFIG.get("ADDER_SHORT_FLOOD_WAIT", 30)))
-        ACCOUNT_LAUNCH_DELAY = tuple(CONFIG.get("ADDER_ACCOUNT_LAUNCH_DELAY", (8, 15)))
-        HUMAN_ADD_INTERVAL = tuple(CONFIG.get("ADDER_HUMAN_ADD_INTERVAL", (25, 45)))
-        JOIN_SETTLE_DELAY = tuple(CONFIG.get("ADDER_JOIN_SETTLE_DELAY", (8, 18)))
-        BURST_ADD_LIMIT = int(CONFIG.get("ADDER_BURST_ADD_LIMIT", 6))
-        BURST_COOLDOWN_TIME = tuple(CONFIG.get("ADDER_BURST_COOLDOWN_TIME", (30, 50)))
         PROGRESS_UPDATE_INTERVAL = int(CONFIG.get("ADDER_PROGRESS_UPDATE_INTERVAL", 10))
         LEASE_RETRY_DELAY = tuple(CONFIG.get("ADDER_LEASE_RETRY_DELAY", (15, 30)))
         NO_PROXY_RETRY_DELAY = tuple(CONFIG.get("ADDER_NO_PROXY_RETRY_DELAY", (30, 60)))
@@ -504,40 +561,55 @@ class EnterpriseMemberAdder:
 
         n_queued = members_queue.qsize()
         n_members = n_queued if n_queued > 0 else len(scraped_pool)
-        accounts_needed = plan_adder_accounts(
-            n_members, len(active_accounts), MEMBERS_PER_ACCOUNT,
-        )
-        if requested_workers is not None and requested_workers > 0:
-            accounts_needed = min(accounts_needed, requested_workers)
-
-        _pipeline_cap = LIVE_CAP
-        _adder_configured_limit = min(
-            int(CONFIG.get("ADDER_MAX_WORKER_SESSIONS", 90)),
-            _pipeline_cap,
-            LIVE_CAP,
-        )
-        if requested_workers is not None and requested_workers > 0:
-            _adder_configured_limit = min(_adder_configured_limit, requested_workers)
-        _adder_available_proxies = 0
-        if self.proxy_lease_manager is not None:
-            try:
-                _adder_available_proxies = max(
-                    0, self.proxy_lease_manager.usable_available_count()
-                )
-            except Exception:
-                _adder_available_proxies = 0
-        if accounts_needed <= 0:
-            MAX_LIVE_ACCOUNTS = 0
-        elif _adder_available_proxies > 0:
-            MAX_LIVE_ACCOUNTS = max(
-                1,
-                min(accounts_needed, _adder_configured_limit, _adder_available_proxies),
-            )
+        if self._direct_fall:
+            accounts_needed = len(active_accounts)
+            if requested_workers is not None and requested_workers > 0:
+                accounts_needed = min(accounts_needed, requested_workers)
+            MAX_LIVE_ACCOUNTS = max(0, min(LIVE_CAP, accounts_needed))
+            _adder_available_proxies = 0
+            _adder_configured_limit = LIVE_CAP
         else:
-            MAX_LIVE_ACCOUNTS = max(1, min(accounts_needed, _adder_configured_limit))
+            accounts_needed = plan_adder_accounts(
+                n_members, len(active_accounts), MEMBERS_PER_ACCOUNT,
+            )
+            if requested_workers is not None and requested_workers > 0:
+                accounts_needed = min(accounts_needed, requested_workers)
+
+            _pipeline_cap = LIVE_CAP
+            _adder_configured_limit = min(
+                int(CONFIG.get("ADDER_MAX_WORKER_SESSIONS", 90)),
+                _pipeline_cap,
+                LIVE_CAP,
+            )
+            if requested_workers is not None and requested_workers > 0:
+                _adder_configured_limit = min(_adder_configured_limit, requested_workers)
+            _adder_available_proxies = 0
+            if self.proxy_lease_manager is not None:
+                try:
+                    _adder_available_proxies = max(
+                        0, self.proxy_lease_manager.usable_available_count()
+                    )
+                except Exception:
+                    _adder_available_proxies = 0
+            if accounts_needed <= 0:
+                MAX_LIVE_ACCOUNTS = 0
+            elif _adder_available_proxies > 0:
+                MAX_LIVE_ACCOUNTS = max(
+                    1,
+                    min(accounts_needed, _adder_configured_limit, _adder_available_proxies),
+                )
+            else:
+                MAX_LIVE_ACCOUNTS = max(1, min(accounts_needed, _adder_configured_limit))
 
         work_accounts = list(active_accounts[:accounts_needed])
-        spare_accounts: deque = deque(active_accounts[accounts_needed:])
+        # Direct-fall: never pull extra accounts from leftover inventory.
+        # If the user asked for N, only those N are used (replacements stay
+        # inside that pool via remaining_q).
+        spare_accounts: deque = (
+            deque()
+            if self._direct_fall
+            else deque(active_accounts[accounts_needed:])
+        )
         remaining_q: deque = deque(work_accounts)
         batches_required = (
             (accounts_needed + BATCH_SIZE - 1) // BATCH_SIZE if accounts_needed else 0
@@ -579,6 +651,7 @@ class EnterpriseMemberAdder:
                     worker_id=f"adder:{clean_phone}",
                     auto_release=True,
                     timeout=90.0,
+                    allow_direct=self._direct_fall,
                 ) as lease:
                     if lease is None:
                         # SessionManager yielded None without raising: the pool
@@ -631,7 +704,7 @@ class EnterpriseMemberAdder:
                                     invite_info = await client(CheckChatInviteRequest(resolved_token))
                                     target_entity = getattr(invite_info, "chat", None)
                         else:
-                            await client(JoinChannelRequest(resolved_token))
+                            await client(JoinChannelRequest(public_ref))
                     except UserAlreadyParticipantError:
                         already_in = True
                         if is_private:
@@ -665,7 +738,7 @@ class EnterpriseMemberAdder:
                             if target_entity is None:
                                 raise ValueError("Could not resolve private invite entity")
                         else:
-                            target_entity = await client.get_entity(resolved_token)
+                            target_entity = await client.get_entity(public_ref)
 
                     if not hasattr(target_entity, "access_hash"):
                         raise ValueError("Target entity has no access_hash")
@@ -760,6 +833,13 @@ class EnterpriseMemberAdder:
         def _note_park() -> None:
             if self.adder_state:
                 self.adder_state.parked = int(getattr(self.adder_state, "parked", 0) or 0) + 1
+
+        async def _error_retry_sleep() -> None:
+            sleep_time = random.uniform(*ERROR_RETRY_INTERVAL)
+            if self.adder_state:
+                self.adder_state.total_delay_sum += sleep_time
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
         async def _rest_account_24h(phone: str, err_name: str) -> None:
             await _block_for_run(phone)
@@ -902,16 +982,23 @@ class EnterpriseMemberAdder:
                                 try:
                                     member = members_queue.get_nowait()
                                 except asyncio.QueueEmpty:
+                                    if self._direct_fall and not _is_blocked(
+                                        worker_account["clean_phone"]
+                                    ):
+                                        await _rest_account_24h(
+                                            worker_account["clean_phone"],
+                                            "DIRECTFALL_SHIFT_COMPLETE",
+                                        )
                                     break
 
-                            uname = str(member.get("username", "")).strip()
+                            uname = str(member.get("username", "") or "").strip().lstrip("@").strip()
                             uid = str(member.get("user_id", "")).strip()
-                            identity = uname if uname and uname.lower() not in ("none", "null") else uid
-                            has_username = bool(uname and uname.lower() not in ("none", "null", ""))
+                            has_username = bool(uname and uname.lower() not in ("none", "null"))
+                            identity = uname if has_username else uid
 
                             try:
-                                # Cross-account adds: scraper access_hash is bound to
-                                # the scraper session (PEER_ID_INVALID / UserIdInvalid).
+                                # Cross-account adds: only the scraper username is
+                                # valid on other sessions. Never use stored access_hash.
                                 if has_username:
                                     target_user = await worker_account["client"].get_input_entity(uname)
                                 else:
@@ -976,6 +1063,29 @@ class EnterpriseMemberAdder:
                                 await asyncio.sleep(sleep_time)
 
                             except FloodWaitError as fl_err:
+                                if self._direct_fall:
+                                    err_name = type(fl_err).__name__
+                                    if not is_restriction_retry:
+                                        logger.info(
+                                            "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
+                                            worker_account["clean_phone"], err_name,
+                                        )
+                                        await _error_retry_sleep()
+                                        pending_retry = member
+                                        continue
+                                    await members_queue.put(member)
+                                    self.flood_drops += 1
+                                    _note_park()
+                                    needs_replace = True
+                                    logger.warning(
+                                        "ADDER_RESTRICT_STOP | account=%s | err=%s | "
+                                        "member requeued, account 24h rest (not marked failed)",
+                                        worker_account["clean_phone"], err_name,
+                                    )
+                                    await _rest_account_24h(
+                                        worker_account["clean_phone"], err_name,
+                                    )
+                                    return added_here, True
                                 seconds = int(getattr(fl_err, "seconds", 0) or 0)
                                 await members_queue.put(member)
                                 if 0 < seconds <= SHORT_FLOOD_WAIT:
@@ -1007,11 +1117,7 @@ class EnterpriseMemberAdder:
                                         "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
                                         worker_account["clean_phone"], err_name,
                                     )
-                                    sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
-                                    if self.adder_state:
-                                        self.adder_state.total_delay_sum += sleep_time
-                                    if sleep_time > 0:
-                                        await asyncio.sleep(sleep_time)
+                                    await _error_retry_sleep()
                                     pending_retry = member
                                     continue
                                 await members_queue.put(member)
@@ -1079,11 +1185,7 @@ class EnterpriseMemberAdder:
                                             "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
                                             worker_account["clean_phone"], err_name,
                                         )
-                                        sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
-                                        if self.adder_state:
-                                            self.adder_state.total_delay_sum += sleep_time
-                                        if sleep_time > 0:
-                                            await asyncio.sleep(sleep_time)
+                                        await _error_retry_sleep()
                                         pending_retry = member
                                         continue
                                     await members_queue.put(member)
@@ -1141,11 +1243,7 @@ class EnterpriseMemberAdder:
                                             "ADDER_RESTRICT_RETRY | account=%s | err=%s | retrying this add once",
                                             worker_account["clean_phone"], err_name,
                                         )
-                                        sleep_time = random.uniform(*HUMAN_ADD_INTERVAL)
-                                        if self.adder_state:
-                                            self.adder_state.total_delay_sum += sleep_time
-                                        if sleep_time > 0:
-                                            await asyncio.sleep(sleep_time)
+                                        await _error_retry_sleep()
                                         pending_retry = member
                                         continue
                                     await members_queue.put(member)
@@ -1321,6 +1419,10 @@ class EnterpriseMemberAdder:
                 nxt = await _take_replacement()
                 if nxt is None:
                     break
+                if self._direct_fall:
+                    delay = random.uniform(*ACCOUNT_LAUNCH_DELAY)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
                 logger.info(
                     "ADDER_ACCOUNT_REPLACE | rested=%s | next=%s | members_left=%s",
                     str(current.get("phone", "")).strip(),
@@ -1413,6 +1515,12 @@ class EnterpriseMemberAdder:
                     continue
 
                 room = MAX_LIVE_ACCOUNTS - accounts_in_flight
+                if self._direct_fall and self._batch_index > 0:
+                    delay = random.uniform(*ACCOUNT_LAUNCH_DELAY)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    if not self.is_running:
+                        break
                 wave = await _pop_wave(min(BATCH_SIZE, room))
                 if not wave:
                     if live:
